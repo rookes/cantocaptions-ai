@@ -1,2 +1,2 @@
 # cantocaptions-ai
-An ASR framework for generating high-quality, written Cantonese subtitles
+An end-to-end speech pipeline for generating high-quality, written Cantonese subtitles
