@@ -1,6 +1,8 @@
 # cantocaptions-ai
 
-An end-to-end speech pipeline for generating high-quality written Cantonese subtitles.
+An end-to-end speech pipeline for generating high-quality, timed written Cantonese (粵文) subtitles.
+
+*This repository is currently in an early stage of development, and some modules may not yet be fully functional.*
 
 ## Prerequisites
 
