@@ -14,7 +14,7 @@ An end-to-end speech pipeline for generating high-quality, timed written Cantone
 ## Installation
 
 ```bash
-git clone --recurse-submodules https://github.com/rookes/cantocaptions-ai
+git clone https://github.com/rookes/cantocaptions-ai
 cd cantocaptions-ai
 uv sync
 ```
