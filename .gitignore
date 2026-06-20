@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+############## CUSTOM ADDITIONS #############
+
+# Ignore the entire .vscode folder
+.vscode/
+
+# Claude
+Claude.md
+
+# Log files
+*.log
+temp/

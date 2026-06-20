@@ -1,30 +1,129 @@
 import io
-import os
+import importlib.resources
 import sys
+import time
 from typing import List, Optional
 
 import numpy as np
 import torch
-import yaml
-from ml_collections import ConfigDict
+import torch.nn as nn
+from omegaconf import OmegaConf, DictConfig
+from huggingface_hub import hf_hub_download
 
+from cantocaptions_ai.pipeline.mbroformer.model import MelBandRoformer
 from cantocaptions_ai.utils.audio import SAMPLE_RATE
 from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
 
-_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
-# _PACKAGE_DIR is cantocaptions_ai/pipeline/; repo root is two levels up
-_DEFAULT_MBROFORMER_DIR = os.path.join(os.path.dirname(os.path.dirname(_PACKAGE_DIR)), "mb-roformer")
-
-_MBROFORMER_MODEL_TYPE = "mel_band_roformer"
-_MBROFORMER_CONFIG_NAME = "config_vocals_mel_band_roformer.yaml"
-_MBROFORMER_CHECKPOINT_NAME = "MelBandRoformer.ckpt"
-
+_HF_REPO_ID = "KimberleyJSN/melbandroformer"
+_HF_FILENAME = "MelBandRoformer.ckpt"
 
 _DURATION_TOLERANCE_S = 0.005  # seconds
 
+
+# ---------------------------------------------------------------------------
+# Inference helpers (ported from mb-roformer/utils.py)
+# ---------------------------------------------------------------------------
+
+def _get_windowing_array(window_size, fade_size, device):
+    fadein = torch.linspace(0, 1, fade_size)
+    fadeout = torch.linspace(1, 0, fade_size)
+    window = torch.ones(window_size)
+    window[-fade_size:] *= fadeout
+    window[:fade_size] *= fadein
+    return window.to(device)
+
+
+def _demix_track(config, model, mix, device, first_chunk_time=None):
+    C = config.inference.chunk_size
+    N = config.inference.num_overlap
+    step = C // N
+    fade_size = C // 10
+    border = C - step
+
+    if mix.shape[1] > 2 * border and border > 0:
+        mix = nn.functional.pad(mix, (border, border), mode='reflect')
+
+    windowing_array = _get_windowing_array(C, fade_size, device)
+
+    with torch.cuda.amp.autocast():
+        with torch.no_grad():
+            if config.training.target_instrument is not None:
+                req_shape = (1,) + tuple(mix.shape)
+            else:
+                req_shape = (len(config.training.instruments),) + tuple(mix.shape)
+
+            mix = mix.to(device)
+            result = torch.zeros(req_shape, dtype=torch.float32).to(device)
+            counter = torch.zeros(req_shape, dtype=torch.float32).to(device)
+
+            i = 0
+            total_length = mix.shape[1]
+            num_chunks = (total_length + step - 1) // step
+
+            if first_chunk_time is None:
+                start_time = time.time()
+                first_chunk = True
+            else:
+                start_time = None
+                first_chunk = False
+
+            while i < total_length:
+                part = mix[:, i:i + C]
+                length = part.shape[-1]
+                if length < C:
+                    if length > C // 2 + 1:
+                        part = nn.functional.pad(input=part, pad=(0, C - length), mode='reflect')
+                    else:
+                        part = nn.functional.pad(input=part, pad=(0, C - length, 0, 0), mode='constant', value=0)
+
+                if first_chunk and i == 0:
+                    chunk_start_time = time.time()
+
+                x = model(part.unsqueeze(0))[0]
+
+                window = windowing_array.clone()
+                if i == 0:
+                    window[:fade_size] = 1
+                elif i + C >= total_length:
+                    window[-fade_size:] = 1
+
+                result[..., i:i + length] += x[..., :length] * window[..., :length]
+                counter[..., i:i + length] += window[..., :length]
+                i += step
+
+                if first_chunk and i == step:
+                    chunk_time = time.time() - chunk_start_time
+                    first_chunk_time = chunk_time
+                    estimated_total_time = chunk_time * num_chunks
+                    print(f"Estimated total processing time for this track: {estimated_total_time:.2f} seconds")
+                    first_chunk = False
+
+                if first_chunk_time is not None and i > step:
+                    chunks_processed = i // step
+                    time_remaining = first_chunk_time * (num_chunks - chunks_processed)
+                    sys.stdout.write(f"\rEstimated time remaining: {time_remaining:.2f} seconds")
+                    sys.stdout.flush()
+
+            print()
+            estimated_sources = result / counter
+            estimated_sources = estimated_sources.cpu().numpy()
+            np.nan_to_num(estimated_sources, copy=False, nan=0.0)
+
+            if mix.shape[1] > 2 * border and border > 0:
+                estimated_sources = estimated_sources[..., border:-border]
+
+    if config.training.target_instrument is None:
+        return {k: v for k, v in zip(config.training.instruments, estimated_sources)}, first_chunk_time
+    else:
+        return {k: v for k, v in zip([config.training.target_instrument], estimated_sources)}, first_chunk_time
+
+
+# ---------------------------------------------------------------------------
+# Processor classes
+# ---------------------------------------------------------------------------
 
 class VocalIsolationProcessor:
     """Base class for vocal isolation processors."""
@@ -54,7 +153,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
     def __init__(
         self,
         model: torch.nn.Module,
-        config: ConfigDict,
+        config: DictConfig,
         device: torch.device,
         demix_track_fn,
     ):
@@ -118,45 +217,51 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         return vocals_mono
 
 
+# ---------------------------------------------------------------------------
+# Public loader
+# ---------------------------------------------------------------------------
+
 def load_vocal_isolation(
     model_name: str,
     device: str,
     device_index: int = 0,
     model_dir: Optional[str] = None,
 ) -> VocalIsolationProcessor:
-    """Load a vocal isolation model and return a processor."""
+    """Load a vocal isolation model and return a processor.
+
+    The checkpoint is downloaded from HuggingFace on first use and cached.
+    model_dir, if given, overrides the default HuggingFace cache directory.
+    """
     if model_name != "mbroformer":
         raise ValueError(
             f"Unknown vocal isolation model '{model_name}'. Supported: 'mbroformer'"
         )
 
-    model_dir = model_dir or _DEFAULT_MBROFORMER_DIR
-    if not os.path.isdir(model_dir):
-        raise FileNotFoundError(f"mb-roformer directory not found: {model_dir}")
+    # Load bundled config
+    config_ref = importlib.resources.files("cantocaptions_ai.assets").joinpath(
+        "config_vocals_mel_band_roformer.yaml"
+    )
+    with importlib.resources.as_file(config_ref) as config_path:
+        config = OmegaConf.load(config_path)
 
-    # mb-roformer is not an installed package — add its root to sys.path so that
-    # its local `utils` module and `models/` package can be imported.
-    if model_dir not in sys.path:
-        sys.path.insert(0, model_dir)
+    # Instantiate model — convert OmegaConf container to plain Python types so
+    # beartype is satisfied, and restore the tuple expected by the constructor.
+    model_kwargs = OmegaConf.to_container(config.model, resolve=True)
+    model_kwargs["multi_stft_resolutions_window_sizes"] = tuple(
+        model_kwargs["multi_stft_resolutions_window_sizes"]
+    )
+    torch_model = MelBandRoformer(**model_kwargs)
 
-    from utils import demix_track, get_model_from_config  # noqa: PLC0415
-
-    config_path = os.path.join(model_dir, "configs", _MBROFORMER_CONFIG_NAME)
-    checkpoint_path = os.path.join(model_dir, _MBROFORMER_CHECKPOINT_NAME)
-
-    with open(config_path) as f:
-        config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
-
+    # Download checkpoint from HuggingFace (cached after first download)
     logger.info("Loading vocal isolation model (MelBandRoformer)...")
-    torch_model = get_model_from_config(_MBROFORMER_MODEL_TYPE, config)
-
-    if os.path.exists(checkpoint_path):
-        torch_model.load_state_dict(
-            torch.load(checkpoint_path, map_location=torch.device("cpu"))
-        )
-        logger.info(f"Loaded checkpoint: {checkpoint_path}")
-    else:
-        logger.warning(f"Checkpoint not found at {checkpoint_path}, using random weights")
+    checkpoint_path = hf_hub_download(
+        repo_id=_HF_REPO_ID,
+        filename=_HF_FILENAME,
+        cache_dir=model_dir,
+    )
+    torch_model.load_state_dict(
+        torch.load(checkpoint_path, map_location=torch.device("cpu"))
+    )
 
     torch_device = (
         torch.device(f"cuda:{device_index}") if device == "cuda" else torch.device(device)
@@ -167,5 +272,5 @@ def load_vocal_isolation(
         model=torch_model,
         config=config,
         device=torch_device,
-        demix_track_fn=demix_track,
+        demix_track_fn=_demix_track,
     )

@@ -19,6 +19,11 @@ dependencies = [
     "opencc>=1.0.0",
     "nltk>=3.9.1",
     "tqdm>=4.0",
+    "omegaconf>=2.3.0",
+    "einops>=0.6.0",
+    "beartype>=0.16.0",
+    "rotary-embedding-torch>=0.6.0",
+    "librosa>=0.10.0",
 ]
 
 [project.optional-dependencies]
