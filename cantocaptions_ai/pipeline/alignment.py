@@ -1,0 +1,725 @@
+"""
+Forced Alignment with Whisper
+C. Max Bain
+"""
+from dataclasses import dataclass
+import math
+from typing import Iterable, Optional, Union, List, Tuple
+
+import numpy as np
+import torch
+
+from cantocaptions_ai.utils.audio import SAMPLE_RATE, load_audio, log_mel_spectrogram
+from cantocaptions_ai.utils.output import interpolate_nans, PUNKT_LANGUAGES
+from cantocaptions_ai.utils.schema import (
+    AlignedTranscriptionResult,
+    SingleSegment,
+    SingleAlignedSegment,
+    SingleWordSegment,
+    SegmentData,
+    ProgressCallback,
+    VadAudioSegment,
+)
+from cantocaptions_ai.cantonese.text import SPLIT_CHARS, standardize_chars_hk, locate_particles, get_particle_candidates
+
+from cantocaptions_ai.utils.log_utils import get_logger
+from cantocaptions_ai.utils.output import LANGUAGES_WITHOUT_SPACES
+
+logger = get_logger(__name__)
+
+DEFAULT_ALIGN_MODELS_TORCH = {
+    "en": "WAV2VEC2_ASR_BASE_960H",
+    "fr": "VOXPOPULI_ASR_BASE_10K_FR",
+    "de": "VOXPOPULI_ASR_BASE_10K_DE",
+    "es": "VOXPOPULI_ASR_BASE_10K_ES",
+    "it": "VOXPOPULI_ASR_BASE_10K_IT",
+}
+
+DEFAULT_ALIGN_MODELS_HF = {
+    "ja": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese",
+    "zh": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
+    "nl": "jonatasgrosman/wav2vec2-large-xlsr-53-dutch",
+    "uk": "Yehor/wav2vec2-xls-r-300m-uk-with-small-lm",
+    "pt": "jonatasgrosman/wav2vec2-large-xlsr-53-portuguese",
+    "ar": "jonatasgrosman/wav2vec2-large-xlsr-53-arabic",
+    "cs": "comodoro/wav2vec2-xls-r-300m-cs-250",
+    "ru": "jonatasgrosman/wav2vec2-large-xlsr-53-russian",
+    "pl": "jonatasgrosman/wav2vec2-large-xlsr-53-polish",
+    "hu": "jonatasgrosman/wav2vec2-large-xlsr-53-hungarian",
+    "fi": "jonatasgrosman/wav2vec2-large-xlsr-53-finnish",
+    "fa": "jonatasgrosman/wav2vec2-large-xlsr-53-persian",
+    "el": "jonatasgrosman/wav2vec2-large-xlsr-53-greek",
+    "tr": "mpoyraz/wav2vec2-xls-r-300m-cv7-turkish",
+    "da": "saattrupdan/wav2vec2-xls-r-300m-ftspeech",
+    "he": "imvladikon/wav2vec2-xls-r-300m-hebrew",
+    "vi": 'nguyenvulebinh/wav2vec2-base-vi-vlsp2020',
+    "ko": "kresnik/wav2vec2-large-xlsr-korean",
+    "ur": "kingabzpro/wav2vec2-large-xls-r-300m-Urdu",
+    "te": "anuragshas/wav2vec2-large-xlsr-53-telugu",
+    "hi": "theainerd/Wav2Vec2-large-xlsr-hindi",
+    "ca": "softcatala/wav2vec2-large-xlsr-catala",
+    "ml": "gvs/wav2vec2-large-xlsr-malayalam",
+    "no": "NbAiLab/nb-wav2vec2-1b-bokmaal-v2",
+    "nn": "NbAiLab/nb-wav2vec2-1b-nynorsk",
+    "sk": "comodoro/wav2vec2-xls-r-300m-sk-cv8",
+    "sl": "anton-l/wav2vec2-large-xlsr-53-slovenian",
+    "hr": "classla/wav2vec2-xls-r-parlaspeech-hr",
+    "ro": "gigant/romanian-wav2vec2",
+    "eu": "stefan-it/wav2vec2-large-xlsr-53-basque",
+    "gl": "ifrz/wav2vec2-large-xlsr-galician",
+    "ka": "xsway/wav2vec2-large-xlsr-georgian",
+    "lv": "jimregan/wav2vec2-large-xlsr-latvian-cv",
+    "tl": "Khalsuu/filipino-wav2vec2-l-xls-r-300m-official",
+    "sv": "KBLab/wav2vec2-large-voxrex-swedish",
+    "yue": "alvanlii/wav2vec2-BERT-cantonese"
+}
+
+# https://huggingface.co/scottykwok/wav2vec2-large-xlsr-cantonese xlsr-53 + common voice
+# scottykwok/wav2vec2-large-xlsr-cantonese xlsr-53 + common voice + more training
+# wcfr/wav2vec2-conformer-rel-pos-base-cantonese
+# alvanlii/wav2vec2-BERT-cantonese
+
+
+# --- Dataclasses ---
+
+@dataclass
+class Point:
+    token_index: int
+    time_index: int
+    score: float
+
+
+@dataclass
+class Segment:
+    label: str
+    start: int
+    end: int
+    score: float
+
+    def __repr__(self):
+        return f"{self.label}\t({self.score:4.2f}): [{self.start:5d}, {self.end:5d})"
+
+    @property
+    def length(self):
+        return self.end - self.start
+
+
+# --- Low-level CTC alignment ---
+# source: https://docs.pytorch.org/audio/stable/tutorials/forced_alignment_tutorial.html
+
+def get_trellis(emission, tokens, blank_id=0):
+    num_frame = emission.size(0)
+    num_tokens = len(tokens)
+
+    # Trellis has extra dimensions for both time axis and tokens.
+    # The extra dim for tokens represents <SoS> (start-of-sentence)
+    # The extra dim for time axis is for simplification of the code.
+    trellis = torch.empty((num_frame + 1, num_tokens + 1))
+    trellis[0, 0] = 0
+    trellis[1:, 0] = torch.cumsum(emission[:, blank_id], 0)
+    trellis[0, -num_tokens:] = -float("inf")
+    trellis[-num_tokens:, 0] = float("inf")
+
+    for t in range(num_frame):
+        trellis[t + 1, 1:] = torch.maximum(
+            # Score for staying at the same token
+            trellis[t, 1:] + emission[t, blank_id],
+            # Score for changing to the next token
+            trellis[t, :-1] + emission[t, tokens],
+        )
+    return trellis
+
+
+def backtrack(trellis, emission, tokens, blank_id=0):
+    # Note:
+    # j and t are indices for trellis, which has extra dimensions
+    # for time and tokens at the beginning.
+    # When referring to time frame index `T` in trellis,
+    # the corresponding index in emission is `T-1`.
+    # Similarly, when referring to token index `J` in trellis,
+    # the corresponding index in transcript is `J-1`.
+    j = trellis.size(1) - 1
+    t_start = torch.argmax(trellis[:, j]).item()
+
+    path = []
+    for t in range(t_start, 0, -1):
+        # 1. Figure out if the current position was stay or change
+        # Note (again):
+        # `emission[T-1]` is the emission at time frame `T` of trellis dimension.
+        # Score for token staying the same from time frame T-1 to T.
+        stayed = trellis[t - 1, j] + emission[t - 1, blank_id]
+        # Score for token changing from J-1 at T-1 to J at T.
+        changed = trellis[t - 1, j - 1] + emission[t - 1, tokens[j - 1]]
+
+        # 2. Store the path with frame-wise probability.
+        prob = emission[t - 1, tokens[j - 1] if changed > stayed else blank_id].exp().item()
+        # Return token index and time index in non-trellis coordinate.
+        path.append(Point(j - 1, t - 1, prob))
+
+        # 3. Update the token
+        if changed > stayed:
+            j -= 1
+            if j == 0:
+                break
+    else:
+        # failed
+        return None
+
+    return path[::-1]
+
+
+def get_score(emission, tokens, blank_id=0):
+    """Return average score for a token sequence against emissions."""
+    trellis = get_trellis(emission, tokens, blank_id)
+    path = backtrack(trellis, emission, tokens, blank_id)
+    if path is None:
+        return float("-inf")
+    return sum(p.score for p in path) / len(path)
+
+
+def merge_repeats(path, transcript):
+    i1, i2 = 0, 0
+    segments = []
+    while i1 < len(path):
+        while i2 < len(path) and path[i1].token_index == path[i2].token_index:
+            i2 += 1
+        score = sum(path[k].score for k in range(i1, i2)) / (i2 - i1)
+        segments.append(
+            Segment(
+                transcript[path[i1].token_index],
+                path[i1].time_index,
+                path[i2 - 1].time_index + 1,
+                score,
+            )
+        )
+        i1 = i2
+    return segments
+
+
+def merge_words(segments, separator="|"):
+    words = []
+    i1, i2 = 0, 0
+    while i1 < len(segments):
+        if i2 >= len(segments) or segments[i2].label == separator:
+            if i1 != i2:
+                segs = segments[i1:i2]
+                word = "".join([seg.label for seg in segs])
+                score = sum(seg.score * seg.length for seg in segs) / sum(seg.length for seg in segs)
+                words.append(Segment(word, segments[i1].start, segments[i2 - 1].end, score))
+            i1 = i2 + 1
+            i2 = i1
+        else:
+            i2 += 1
+    return words
+
+
+# --- Private helpers ---
+
+def _run_model_inference(
+    model: torch.nn.Module,
+    model_type: str,
+    audio: torch.Tensor,
+    bert_processor,
+    device: str,
+    lengths=None,
+) -> torch.Tensor:
+    """Single forward pass returning log-softmax emissions."""
+    with torch.inference_mode():
+        if model_type == "torchaudio":
+            emissions, _ = model(audio.to(device), lengths=lengths)
+        elif model_type == "huggingface":
+            if bert_processor is not None:
+                features = bert_processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+                emissions = model(features["input_features"].to(device)).logits
+            else:
+                emissions = model(audio.to(device)).logits
+        else:
+            raise NotImplementedError(f"Align model of type {model_type} not supported.")
+        return torch.log_softmax(emissions, dim=-1)
+
+
+def _get_blank_id(model_dictionary: dict) -> int:
+    return next((code for char, code in model_dictionary.items() if char in ('[pad]', '<pad>')), 0)
+
+
+def _get_sentence_spans(text: str, model_lang: str) -> List[Tuple[int, int]]:
+    """Split text into sentence span tuples using language-appropriate tokenization."""
+    if model_lang in ['yue', 'zh']:
+        split_chars = SPLIT_CHARS
+        split_indexes = [i for i, char in enumerate(text) if char in split_chars]
+        spans, cur_start = [], 0
+        for val in split_indexes:
+            spans.append((cur_start, val))
+            cur_start = val + 1
+        if cur_start <= len(text):
+            spans.append((cur_start, len(text)))
+        return spans
+
+    import nltk
+    from nltk.data import load as nltk_load
+    punkt_lang = PUNKT_LANGUAGES.get(model_lang, 'english')
+    try:
+        sentence_splitter = nltk_load(f'tokenizers/punkt_tab/{punkt_lang}.pickle')
+    except LookupError:
+        nltk.download('punkt_tab', quiet=True)
+        sentence_splitter = nltk_load(f'tokenizers/punkt_tab/{punkt_lang}.pickle')
+    return list(sentence_splitter.span_tokenize(text))
+
+
+def _preprocess_segment(text: str, model_lang: str, model_dictionary: dict) -> SegmentData:
+    """Clean text and produce per-segment alignment metadata."""
+    num_leading = len(text) - len(text.lstrip())
+    num_trailing = len(text) - len(text.rstrip())
+
+    per_word = text.split(" ") if model_lang not in LANGUAGES_WITHOUT_SPACES else text
+
+    clean_char, clean_cdx = [], []
+    for cdx, char in enumerate(text):
+        char_ = char.lower()
+        if model_lang not in LANGUAGES_WITHOUT_SPACES:
+            char_ = char_.replace(" ", "|")
+        if cdx < num_leading or cdx > len(text) - num_trailing - 1:
+            continue
+        if char_ in model_dictionary or char_ in SPLIT_CHARS:
+            clean_char.append(char_)
+            clean_cdx.append(cdx)
+
+    clean_wdx = [
+        wdx for wdx, wrd in enumerate(per_word)
+        if any(c in model_dictionary for c in wrd.lower())
+    ]
+
+    return {
+        "clean_char": clean_char,
+        "clean_cdx": clean_cdx,
+        "clean_wdx": clean_wdx,
+        "sentence_spans": _get_sentence_spans(text, model_lang),
+    }
+
+def _preprocess_transcript(
+    transcript: List[SingleSegment],
+    model_lang: str,
+    model_dictionary: dict,
+    print_progress: bool = False,
+    combined_progress: bool = False,
+) -> dict:
+    """First pass: build SegmentData for every transcript segment."""
+    total = len(transcript)
+    segment_data = {}
+    for sdx, segment in enumerate(transcript):
+        segment_data[sdx] = _preprocess_segment(segment["text"], model_lang, model_dictionary)
+    return segment_data
+
+
+_TIMESTAMP_TOLERANCE_S = 0.005
+
+
+def _find_vad_segment_idx(vad_segments: List[VadAudioSegment], t: float) -> Optional[int]:
+    # Half-open [start - tol, end) so that a timestamp exactly at a segment boundary
+    # belongs to the next segment rather than the one that just ended.
+    for i, seg in enumerate(vad_segments):
+        if seg["start"] - _TIMESTAMP_TOLERANCE_S <= t < seg["end"]:
+            return i
+    # Fallback: t is at or just past the end of the last segment.
+    if vad_segments and t <= vad_segments[-1]["end"] + _TIMESTAMP_TOLERANCE_S:
+        return len(vad_segments) - 1
+    return None
+
+
+def _compute_vad_emissions(
+    vad_segments: List[VadAudioSegment],
+    model: torch.nn.Module,
+    model_type: str,
+    bert_processor,
+    device: str,
+) -> List[Tuple[torch.Tensor, float]]:
+    """Run inference on each full VAD segment. Returns (log_softmax_emission, frame_rate) per segment."""
+    results = []
+    for vad_seg in vad_segments:
+        seg_audio = vad_seg["audio"]
+        if not torch.is_tensor(seg_audio):
+            seg_audio = torch.from_numpy(seg_audio)
+        if len(seg_audio.shape) == 1:
+            seg_audio = seg_audio.unsqueeze(0)
+
+        emissions = _run_model_inference(model, model_type, seg_audio, bert_processor, device)
+        emission = emissions[0].cpu().detach()
+        vad_duration = vad_seg["end"] - vad_seg["start"]
+        frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
+        results.append((emission, frame_rate))
+    return results
+
+
+def _get_emission_for_segment(
+    t1: float,
+    t2: float,
+    audio,
+    vad_segments: Optional[List[VadAudioSegment]],
+    vad_seg_emissions: Optional[List[Tuple[torch.Tensor, float]]],
+    model: torch.nn.Module,
+    model_type: str,
+    bert_processor,
+    device: str,
+) -> Optional[torch.Tensor]:
+    """Return the emission tensor for one segment, or None if no VAD match is found."""
+    if vad_seg_emissions is not None:
+        vad_idx = _find_vad_segment_idx(vad_segments, t1)
+        if vad_idx is None:
+            return None
+        vad_seg = vad_segments[vad_idx]
+        full_emission, frame_rate = vad_seg_emissions[vad_idx]
+        t1_local = t1 - vad_seg["start"]
+        t2_local = t2 - vad_seg["start"]
+        e1 = int(t1_local * frame_rate)
+        e2 = max(int(t2_local * frame_rate), e1 + 1)
+        return full_emission[e1:e2, :]
+
+    f1 = int(t1 * SAMPLE_RATE)
+    f2 = int(t2 * SAMPLE_RATE)
+    waveform_segment = audio[:, f1:f2]
+    if waveform_segment.shape[-1] < 400:
+        lengths = torch.as_tensor([waveform_segment.shape[-1]]).to(device)
+        waveform_segment = torch.nn.functional.pad(
+            waveform_segment, (0, 400 - waveform_segment.shape[-1])
+        )
+    else:
+        lengths = None
+    emissions = _run_model_inference(model, model_type, waveform_segment, bert_processor, device, lengths=lengths)
+    return emissions[0].cpu().detach()
+
+
+def _align_segment(
+    segment: SingleSegment,
+    seg_data: SegmentData,
+    emission: torch.Tensor,
+    model_dictionary: dict,
+    model_lang: str,
+    blank_id: int,
+    spacing_char_id: int,
+    t1: float,
+    t2: float,
+    align_padding: float,
+    align_release: float,
+    interpolate_method: str,
+    return_char_alignments: bool,
+) -> List[dict]:
+    """Align one transcript segment against its emission, returning subsegment dicts."""
+    text = segment["text"]
+    avg_logprob = segment.get("avg_logprob")
+
+    base_seg: SingleAlignedSegment = {"start": t1, "end": t2, "text": text, "words": [], "chars": None}
+    if avg_logprob is not None:
+        base_seg["avg_logprob"] = avg_logprob
+    if return_char_alignments:
+        base_seg["chars"] = []
+
+    if len(seg_data["clean_char"]) == 0:
+        logger.warning(f'Failed to align segment ("{text}"): no characters in this segment found in model dictionary, resorting to original')
+        return [base_seg]
+
+    text_clean = "".join(seg_data["clean_char"])
+
+    # Replace punctuation with spacing token to better align breaks at sentence ends
+    tokens = [model_dictionary[c] if c not in SPLIT_CHARS else spacing_char_id for c in text_clean]
+
+    trellis = get_trellis(emission, tokens, blank_id)
+    path = backtrack(trellis, emission, tokens, blank_id)
+
+    print(f"Checking particle candidates for text: '{text_clean}'.")
+
+    lowercase_text = text.lower()
+    t_i = 0
+    for p_i, p in enumerate(text_clean):
+        # Use t_i to mark the position in the base "text" var. Keep this updated to avoid conflicts.
+        # TODO: roll text, text_clean, and seg_data["clean_char"] all up into a single dynamic type
+        t_i = t_i + lowercase_text[t_i:].index(p) + 1
+
+        candidates = get_particle_candidates(p)
+        if len(candidates) <= 1:
+            continue
+
+        path_i = min(x.time_index for x in path if x.token_index == p_i)
+
+        max_score = -math.inf
+        best_candidate = None
+        for c in candidates:
+            c_token = model_dictionary[c]
+            score = emission[path_i, c_token].item()
+
+            # TODO: Yeah, I'll fix it later
+            if c == '噉':
+                score += 0.8
+
+            if score > max_score:
+                best_candidate = c
+                max_score = score
+
+        if best_candidate != p:
+            text_clean = text_clean[:p_i] + best_candidate + text_clean[p_i + 1:]
+            text = text[:t_i - 1] + best_candidate + text[t_i:] # messy :(
+
+        print(f"Best candidate for char '{p_i}' ('{p}') : '{best_candidate}' (score {round(max_score, 3)}).")
+
+    seg_data["clean_char"] = [c for c in text_clean]
+    #t_particles = locate_particles(text_clean)
+    #last_p_e = 0
+    #for (p_sx, p_e), p in t_particles:
+    #    candidates = get_particle_candidates(p)
+    #    if len(candidates) <= 1:
+    #        last_p_e = p_e
+    #        continue
+    #
+    #    p_s = p_sx - 1 if p_sx >= 1 else p_sx
+    #    path_s_i = min(x.time_index for x in path if x.token_index == p_s)
+    #    path_e_i = max(x.time_index for x in path if x.token_index == p_e)
+    #
+    #    max_score = 0.0
+    #    best_candidate = None
+    #    for c in candidates:
+    #        c_tokens = [model_dictionary[c_tk] for c_tk in c]
+    #        c_tokens.append(spacing_char_id)
+    #        if p_s < p_sx:
+    #            c_tokens.insert(0, model_dictionary[text_clean[p_s]] if text_clean[p_s] in model_dictionary else spacing_char_id)
+    #        score = get_score(emission[path_s_i:path_e_i + 1, :], c_tokens, blank_id)
+    #        if score > max_score:
+    #            best_candidate, max_score = c, score
+    #
+    #    print(f"Best candidate for '{text_clean[last_p_e:p_e]}': '{best_candidate}' (score {round(max_score, 3)}).")
+    #    last_p_e = p_e
+
+    if path is None:
+        logger.warning(f'Failed to align segment ("{text}"): backtrack failed, resorting to original')
+        return [base_seg]
+
+    char_segments = merge_repeats(path, text_clean)
+    duration = t2 - t1
+    ratio = duration / (trellis.size(0) - 1)
+
+    char_segments_arr = []
+    word_idx = 0
+    for cdx, char in enumerate(text):
+        start, end, score = None, None, None
+        if cdx in seg_data["clean_cdx"]:
+            char_seg = char_segments[seg_data["clean_cdx"].index(cdx)]
+            start = round(char_seg.start * ratio + t1, 3)
+            end = round(char_seg.end * ratio + t1, 3)
+            score = round(char_seg.score, 3)
+        char_segments_arr.append({"char": char, "start": start, "end": end, "score": score, "word-idx": word_idx})
+        if model_lang in LANGUAGES_WITHOUT_SPACES:
+            word_idx += 1
+        elif cdx == len(text) - 1 or text[cdx + 1] == " ":
+            word_idx += 1
+
+    import pandas as pd
+    char_segments_arr = pd.DataFrame(char_segments_arr)
+    char_segments_arr["sentence-idx"] = None
+    aligned_subsegments = []
+
+    for sdx2, (sstart, send) in enumerate(seg_data["sentence_spans"]):
+        mask = (char_segments_arr.index >= sstart) & (char_segments_arr.index <= send)
+        curr_chars = char_segments_arr.loc[mask]
+        char_segments_arr.loc[mask, "sentence-idx"] = sdx2
+
+        end_chars = curr_chars[curr_chars["char"] != ' ']
+        if len(end_chars) == 0:
+            continue
+
+        sentence_text = text[sstart:send + 1]
+        sentence_start = curr_chars["start"].min()
+        last_char = end_chars.iloc[-1]
+        sentence_end = (
+            round(last_char["start"] + align_release, 3)
+            if last_char["char"] in SPLIT_CHARS
+            else end_chars["end"].max()
+        )
+
+        sentence_words = []
+        for word_idx in curr_chars["word-idx"].unique():
+            word_chars = curr_chars.loc[curr_chars["word-idx"] == word_idx]
+            word_text = "".join(word_chars["char"].tolist()).strip()
+            if not word_text:
+                continue
+            word_chars = word_chars[word_chars["char"] != " "]
+            word_start = word_chars["start"].min()
+            word_end = word_chars["end"].max()
+            word_score = round(word_chars["score"].mean(), 3)
+            word_segment = {"word": word_text}
+            if not np.isnan(word_start):
+                word_segment["start"] = word_start
+            if not np.isnan(word_end):
+                word_segment["end"] = word_end
+            if not np.isnan(word_score):
+                word_segment["score"] = word_score
+            sentence_words.append(word_segment)
+
+        subsegment = {"text": sentence_text, "start": sentence_start, "end": sentence_end, "words": sentence_words}
+        if avg_logprob is not None:
+            subsegment["avg_logprob"] = avg_logprob
+        aligned_subsegments.append(subsegment)
+
+        if return_char_alignments:
+            chars_out = curr_chars[["char", "start", "end", "score"]].copy()
+            chars_out.fillna(-1, inplace=True)
+            aligned_subsegments[-1]["chars"] = [
+                {k: v for k, v in row.items() if v != -1}
+                for row in chars_out.to_dict("records")
+            ]
+
+    aligned_subsegments = pd.DataFrame(aligned_subsegments)
+    aligned_subsegments["start"] = interpolate_nans(aligned_subsegments["start"], method=interpolate_method)
+    aligned_subsegments["end"] = interpolate_nans(aligned_subsegments["end"], method=interpolate_method)
+
+    # Pad segments and ensure non-overlapping timings
+    condition = aligned_subsegments["end"] > aligned_subsegments["start"].shift(-1) - align_padding
+    aligned_subsegments.loc[condition, "end"] = round(aligned_subsegments["start"].shift(-1) - align_padding, 3)
+
+    # Concatenate sentences with same timestamps
+    agg_dict = {"text": " ".join, "words": "sum"}
+    if model_lang in LANGUAGES_WITHOUT_SPACES:
+        agg_dict["text"] = "".join
+    if return_char_alignments:
+        agg_dict["chars"] = "sum"
+    if avg_logprob is not None:
+        agg_dict["avg_logprob"] = "first"
+
+    aligned_subsegments = aligned_subsegments.groupby(["start", "end"], as_index=False).agg(agg_dict)
+    return aligned_subsegments.to_dict("records")
+
+
+# --- Public functions ---
+
+def load_align_model(language_code: str, device: str, model_name: Optional[str] = None, model_dir=None, model_cache_only: bool = False):
+    if model_name is None:
+        if language_code in DEFAULT_ALIGN_MODELS_TORCH:
+            model_name = DEFAULT_ALIGN_MODELS_TORCH[language_code]
+        elif language_code in DEFAULT_ALIGN_MODELS_HF:
+            model_name = DEFAULT_ALIGN_MODELS_HF[language_code]
+        else:
+            logger.error(
+                f"No default alignment model for language: {language_code}. "
+                f"Please find a wav2vec2.0 model finetuned on this language at https://huggingface.co/models, "
+                f"then pass the model name via --align_model [MODEL_NAME]"
+            )
+            raise ValueError(f"No default align-model for language: {language_code}")
+
+    import torchaudio
+    if model_name in torchaudio.pipelines.__all__:
+        pipeline_type = "torchaudio"
+        bundle = torchaudio.pipelines.__dict__[model_name]
+        align_model = bundle.get_model(dl_kwargs={"model_dir": model_dir}).to(device)
+        labels = bundle.get_labels()
+        align_dictionary = {c.lower(): i for i, c in enumerate(labels)}
+    else:
+        from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, Wav2Vec2BertForCTC, Wav2Vec2BertProcessor
+        is_bert = 'wav2vec2-BERT' in model_name
+        ProcessorClass = Wav2Vec2BertProcessor if is_bert else Wav2Vec2Processor
+        ModelClass = Wav2Vec2BertForCTC if is_bert else Wav2Vec2ForCTC
+        model_flavor = "wav2vec2-BERT" if is_bert else "wav2vec2.0"
+        try:
+            processor = ProcessorClass.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
+            align_model = ModelClass.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
+        except Exception as e:
+            print(e)
+            print(f"Error loading model from huggingface, check https://huggingface.co/models for finetuned {model_flavor} models")
+            raise ValueError(
+                f'The chosen align_model "{model_name}" could not be found in huggingface '
+                f'(https://huggingface.co/models) or torchaudio (https://pytorch.org/audio/stable/pipelines.html#id14)'
+            )
+        pipeline_type = "huggingface"
+        align_model = align_model.to(device)
+        align_dictionary = {char.lower(): code for char, code in processor.tokenizer.get_vocab().items()}
+
+    align_metadata = {"language": language_code, "dictionary": align_dictionary, "type": pipeline_type}
+    return align_model, align_metadata
+
+
+def align(
+    transcript: Iterable[SingleSegment],
+    model: torch.nn.Module,
+    align_model_metadata: dict,
+    audio: Union[str, np.ndarray, torch.Tensor, List[VadAudioSegment]],
+    device: str,
+    bert_processor=None,
+    align_padding: float = 0.04,
+    align_release: float = 0.4,
+    interpolate_method: str = "nearest",
+    return_char_alignments: bool = False,
+    print_progress: bool = False,
+    combined_progress: bool = False,
+    progress_callback: ProgressCallback = None,
+    batch_size: int = 4,
+) -> AlignedTranscriptionResult:
+    """Align phoneme recognition predictions to known transcription."""
+
+    # --- Audio setup ---
+    vad_segments: Optional[List[VadAudioSegment]] = None
+    if isinstance(audio, list):
+        vad_segments = audio
+        MAX_DURATION = max(seg["end"] for seg in vad_segments) if vad_segments else 0.0
+    else:
+        if not torch.is_tensor(audio):
+            if isinstance(audio, str):
+                audio = load_audio(audio)
+            audio = torch.from_numpy(audio)
+        if len(audio.shape) == 1:
+            audio = audio.unsqueeze(0)
+        MAX_DURATION = audio.shape[1] / SAMPLE_RATE
+
+    model_dictionary = align_model_metadata["dictionary"]
+    model_lang = align_model_metadata["language"]
+    model_type = align_model_metadata["type"]
+    blank_id = _get_blank_id(model_dictionary)
+    spacing_char_id = blank_id # model_dictionary['！']
+
+    vad_seg_emissions = (
+        _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device)
+        if vad_segments is not None
+        else None
+    )
+
+    # --- Preprocess transcript ---
+    transcript = list(transcript)
+    total_segments = len(transcript)
+    segment_data = _preprocess_transcript(transcript, model_lang, model_dictionary, print_progress, combined_progress)
+
+    # --- Align each segment ---
+    aligned_segments: List[SingleAlignedSegment] = []
+    for sdx, segment in enumerate(transcript):
+        t1 = segment["start"]
+        t2 = segment["end"]
+        text = segment["text"]
+        avg_logprob = segment.get("avg_logprob")
+
+        base_seg: SingleAlignedSegment = {"start": t1, "end": t2, "text": text, "words": [], "chars": None}
+        if avg_logprob is not None:
+            base_seg["avg_logprob"] = avg_logprob
+        if return_char_alignments:
+            base_seg["chars"] = []
+
+        if t1 >= MAX_DURATION:
+            logger.warning(f'Failed to align segment ("{text}"): original start time longer than audio duration, skipping')
+            aligned_segments.append(base_seg)
+            continue
+
+        emission = _get_emission_for_segment(
+            t1, t2, audio, vad_segments, vad_seg_emissions,
+            model, model_type, bert_processor, device,
+        )
+        if emission is None:
+            logger.warning(f'Failed to align segment ("{text}"): no VAD segment found for start time {t1}, skipping')
+            aligned_segments.append(base_seg)
+            continue
+
+        subsegments = _align_segment(
+            segment, segment_data[sdx], emission,
+            model_dictionary, model_lang, blank_id, spacing_char_id,
+            t1, t2, align_padding, align_release, interpolate_method, return_char_alignments,
+        )
+        aligned_segments += subsegments
+
+        if progress_callback is not None:
+            progress_callback(((sdx + 1) / total_segments) * 100)
+
+    # --- Collect word segments ---
+    word_segments: List[SingleWordSegment] = [w for seg in aligned_segments for w in seg["words"]]
+    return {"segments": aligned_segments, "word_segments": word_segments}

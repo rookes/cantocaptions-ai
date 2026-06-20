@@ -1,0 +1,3 @@
+[submodule "mb-roformer"]
+	path = mb-roformer
+	url = https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model

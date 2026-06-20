@@ -1,0 +1,77 @@
+[project]
+urls = { repository = "https://github.com/rookes/cantocaptions-ai" }
+authors = [{ name = "Jon Miller" }]
+name = "cantocaptions-ai"
+version = "0.1.0"
+description = "End-to-end pipeline for high-quality, time-accurate written Cantonese subtitles."
+readme = "README.md"
+requires-python = ">=3.10, <3.13"
+license = "GPL-3.0-only"
+
+dependencies = [
+    "qwen-asr>=0.0.6",
+    "numpy>=2.1.0",
+    "pandas>=2.2.3",
+    "pyannote-audio>=4.0.0",
+    "huggingface-hub<1.0.0",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "opencc>=1.0.0",
+    "nltk>=3.9.1",
+    "tqdm>=4.0",
+]
+
+[project.optional-dependencies]
+ensemble = ["faster-whisper>=1.0.0"]
+llm = ["bitsandbytes>=0.43.0"]
+diarize = ["nemo_toolkit[asr]; sys_platform == 'linux'", "matplotlib"]
+full = ["faster-whisper>=1.0.0", "bitsandbytes>=0.43.0", "nemo_toolkit[asr]; sys_platform == 'linux'", "matplotlib"]
+
+[project.scripts]
+cantocaptions = "cantocaptions_ai.__main__:cli"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = { find = { where = ["."], include = ["cantocaptions_ai*"] } }
+
+[tool.setuptools.package-data]
+cantocaptions_ai = ["cantonese/opencc/*", "assets/*"]
+
+# torchcodec (transitive dep of pyannote-audio >=4) has no wheels for Windows, macOS, or Linux aarch64.
+# Only Linux x86_64 has torchcodec wheels; everywhere else we override it away.
+[tool.uv]
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'darwin'",
+]
+override-dependencies = [
+    "torchcodec>=0.6.0; sys_platform != 'linux' or platform_machine != 'x86_64'",
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+  { index = "pytorch-cpu", marker = "platform_machine != 'AMD64' and platform_machine != 'x86_64' and sys_platform != 'darwin'" },
+  { index = "pytorch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+  { index = "pytorch", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+]
+torchaudio = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+  { index = "pytorch-cpu", marker = "platform_machine != 'AMD64' and platform_machine != 'x86_64' and sys_platform != 'darwin'" },
+  { index = "pytorch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+  { index = "pytorch", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
