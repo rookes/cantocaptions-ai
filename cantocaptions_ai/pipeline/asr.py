@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import torch
 from transformers import Pipeline
@@ -56,25 +56,25 @@ class QwenPipeline(Pipeline):
     def _sanitize_parameters(self, **kwargs):
         return {}, {}, {}
 
-    def preprocess(self, input_item):
+    def preprocess(self, input_, **_preprocess_parameters):
         """Process a single audio segment into model inputs."""
-        wav = input_item['audio']
-        language = input_item.get('language') or self.preset_language or "Cantonese"
+        wav = input_['audio']
+        language = input_.get('language') or self.preset_language or "Cantonese"
         prompt = self.model._build_text_prompt(context="", force_language=language)
         inputs = self.model.processor(text=[prompt], audio=[wav], return_tensors="pt")
         inputs['_language'] = language
         return inputs
 
-    def _forward(self, model_inputs):
+    def _forward(self, input_tensors, **_forward_parameters) -> Any:
         """Run generation on a single set of model inputs."""
-        language = model_inputs.pop('_language', self.preset_language or "Cantonese")
-        inputs = model_inputs.to(self.model.model.device).to(self.model.model.dtype)
+        language = input_tensors.pop('_language', self.preset_language or "Cantonese")
+        inputs = input_tensors.to(self.model.model.device).to(self.model.model.dtype)
         with torch.no_grad():
             generated = self.model.model.generate(**inputs, max_new_tokens=self.model.max_new_tokens)
         n_input = inputs["input_ids"].shape[1]
         return {"sequences": generated.sequences, "n_input_tokens": n_input, "_language": language}
 
-    def postprocess(self, model_outputs):
+    def postprocess(self, model_outputs, **_postprocess_parameters):
         """Decode generated tokens to text."""
         from qwen_asr.inference.utils import parse_asr_output
         language = model_outputs.get('_language', self.preset_language or "Cantonese")
@@ -121,9 +121,9 @@ class QwenPipeline(Pipeline):
         language = language or self.preset_language or "Cantonese"
 
         if use_native:
-            native_language = LANGUAGES.get(language, language)
+            language_longname = LANGUAGES.get(language, language)
             wavs = [(seg['audio'], 16000) for seg in vad_segments]
-            results = self.model.transcribe(wavs, language=native_language)
+            results = self.model.transcribe(wavs, language=language_longname)
             segments = [
                 {'text': r.text, 'start': seg['start'], 'end': seg['end']}
                 for r, seg in zip(results, vad_segments)
@@ -142,7 +142,7 @@ class QwenPipeline(Pipeline):
         for i in range(0, total, effective_batch):
             batch = vad_segments[i:i + effective_batch]
             wavs = [seg['audio'] for seg in batch]
-            prompts = [self.model._build_text_prompt(context="", force_language=language) for _ in batch]
+            prompts = [self.model._build_text_prompt(context="Character names: 保怡, 巴高.\n\nCantonese conventions:\n* Use Simplified Chinese (簡體字).\n* Transcribe wo3 as '喎' where it appears in the audio.", force_language=language) for _ in batch]
 
             inputs = self.model.processor(text=prompts, audio=wavs, return_tensors="pt", padding=True)
             inputs = inputs.to(self.model.model.device).to(self.model.model.dtype)
@@ -197,7 +197,7 @@ def load_model(
         compute_type = "float16" if device == "cuda" else "float32"
         logger.info(f"Compute type not specified, defaulting to {compute_type} for device {device}")
 
-    device_map = device + ":" + str(device_index)
+    device_map = f"cuda:{device_index}" if device == "cuda" else device
 
     from qwen_asr import Qwen3ASRModel
     qwen_model = model or Qwen3ASRModel.from_pretrained(

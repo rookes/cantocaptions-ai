@@ -58,7 +58,7 @@ def cli():
 
     # alignment params
     parser.add_argument("--align_padding", type=float, default=0.04, help="The minimum allowed timebetween subttitles.")
-    parser.add_argument("--align_release", type=float, default=0.5, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
+    parser.add_argument("--align_release", type=float, default=0.45, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
     parser.add_argument("--align_merge_distance", type=float, default=0.12, help="The maximum distance between utterances that allows them to be merged.")
     parser.add_argument("--diarize_merge", action="store_true", help="Use diarization to detect the same speaker on consecutive lines and merge them.")
 
