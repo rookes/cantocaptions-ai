@@ -37,11 +37,13 @@ The VAD model (`pyannote/segmentation`) requires accepting its terms of use on H
 cantocaptions audio.wav --hf_token hf_...
 ```
 
-### Output directory
+### Custom options
 
-```bash
-cantocaptions audio.wav -o ./subtitles
-```
+* `-o [DIR_NAME]` - output directory for the SRT file
+* `--vocal_isolation_method [OPTION]` - set to "none" for no vocal isolation, or "mbroformer" for full mbroformer vocal isolation
+* `--log_file [FILE_PATH]` - simplify console logging and output full logs to designated file
+* `--debug_dir [DIR_NAME]` - directory for intermediate processed data for debugging purposes
+* `--load_debug_dir [DIR_NAME]` - load previously generated `--debug_dir` data from this directory to skip processing steps (such as VAD, vocal isolation, and transcription)
 
 ## Optional features
 
@@ -61,3 +63,14 @@ cantocaptions audio.wav --ensemble_model whisper
 cantocaptions audio.wav --llm_correction
 cantocaptions audio.wav --diarize          # Linux only
 ```
+
+## Planned Updates
+
+Current updates planned for the near future:
+
+* Add Cantonese standardization and cleaning scripts (adapted from [rookes/canto-subtitle-cleaner](https://github.com/rookes/canto-subtitle-cleaner))
+* Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
+* Improve ensemble+LLM integration to allow for more consistent and error-free transcriptions
+* Complete diarization implementation to separate lines from different speakers
+* Add [SubER](https://github.com/apptek/SubER) metric calculation compatibility, and use its Levenshtein distance algorithm to parallelize ensemble subs
+* Add some subtitle processing helper utilities, such as an SRT retiming utility
