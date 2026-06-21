@@ -70,6 +70,7 @@ Current updates planned for the near future:
 
 * Add Cantonese standardization and cleaning scripts (adapted from [rookes/canto-subtitle-cleaner](https://github.com/rookes/canto-subtitle-cleaner))
 * Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
+* Add better multilingual recognition for Mandarin and English
 * Improve ensemble+LLM integration to allow for more consistent and error-free transcriptions
 * Complete diarization implementation to separate lines from different speakers
 * Add [SubER](https://github.com/apptek/SubER) metric calculation compatibility, and use its Levenshtein distance algorithm to parallelize ensemble subs
