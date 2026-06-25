@@ -228,3 +228,5 @@ Claude.md
 # Log files
 *.log
 temp/
+*.srt
+*.wav

@@ -142,7 +142,7 @@ class QwenPipeline(Pipeline):
         for i in range(0, total, effective_batch):
             batch = vad_segments[i:i + effective_batch]
             wavs = [seg['audio'] for seg in batch]
-            prompts = [self.model._build_text_prompt(context="Character names: 保怡, 巴高.\n\nCantonese conventions:\n* Use Simplified Chinese (簡體字).\n* Transcribe wo3 as '喎' where it appears in the audio.", force_language=language) for _ in batch]
+            prompts = [self.model._build_text_prompt(context="", force_language=language) for _ in batch]
 
             inputs = self.model.processor(text=prompts, audio=wavs, return_tensors="pt", padding=True)
             inputs = inputs.to(self.model.model.device).to(self.model.model.dtype)
@@ -205,7 +205,7 @@ def load_model(
         dtype=compute_type,
         device_map=device_map,
         attn_implementation="sdpa",
-        max_inference_batch_size=64,
+        max_inference_batch_size=24,
         max_new_tokens=256,
     )
 

@@ -80,3 +80,8 @@ explicit = true
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "subtitle-edit-rate>=0.4.0",
+]

@@ -22,7 +22,7 @@ def cli():
     parser.add_argument("--model_dir", type=str, default=None, help="the path to save model files; uses ~/.cache/whisper by default")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"), help="device type to use for PyTorch inference (e.g. cpu, cuda, mps)")
     parser.add_argument("--device_index", default=0, type=int, help="device index to use for inference")
-    parser.add_argument("--batch_size", default=64, type=int, help="the preferred batch size for inference")
+    parser.add_argument("--batch_size", default=24, type=int, help="the preferred batch size for inference")
     parser.add_argument("--compute_type", default="default", type=str, choices=["default", "float16", "float32", "int8"], help="compute type for computation; 'default' uses float16 on GPU, float32 on CPU")
 
     parser.add_argument("--output_dir", "-o", type=str, default=".", help="directory to save the outputs")
