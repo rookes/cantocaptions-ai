@@ -228,5 +228,8 @@ Claude.md
 # Log files
 *.log
 temp/
+
+# Subtitle/Audio/Video files
 *.srt
 *.wav
+*.mp4
