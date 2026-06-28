@@ -3,15 +3,16 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 
-from cantocaptions_ai.utils.audio import SAMPLE_RATE
-from cantocaptions_ai.utils.schema import VadAudioSegment
+from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
+from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
+from cantocaptions_ai.utils.model_utils import PipelineStage
 from cantocaptions_ai.pipeline.vads import Vad, Pyannote
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
 
 
-class VadProcessor:
+class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
     def __init__(
         self,
         vad_model: Vad,
@@ -24,13 +25,13 @@ class VadProcessor:
         self.vad_offset = vad_offset
         self.chunk_size = chunk_size
 
-    def segment(self, audio: np.ndarray) -> List[VadAudioSegment]:
+    def process(self, input: np.ndarray, *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
         """Run VAD on audio and return merged audio segments with timestamps."""
         if issubclass(type(self.vad_model), Vad):
-            waveform = self.vad_model.preprocess_audio(audio)
+            waveform = self.vad_model.preprocess_audio(input)
             merge_chunks = self.vad_model.merge_chunks
         else:
-            waveform = Pyannote.preprocess_audio(audio)
+            waveform = Pyannote.preprocess_audio(input)
             merge_chunks = Pyannote.merge_chunks
 
         raw_segments = self.vad_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
@@ -48,7 +49,7 @@ class VadProcessor:
             segments.append({
                 'start': seg['start'],
                 'end': seg['end'],
-                'audio': audio[f1:f2],
+                'audio': input[f1:f2],
             })
         return segments
 
@@ -67,9 +68,8 @@ def load_vad(
         logger.info("Using manually assigned vad_model. vad_method is ignored.")
     else:
         if vad_method == "pyannote":
-            device_vad = f'cuda:{device_index}' if device == 'cuda' else device
             vad_model = Pyannote(
-                torch.device(device_vad),
+                torch.device(resolve_device(device, device_index)),
                 token=use_auth_token,
                 vad_onset=vad_onset,
                 vad_offset=vad_offset,

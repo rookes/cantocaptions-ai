@@ -4,6 +4,14 @@ import numpy as np
 
 ProgressCallback = Optional[Callable[[float], None]]
 
+
+def interpolate_nans(x, method: str = 'nearest'):
+    """Fill NaN values in a pandas Series using interpolation."""
+    if x.notnull().sum() > 1:
+        return x.interpolate(method=method).ffill().bfill()
+    else:
+        return x.ffill().bfill()
+
 try:
     from typing import NotRequired
 except ImportError:
@@ -96,9 +104,28 @@ class AlignedTranscriptionResult(TypedDict):
     language: str
 
 
+class VadItem(TypedDict):
+    """Intermediate carrier for the VAD and vocal-isolation stages (before transcription)."""
+    audio_path: str
+    vad_segments: List[VadAudioSegment]
+
+
 class ProcessingItem(TypedDict):
-    """Carries one audio file's data through the pipeline stages."""
+    """Carries one audio file's data from transcription onwards."""
     audio_path: str
     result: Union[TranscriptionResult, AlignedTranscriptionResult]
     vad_segments: NotRequired[List[VadAudioSegment]]
     ensemble_texts: NotRequired[List[str]]  # index-aligned alternative ASR hypotheses
+
+
+def merge_segments(seg1: SingleAlignedSegment, seg2: SingleAlignedSegment) -> SingleAlignedSegment:
+    """Merge two adjacent aligned segments into one."""
+    s3_chars = (seg1.get("chars") or []) + (seg2.get("chars") or [])
+    return {
+        "start": seg1["start"],
+        "end": seg2["end"],
+        "text": seg1["text"] + seg2["text"],
+        "avg_logprob": None,
+        "words": seg1["words"] + seg2["words"],
+        "chars": s3_chars or None,
+    }

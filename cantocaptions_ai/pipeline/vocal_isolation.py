@@ -11,8 +11,9 @@ from omegaconf import OmegaConf, DictConfig
 from huggingface_hub import hf_hub_download
 
 from cantocaptions_ai.pipeline.mbroformer.model import MelBandRoformer
-from cantocaptions_ai.utils.audio import SAMPLE_RATE
+from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
+from cantocaptions_ai.utils.model_utils import PipelineStage
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -125,12 +126,12 @@ def _demix_track(config, model, mix, device, first_chunk_time=None):
 # Processor classes
 # ---------------------------------------------------------------------------
 
-class VocalIsolationProcessor:
+class VocalIsolationProcessor(PipelineStage["List[VadAudioSegment]", "List[VadAudioSegment]"]):
     """Base class for vocal isolation processors."""
 
-    def isolate(self, segments: List[VadAudioSegment], progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
+    def process(self, input: List[VadAudioSegment], *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
         """Run isolation then validate that segment durations are consistent."""
-        result = self._isolate(segments, progress_callback=progress_callback)
+        result = self._isolate(input, progress_callback=progress_callback)
         for seg in result:
             expected = seg["end"] - seg["start"]
             actual = len(seg["audio"]) / SAMPLE_RATE
@@ -186,7 +187,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
 
             result.append({"start": seg["start"], "end": seg["end"], "audio": isolated})
             if progress_callback is not None:
-                progress_callback((idx + 1) / n * 100)
+                progress_callback((idx + 1) / n)
 
         return result
 
@@ -263,9 +264,7 @@ def load_vocal_isolation(
         torch.load(checkpoint_path, map_location=torch.device("cpu"))
     )
 
-    torch_device = (
-        torch.device(f"cuda:{device_index}") if device == "cuda" else torch.device(device)
-    )
+    torch_device = torch.device(resolve_device(device, device_index))
     torch_model = torch_model.to(torch_device)
 
     return MbRoformerProcessor(

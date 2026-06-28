@@ -39,7 +39,6 @@ class SpeakerVerificationPipeline:
         self,
         transcript: Iterable[SingleSegment],
         audio: Union[Union[str, np.ndarray], List[Union[str, np.ndarray]]],
-        #segment_spans: List[Tuple[int, int]] = None,
         progress_callback: ProgressCallback = None,
     ) -> pd.DataFrame:
         """
@@ -56,20 +55,10 @@ class SpeakerVerificationPipeline:
         if isinstance(audio, str):
             audio = load_audio(audio)
 
-        #hey do some type checking my guy
         audio_data = [{
                 'input_signal': torch.from_numpy(a[None, :]).to(self.device),
                 'input_len': torch.tensor([torch.from_numpy(a[None, :]).shape[1]]).to(self.device)
             } for a in audio]
-
-        # Convert to Mel spectrogram
-        # processed_signal, processed_len = self.model.preprocessor(
-        #     input_signal=audio_data["input_signal"],
-        #     length=audio_data["input_len"]
-        # )
-
-        #encoder_output = self.model.encoder(audio_signal=processed_signal, length=processed_len)
-        #embeddings = self.model.decoder(encoder_output)
 
         all_embs = []
         for a in audio_data:
@@ -86,7 +75,6 @@ class SpeakerVerificationPipeline:
             this_speech = transcript[i]["text"]
             next_speech = transcript[i+1]["text"]
             sim = F.cosine_similarity(all_embs[i], all_embs[i+1]).item()
-            continue
 
         diarization = F.cosine_similarity(all_embs, all_embs)
 

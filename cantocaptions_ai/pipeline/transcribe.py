@@ -1,16 +1,16 @@
 import argparse
-import gc
 import os
-import time
 import warnings
 
 import numpy as np
 import torch
 
 from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE
-from cantocaptions_ai.utils.schema import AlignedTranscriptionResult, ProgressCallback, TranscriptionResult
-from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer, merge_segments
+from cantocaptions_ai.utils.schema import AlignedTranscriptionResult, ProcessingItem, ProgressCallback, TranscriptionResult, VadItem, merge_segments
+from typing import Callable, List, Optional
+from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer
 from cantocaptions_ai.utils.log_utils import StageTimer, TranscriptionSummary, get_logger
+from cantocaptions_ai.utils.model_utils import model_scope, flush_vram
 from cantocaptions_ai.cantonese.text import is_mergeable, normalize_segment_text
 from cantocaptions_ai.utils.debug import (
     write_vad_debug, write_isolation_debug, write_transcription_debug,
@@ -23,118 +23,119 @@ from cantocaptions_ai.utils.debug import (
 logger = get_logger(__name__)
 
 
+def _load_or_compute(audio_path, load_debug_dir, debug_dir, load_fn, write_fn, compute_fn):
+    """Load a stage result from debug cache, or compute and optionally save it."""
+    if load_debug_dir:
+        cached = load_fn(audio_path, load_debug_dir)
+        if cached is not None:
+            return cached
+    result = compute_fn()
+    if debug_dir:
+        write_fn(audio_path, result, debug_dir)
+    return result
+
+
 def _run_vad(
-    audio_paths: list,
+    audio_paths: List[str],
     vad_processor,
-    debug_dir: str = None,
-    load_debug_dir: str = None,
-) -> list:
-    items = []
+    debug_dir: Optional[str] = None,
+    load_debug_dir: Optional[str] = None,
+) -> List[VadItem]:
+    items: List[VadItem] = []
     for audio_path in audio_paths:
-        vad_loaded = load_vad_debug(audio_path, load_debug_dir) if load_debug_dir else None
-        if vad_loaded is not None:
-            vad_segments = vad_loaded
-        else:
+        def _compute():
             audio = load_audio(audio_path)
             logger.info("Performing voice activity detection...")
-            vad_segments = vad_processor.segment(audio)
-            if debug_dir:
-                write_vad_debug(audio_path, vad_segments, debug_dir)
+            return vad_processor.process(audio)
+        vad_segments = _load_or_compute(
+            audio_path, load_debug_dir, debug_dir,
+            load_vad_debug, write_vad_debug, _compute,
+        )
         items.append({'audio_path': audio_path, 'vad_segments': vad_segments})
     return items
 
 
 def _run_isolation(
-    items: list,
+    items: List[VadItem],
     vocal_isolation_processor,
-    debug_dir: str = None,
-    load_debug_dir: str = None,
+    debug_dir: Optional[str] = None,
+    load_debug_dir: Optional[str] = None,
     progress_callback: ProgressCallback = None,
-) -> list:
-    result_items = []
+) -> List[VadItem]:
+    result_items: List[VadItem] = []
     for item in items:
         audio_path = item['audio_path']
-        isol_loaded = load_isolation_debug(audio_path, load_debug_dir) if load_debug_dir else None
-        if isol_loaded is not None:
-            vad_segments = isol_loaded
-        else:
+        def _compute():
             logger.info("Performing vocal isolation...")
-            vad_segments = vocal_isolation_processor.isolate(item['vad_segments'], progress_callback=progress_callback)
-            if debug_dir:
-                write_isolation_debug(audio_path, vad_segments, debug_dir)
+            return vocal_isolation_processor.process(item['vad_segments'], progress_callback=progress_callback)
+        vad_segments = _load_or_compute(
+            audio_path, load_debug_dir, debug_dir,
+            load_isolation_debug, write_isolation_debug, _compute,
+        )
         result_items.append({'audio_path': audio_path, 'vad_segments': vad_segments})
     return result_items
 
 
 def _run_transcription(
-    items: list,
+    items: List[VadItem],
     model,
-    batch_size: int,
-    print_progress: bool,
-    verbose: bool,
-    debug_dir: str = None,
-    load_debug_dir: str = None,
+    debug_dir: Optional[str] = None,
+    load_debug_dir: Optional[str] = None,
     progress_callback: ProgressCallback = None,
-) -> list:
-    result_items = []
+) -> List[ProcessingItem]:
+    result_items: List[ProcessingItem] = []
     for item in items:
         audio_path = item['audio_path']
-        trans_loaded = load_transcription_debug(audio_path, load_debug_dir) if load_debug_dir else None
-        if trans_loaded is not None:
-            result = trans_loaded
-        else:
+        def _compute():
             logger.info("Performing transcription...")
-            result: TranscriptionResult = model.transcribe(
+            result: TranscriptionResult = model.process(
                 item['vad_segments'],
-                batch_size=batch_size,
-                print_progress=print_progress,
-                verbose=verbose,
                 progress_callback=progress_callback,
-                use_native=False,  # set True to test Qwen's own transcribe()
             )
+            return {**result, 'segments': [normalize_segment_text(seg) for seg in result['segments']]}
+        result = _load_or_compute(
+            audio_path, load_debug_dir, debug_dir,
+            load_transcription_debug, write_transcription_debug, _compute,
+        )
         result_items.append({'audio_path': audio_path, 'result': result, 'vad_segments': item['vad_segments']})
     return result_items
 
 
 def _run_ensemble(
-    items: list,
+    items: List[ProcessingItem],
     ensemble_model,
-    debug_dir: str = None,
-    load_debug_dir: str = None,
+    debug_dir: Optional[str] = None,
+    load_debug_dir: Optional[str] = None,
     progress_callback: ProgressCallback = None,
-) -> list:
-    result_items = []
+) -> List[ProcessingItem]:
+    result_items: List[ProcessingItem] = []
     for item in items:
         audio_path = item['audio_path']
-        loaded = load_ensemble_debug(audio_path, load_debug_dir) if load_debug_dir else None
-        if loaded is not None:
-            alt_texts = loaded
-        else:
+        def _compute():
             logger.info("Running ensemble ASR (faster-whisper)...")
-            alt_texts = ensemble_model.transcribe_segments(
+            return ensemble_model.process(
                 item['vad_segments'],
                 progress_callback=progress_callback,
             )
-            if debug_dir:
-                write_ensemble_debug(audio_path, alt_texts, debug_dir)
+        alt_texts = _load_or_compute(
+            audio_path, load_debug_dir, debug_dir,
+            load_ensemble_debug, write_ensemble_debug, _compute,
+        )
         result_items.append({**item, 'ensemble_texts': alt_texts})
     return result_items
 
 
 def _run_llm_correction(
-    items: list,
+    items: List[ProcessingItem],
     corrector,
-    debug_dir: str = None,
-    load_debug_dir: str = None,
+    debug_dir: Optional[str] = None,
+    load_debug_dir: Optional[str] = None,
     progress_callback: ProgressCallback = None,
-) -> list:
-    result_items = []
+) -> List[ProcessingItem]:
+    result_items: List[ProcessingItem] = []
     for item in items:
         audio_path = item['audio_path']
-        loaded = load_llm_correction_debug(audio_path, load_debug_dir) if load_debug_dir else None
-        if loaded is not None:
-            result = loaded
-        else:
+        def _compute():
             logger.info("Running LLM correction...")
             segments = item['result']['segments']
             ensemble_texts = item.get('ensemble_texts')
@@ -145,22 +146,17 @@ def _run_llm_correction(
             )
             corrected_texts = corrector.normalize_names(corrected_texts)
             new_segments = [{**seg, 'text': corrected_texts[i]} for i, seg in enumerate(segments)]
-            result = {**item['result'], 'segments': new_segments}
-            if debug_dir:
-                write_llm_correction_debug(audio_path, result, debug_dir)
+            return {**item['result'], 'segments': new_segments}
+        result = _load_or_compute(
+            audio_path, load_debug_dir, debug_dir,
+            load_llm_correction_debug, write_llm_correction_debug, _compute,
+        )
         result_items.append({**item, 'result': result})
     return result_items
 
 
-def _normalize_cantonese(items: list) -> list:
-    return [
-        {**item, 'result': {**item['result'], 'segments': [normalize_segment_text(seg) for seg in item['result']['segments']]}}
-        for item in items
-    ]
-
-
 def _run_alignment(
-    items: list,
+    items: List[ProcessingItem],
     align_model,
     align_metadata,
     bert_processor,
@@ -172,7 +168,7 @@ def _run_alignment(
     print_progress: bool,
     batch_size: int,
     progress_callback: ProgressCallback = None,
-) -> list:
+) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.alignment import align
     aligned_items = []
     for item in items:
@@ -201,7 +197,7 @@ def _run_alignment(
     return aligned_items
 
 
-def _extract_timestamps(items: list) -> list:
+def _extract_timestamps(items: list) -> List[ProcessingItem]:
     """Build segment timings from ASR-provided per-character timestamps (used when no_align=True)."""
     extracted_items = []
     for item in items:
@@ -216,16 +212,16 @@ def _extract_timestamps(items: list) -> list:
 
 
 def _run_diarization(
-    items: list,
+    items: List[ProcessingItem],
     diarize_model_name: str,
-    hf_token: str,
+    hf_token: Optional[str],
     device: str,
-    model_dir: str,
-    min_speakers: int,
-    max_speakers: int,
+    model_dir: Optional[str],
+    min_speakers: Optional[int],
+    max_speakers: Optional[int],
     return_speaker_embeddings: bool,
     progress_callback: ProgressCallback = None,
-) -> list:
+) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.diarize import DiarizationPipeline, assign_word_speakers
     logger.info("Performing diarization...")
     logger.info(f"Using model: {diarize_model_name}")
@@ -250,11 +246,11 @@ def _run_diarization(
 
 
 def _run_speaker_verification(
-    items: list,
+    items: List[ProcessingItem],
     device: str,
-    model_dir: str,
+    model_dir: Optional[str],
     progress_callback: ProgressCallback = None,
-) -> list:
+) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.speaker_verification import SpeakerVerificationPipeline
     logger.info("Performing speaker verification...")
     speaker_verification_model = SpeakerVerificationPipeline(device=device, cache_dir=model_dir)
@@ -271,8 +267,40 @@ def _run_speaker_verification(
     return verified_items
 
 
+def _run_retime(
+    items: List[VadItem],
+    retime_path: str,
+    align_model,
+    align_metadata,
+    bert_processor,
+    device: str,
+    score_threshold: float = -5.0,
+    search_window: float = 120.0,
+) -> List[ProcessingItem]:
+    from cantocaptions_ai.pipeline.retime import load_subtitle_file, retime_subtitles
+    logger.info(f"Loading subtitles from: {retime_path}")
+    subtitles = load_subtitle_file(retime_path)
+    logger.info(f"Loaded {len(subtitles)} subtitle lines.")
+    result_items = []
+    for item in items:
+        logger.info("Retiming subtitles against VAD segments...")
+        coarse_segments = retime_subtitles(
+            subtitles,
+            item["vad_segments"],
+            align_model,
+            align_metadata,
+            bert_processor,
+            device,
+            score_threshold=score_threshold,
+            search_window=search_window,
+        )
+        result = {"segments": coarse_segments, "language": align_metadata["language"]}
+        result_items.append({**item, "result": result})
+    return result_items
+
+
 def _merge_and_write(
-    items: list,
+    items: List[ProcessingItem],
     writer,
     align_language: str,
     align_merge_distance: float,
@@ -319,154 +347,110 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         args: Dictionary of command-line arguments.
         parser: argparse.ArgumentParser object.
     """
+    from cantocaptions_ai.pipeline.config import PipelineConfig
 
-    audio_start: float = args.pop("audio_start")
-    audio_end: float = args.pop("audio_end")
+    audio_paths = args.pop("audio")
+    cfg = PipelineConfig.from_args(args)
+    os.makedirs(cfg.output_dir, exist_ok=True)
 
-    model_name: str = args.pop("model")
-    batch_size: int = args.pop("batch_size")
-    model_dir: str = args.pop("model_dir")
-    model_cache_only: bool = args.pop("model_cache_only")
-    output_dir: str = args.pop("output_dir")
-    output_format: str = args.pop("output_format")
-    device: str = args.pop("device")
-    device_index: int = args.pop("device_index")
-    compute_type: str = args.pop("compute_type")
-    verbose: bool = args.pop("verbose")
-
-    # model_flush: bool = args.pop("model_flush")
-    os.makedirs(output_dir, exist_ok=True)
-
-    align_model_name: str = args.pop("align_model")
-    interpolate_method: str = args.pop("interpolate_method")
-    no_align: bool = args.pop("no_align")
-    task: str = "transcribe"
-
-    return_char_alignments: bool = args.pop("return_char_alignments")
-
-    hf_token: str = args.pop("hf_token")
-    vad_method: str = args.pop("vad_method")
-    vad_onset: float = args.pop("vad_onset")
-    vad_offset: float = args.pop("vad_offset")
-
-    chunk_size: int = args.pop("chunk_size")
-
-    vocal_isolation_method: str = args.pop("vocal_isolation_method")
-
-    align_padding: float = args.pop("align_padding")
-    align_release: float = args.pop("align_release")
-    align_merge_distance: float = args.pop("align_merge_distance")
-    diarize_merge: bool = args.pop("diarize_merge")
-
-    diarize: bool = args.pop("diarize")
-    min_speakers: int = args.pop("min_speakers")
-    max_speakers: int = args.pop("max_speakers")
-    diarize_model_name: str = args.pop("diarize_model")
-    print_progress: bool = args.pop("print_progress")
-    return_speaker_embeddings: bool = args.pop("speaker_embeddings")
-
-    verify_speakers: bool = args.pop("verify_speakers")
-    debug_dir: str = args.pop("debug_dir", None)
-    load_debug_dir: str = args.pop("load_debug_dir", None)
-
-    ensemble_model_name: str = args.pop("ensemble_model")
-    llm_correction: bool = args.pop("llm_correction")
-    llm_model: str = args.pop("llm_model")
-    llm_model_dir = args.pop("llm_model_dir")
-
-    if return_speaker_embeddings and not diarize:
+    if cfg.speaker_embeddings and not cfg.diarize:
         warnings.warn("--speaker_embeddings has no effect without --diarize")
 
-    if args["language"] is not None:
-        args["language"] = args["language"].lower()
-        if args["language"] not in LANGUAGES:
-            if args["language"] in TO_LANGUAGE_CODE:
-                args["language"] = TO_LANGUAGE_CODE[args["language"]]
+    if cfg.language is not None:
+        cfg.language = cfg.language.lower()
+        if cfg.language not in LANGUAGES:
+            if cfg.language in TO_LANGUAGE_CODE:
+                cfg.language = TO_LANGUAGE_CODE[cfg.language]
             else:
-                raise ValueError(f"Unsupported language: {args['language']}")
+                raise ValueError(f"Unsupported language: {cfg.language}")
 
-    if args["language"] != "yue":
+    if cfg.language != "yue":
         warnings.warn(
-            f"Configured language '{args['language']}' is not yue/cantonese, and may not be compatibile with this framework."
+            f"Configured language '{cfg.language}' is not yue/cantonese, and may not be compatible with this framework."
         )
 
-    align_language = args["language"] if args["language"] is not None else "yue"
+    align_language = cfg.language if cfg.language is not None else "yue"
+    task: str = "transcribe"
 
     qwen_threads = torch.get_num_threads()
-    if (threads := args.pop("threads")) > 0:
-        torch.set_num_threads(threads)
-        qwen_threads = threads
+    if cfg.threads > 0:
+        torch.set_num_threads(cfg.threads)
+        qwen_threads = cfg.threads
 
     asr_options = {
         "condition_on_previous_text": False,
-        "initial_prompt": args.pop("initial_prompt"),
-        "hotwords": args.pop("hotwords"),
-        "suppress_tokens": [int(x) for x in args.pop("suppress_tokens").split(",")],
-        "suppress_numerals": args.pop("suppress_numerals"),
+        "initial_prompt": cfg.initial_prompt,
+        "hotwords": cfg.hotwords,
+        "suppress_tokens": [int(x) for x in cfg.suppress_tokens.split(",")],
+        "suppress_numerals": cfg.suppress_numerals,
     }
 
-    writer = get_writer(output_format, output_dir)
+    writer = get_writer(cfg.output_format, cfg.output_dir)
     word_options = ["highlight_words", "max_line_count", "max_line_width"]
-    if no_align:
+    if cfg.no_align:
         for option in word_options:
-            if args[option]:
+            if getattr(cfg, option):
                 parser.error(f"--{option} not possible with --no_align")
-    if args["max_line_count"] and not args["max_line_width"]:
+    if cfg.max_line_count and not cfg.max_line_width:
         warnings.warn("--max_line_count has no effect without --max_line_width")
-    writer_args = {arg: args.pop(arg) for arg in word_options}
+    writer_args = {
+        "highlight_words": cfg.highlight_words,
+        "max_line_count": cfg.max_line_count,
+        "max_line_width": cfg.max_line_width,
+    }
 
-    audio_paths = args.pop("audio")
-
-    if load_debug_dir:
+    if cfg.load_debug_dir:
         from pathlib import Path as _Path
         for ap in audio_paths:
-            stem_dir = os.path.join(load_debug_dir, _Path(ap).stem)
+            stem_dir = os.path.join(cfg.load_debug_dir, _Path(ap).stem)
             if not os.path.isdir(stem_dir):
                 parser.error(f"No debug data found for '{ap}': directory '{stem_dir}' does not exist")
 
-    need_asr = not load_debug_dir or any(
-        not _debug_stage_exists(ap, "transcription", load_debug_dir) for ap in audio_paths
+    need_asr = not cfg.retime and (
+        not cfg.load_debug_dir or any(
+            not _debug_stage_exists(ap, "transcription", cfg.load_debug_dir) for ap in audio_paths
+        )
     )
-    need_vad = not load_debug_dir or any(
-        not _debug_stage_exists(ap, "vad", load_debug_dir) for ap in audio_paths
+    need_vad = not cfg.load_debug_dir or any(
+        not _debug_stage_exists(ap, "vad", cfg.load_debug_dir) for ap in audio_paths
     )
     need_vocal_isolation = (
-        bool(vocal_isolation_method) and vocal_isolation_method.lower() != "none"
-        and (not load_debug_dir or any(
-            not _debug_stage_exists(ap, "vocal_isolation", load_debug_dir) for ap in audio_paths
+        bool(cfg.vocal_isolation_method) and cfg.vocal_isolation_method.lower() != "none"
+        and (not cfg.load_debug_dir or any(
+            not _debug_stage_exists(ap, "vocal_isolation", cfg.load_debug_dir) for ap in audio_paths
         ))
     )
     need_ensemble = (
-        ensemble_model_name != "none"
-        and (not load_debug_dir or any(
-            not _debug_stage_exists(ap, "ensemble", load_debug_dir) for ap in audio_paths
+        cfg.ensemble_model != "none"
+        and (not cfg.load_debug_dir or any(
+            not _debug_stage_exists(ap, "ensemble", cfg.load_debug_dir) for ap in audio_paths
         ))
     )
     need_llm = (
-        llm_correction
-        and (not load_debug_dir or any(
-            not _debug_stage_exists(ap, "llm_correction", load_debug_dir) for ap in audio_paths
+        cfg.llm_correction
+        and (not cfg.load_debug_dir or any(
+            not _debug_stage_exists(ap, "llm_correction", cfg.load_debug_dir) for ap in audio_paths
         ))
     )
 
-    summary = TranscriptionSummary(enabled=print_progress)
+    summary = TranscriptionSummary(enabled=cfg.print_progress)
 
     # Stage 1: VAD loading & processing
     with StageTimer("VAD loading & processing", summary):
         if need_vad:
             from cantocaptions_ai.pipeline.vad import load_vad
             vad_processor = load_vad(
-                vad_method=vad_method,
-                device=device,
-                device_index=device_index,
-                vad_onset=vad_onset,
-                vad_offset=vad_offset,
-                chunk_size=chunk_size,
-                use_auth_token=hf_token,
+                vad_method=cfg.vad_method,
+                device=cfg.device,
+                device_index=cfg.device_index,
+                vad_onset=cfg.vad_onset,
+                vad_offset=cfg.vad_offset,
+                chunk_size=cfg.chunk_size,
+                use_auth_token=cfg.hf_token,
             )
         else:
             vad_processor = None
-        items = _run_vad(audio_paths, vad_processor, debug_dir=debug_dir, load_debug_dir=load_debug_dir)
+        items = _run_vad(audio_paths, vad_processor, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir)
 
     # Stage 2: Vocal Isolation (conditional)
     vocal_isolation_processor = None
@@ -474,135 +458,141 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         with StageTimer("Vocal isolation", summary) as stage:
             from cantocaptions_ai.pipeline.vocal_isolation import load_vocal_isolation
             vocal_isolation_processor = load_vocal_isolation(
-                model_name=vocal_isolation_method,
-                device=device,
-                device_index=device_index,
+                model_name=cfg.vocal_isolation_method,
+                device=cfg.device,
+                device_index=cfg.device_index,
             )
-            items = _run_isolation(items, vocal_isolation_processor, debug_dir=debug_dir, load_debug_dir=load_debug_dir, progress_callback=stage.callback)
-
-    t0 = time.time()
+            items = _run_isolation(items, vocal_isolation_processor, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
 
     # Free VAD and isolation models before loading ASR to maximise available GPU memory.
     if vad_processor is not None:
         del vad_processor
-        vad_processor = None
     if vocal_isolation_processor is not None:
         del vocal_isolation_processor
-        vocal_isolation_processor = None
-    gc.collect()
-    torch.cuda.empty_cache()
+    flush_vram()
 
-    print(f"[TIMING] Model cleanup: {time.time() - t0:.1f}s")  # line 459
-
-    # Stage 3: Transcription
-    model = None
-
-    t1 = time.time()
-    with StageTimer("Transcription", summary) as stage:
+    if cfg.retime:
+        # Retime mode: skip ASR entirely; use the alignment model for both search and fine alignment.
+        from transformers import Wav2Vec2BertProcessor
+        from cantocaptions_ai.pipeline.alignment import load_align_model
+        bert_processor = Wav2Vec2BertProcessor.from_pretrained("alvanlii/wav2vec2-BERT-cantonese")
+        align_model, align_metadata = load_align_model(
+            align_language, cfg.device, cfg.device_index,
+            model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
+        )
+        with StageTimer("Subtitle retiming + alignment", summary) as stage:
+            items = _run_retime(items, cfg.retime, align_model, align_metadata, bert_processor, cfg.device)
+            if not cfg.no_align:
+                items = _run_alignment(
+                    items, align_model, align_metadata, bert_processor, cfg.device,
+                    cfg.align_padding, cfg.align_release, cfg.interpolate_method,
+                    cfg.return_char_alignments, cfg.print_progress, cfg.batch_size,
+                    progress_callback=stage.callback,
+                )
+            else:
+                items = _extract_timestamps(items)
+        del align_model, bert_processor
+        flush_vram()
+    else:
+        # Stage 3: Transcription
+        load_model = None
         if need_asr:
             from cantocaptions_ai.pipeline.asr import load_model
-            model = load_model(
-                model_name,
-                device=device,
-                device_index=device_index,
-                download_root=model_dir,
-                compute_type=compute_type,
-                language=args["language"],
-                asr_options=asr_options,
-                vocal_isolation_method=vocal_isolation_method,
-                task=task,
-                local_files_only=model_cache_only,
-                threads=qwen_threads,
-                use_auth_token=hf_token,
-            )
+        with model_scope(
+            load_model,
+            cfg.model,
+            device=cfg.device,
+            device_index=cfg.device_index,
+            download_root=cfg.model_dir,
+            compute_type=cfg.compute_type,
+            language=cfg.language,
+            asr_options=asr_options,
+            vocal_isolation_method=cfg.vocal_isolation_method,
+            task=task,
+            local_files_only=cfg.model_cache_only,
+            threads=qwen_threads,
+            use_auth_token=cfg.hf_token,
+            batch_size=cfg.batch_size,
+            print_progress=cfg.print_progress,
+            verbose=cfg.verbose,
+        ) as model:
+            with StageTimer("Transcription", summary) as stage:
+                items = _run_transcription(
+                    items, model,
+                    debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir,
+                    progress_callback=stage.callback,
+                )
 
-            print(f"[TIMING] load_model: {time.time() - t1:.1f}s")     # line after load_model
-
-        t2 = time.time()
-        items = _run_transcription(items, model, batch_size, print_progress, verbose, debug_dir=debug_dir, load_debug_dir=load_debug_dir, progress_callback=stage.callback)
-        print(f"[TIMING] _run_transcription: {time.time() - t2:.1f}s")
-
-    items = _normalize_cantonese(items)
-    if debug_dir:
-        for item in items:
-            write_transcription_debug(item['audio_path'], item['result'], debug_dir)
-
-    if model is not None:
-        del model
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # Stage 3b: Ensemble ASR (optional)
-    if ensemble_model_name != "none":
-        with StageTimer("Ensemble ASR (faster-whisper)", summary) as stage:
-            ensemble = None
+        # Stage 3b: Ensemble ASR (optional)
+        if cfg.ensemble_model != "none":
+            load_faster_whisper = None
             if need_ensemble:
                 from cantocaptions_ai.pipeline.ensemble import load_faster_whisper
-                ensemble = load_faster_whisper(
-                    device=device,
-                    device_index=device_index,
-                    model_dir=model_dir,
-                    local_files_only=model_cache_only,
-                )
-            items = _run_ensemble(items, ensemble, debug_dir=debug_dir, load_debug_dir=load_debug_dir, progress_callback=stage.callback)
-        if ensemble is not None:
-            del ensemble
-        gc.collect()
-        torch.cuda.empty_cache()
+            with model_scope(
+                load_faster_whisper,
+                device=cfg.device,
+                device_index=cfg.device_index,
+                model_dir=cfg.model_dir,
+                local_files_only=cfg.model_cache_only,
+            ) as ensemble:
+                with StageTimer("Ensemble ASR (faster-whisper)", summary) as stage:
+                    items = _run_ensemble(items, ensemble, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
 
-    # Stage 3c: LLM correction (optional)
-    if llm_correction:
-        with StageTimer("LLM correction", summary) as stage:
-            corrector = None
+        # Stage 3c: LLM correction (optional)
+        if cfg.llm_correction:
+            load_llm = None
             if need_llm:
                 from cantocaptions_ai.pipeline.llm_correction import load_llm
-                corrector = load_llm(
-                    model_id=llm_model,
-                    model_dir=llm_model_dir,
-                    device=device,
-                    local_files_only=model_cache_only,
-                )
-            items = _run_llm_correction(items, corrector, debug_dir=debug_dir, load_debug_dir=load_debug_dir, progress_callback=stage.callback)
-        if corrector is not None:
-            del corrector
-        gc.collect()
-        torch.cuda.empty_cache()
+            with model_scope(
+                load_llm,
+                model_id=cfg.llm_model,
+                model_dir=cfg.llm_model_dir,
+                device=cfg.device,
+                local_files_only=cfg.model_cache_only,
+            ) as corrector:
+                with StageTimer("LLM correction", summary) as stage:
+                    items = _run_llm_correction(items, corrector, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
 
-    # Stage 4: Alignment
-    if not no_align:
-        with StageTimer("Alignment", summary) as stage:
+        # Stage 4: Alignment
+        if not cfg.no_align:
             from transformers import Wav2Vec2BertProcessor
             from cantocaptions_ai.pipeline.alignment import load_align_model
             bert_processor = Wav2Vec2BertProcessor.from_pretrained("alvanlii/wav2vec2-BERT-cantonese")
             align_model, align_metadata = load_align_model(
-                align_language, device, model_name=align_model_name, model_dir=model_dir, model_cache_only=model_cache_only
+                align_language, cfg.device, cfg.device_index,
+                model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
             )
-            items = _run_alignment(
-                items, align_model, align_metadata, bert_processor, device,
-                align_padding, align_release, interpolate_method, return_char_alignments, print_progress, batch_size,
-                progress_callback=stage.callback,
-            )
-        del align_model, bert_processor
-        gc.collect()
-        torch.cuda.empty_cache()
-    else:
-        items = _extract_timestamps(items)
+            with StageTimer("Alignment", summary) as stage:
+                items = _run_alignment(
+                    items, align_model, align_metadata, bert_processor, cfg.device,
+                    cfg.align_padding, cfg.align_release, cfg.interpolate_method,
+                    cfg.return_char_alignments, cfg.print_progress, cfg.batch_size,
+                    progress_callback=stage.callback,
+                )
+            del align_model, bert_processor
+            flush_vram()
+        else:
+            items = _extract_timestamps(items)
 
     # Stage 5: Diarization
-    if diarize:
-        if hf_token is None:
+    if cfg.diarize:
+        if cfg.hf_token is None:
             logger.warning(
                 "No --hf_token provided, needs to be saved in environment variable, otherwise will throw error loading diarization model"
             )
         with StageTimer("Diarization", summary) as stage:
-            items = _run_diarization(items, diarize_model_name, hf_token, device, model_dir, min_speakers, max_speakers, return_speaker_embeddings, progress_callback=stage.callback)
+            items = _run_diarization(
+                items, cfg.diarize_model, cfg.hf_token, cfg.device, cfg.model_dir,
+                cfg.min_speakers, cfg.max_speakers, cfg.speaker_embeddings,
+                progress_callback=stage.callback,
+            )
 
     # Stage 6: Speaker Verification
-    if verify_speakers:
+    if cfg.verify_speakers:
         with StageTimer("Speaker verification", summary) as stage:
-            items = _run_speaker_verification(items, device, model_dir, progress_callback=stage.callback)
+            items = _run_speaker_verification(items, cfg.device, cfg.model_dir, progress_callback=stage.callback)
 
     # Write
-    _merge_and_write(items, writer, align_language, align_merge_distance, align_padding, writer_args)
+    _merge_and_write(items, writer, align_language, cfg.align_merge_distance, cfg.align_padding, writer_args)
 
     summary.print_summary()

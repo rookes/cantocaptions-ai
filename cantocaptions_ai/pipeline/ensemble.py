@@ -2,30 +2,32 @@ import os
 from typing import List, Optional
 
 from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
+from cantocaptions_ai.utils.model_utils import PipelineStage
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
 
 
-class FasterWhisperEnsemble:
+class FasterWhisperEnsemble(PipelineStage["List[VadAudioSegment]", "List[str]"]):
     """Second ASR model (faster-whisper) for ensemble transcription."""
 
     def __init__(self, model, device: str) -> None:
         self._model = model
         self._device = device
 
-    def transcribe_segments(
+    def process(
         self,
-        vad_segments: List[VadAudioSegment],
+        input: List[VadAudioSegment],
+        *,
         progress_callback: ProgressCallback = None,
     ) -> List[str]:
         """Transcribe each VAD segment, returning one text string per segment."""
-        if not vad_segments:
+        if not input:
             return []
 
         texts = []
-        n = len(vad_segments)
-        for i, seg in enumerate(vad_segments):
+        n = len(input)
+        for i, seg in enumerate(input):
             try:
                 segments_iter, _ = self._model.transcribe(
                     seg['audio'],
@@ -39,7 +41,7 @@ class FasterWhisperEnsemble:
                 text = ""
             texts.append(text)
             if progress_callback is not None:
-                progress_callback((i + 1) / n * 100)
+                progress_callback((i + 1) / n)
 
         return texts
 

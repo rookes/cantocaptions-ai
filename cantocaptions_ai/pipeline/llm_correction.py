@@ -81,7 +81,7 @@ class LLMCorrector:
             corrected.append(self._sanitize_pass_a(response, primary))
 
             if progress_callback is not None:
-                progress_callback((i + 1) / n * 100)
+                progress_callback((i + 1) / n)
 
         return corrected
 

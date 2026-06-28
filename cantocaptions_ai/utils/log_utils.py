@@ -1,5 +1,7 @@
+import itertools
 import logging
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -122,6 +124,8 @@ class StageTimer:
         self._start: float = 0.0
         self._bar: "Optional[_TqdmBar]" = None
         self._determinate: bool = False
+        self._spinner_stop: threading.Event = threading.Event()
+        self._spinner_thread: Optional[threading.Thread] = None
 
     def __enter__(self) -> "StageTimer":
         if not self._summary.enabled:
@@ -129,21 +133,38 @@ class StageTimer:
             return self
         from tqdm import tqdm
         self._start = time.perf_counter()
+        self._spinner_stop.clear()
         self._bar = tqdm(
             desc=self._label,
-            bar_format="{desc}: {elapsed}",
+            bar_format="{desc}",
             leave=True,
             file=sys.__stdout__,
             dynamic_ncols=True,
         )
+        self._spinner_thread = threading.Thread(target=self._spin, daemon=True)
+        self._spinner_thread.start()
         return self
+
+    def _spin(self) -> None:
+        for char in itertools.cycle(r'\|/-'):
+            if self._spinner_stop.is_set():
+                break
+            if not self._determinate and self._bar is not None:
+                self._bar.set_description_str(f"{self._label} {char}")
+                self._bar.refresh()
+            self._spinner_stop.wait(0.12)
 
     def __exit__(self, *_: object) -> None:
         elapsed = time.perf_counter() - self._start
+        self._spinner_stop.set()
+        if self._spinner_thread is not None:
+            self._spinner_thread.join(timeout=0.5)
         if self._bar is not None:
             if self._determinate:
                 self._bar.n = 100
                 self._bar.last_print_n = 100
+            else:
+                self._bar.set_description_str(f"{self._label}: Complete")
             self._bar.close()
         self._summary.record(self._label, elapsed)
 
@@ -156,6 +177,9 @@ class StageTimer:
         if not self._summary.enabled:
             return
         if not self._determinate:
+            self._spinner_stop.set()
+            if self._spinner_thread is not None:
+                self._spinner_thread.join(timeout=0.5)
             if self._bar is not None:
                 self._bar.leave = False
                 self._bar.close()
@@ -170,5 +194,5 @@ class StageTimer:
             )
             self._determinate = True
         if self._bar is not None:
-            self._bar.n = pct
+            self._bar.n = pct * 100
             self._bar.refresh()

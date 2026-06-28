@@ -9,8 +9,8 @@ from typing import Iterable, Optional, Union, List, Tuple
 import numpy as np
 import torch
 
-from cantocaptions_ai.utils.audio import SAMPLE_RATE, load_audio, log_mel_spectrogram
-from cantocaptions_ai.utils.output import interpolate_nans, PUNKT_LANGUAGES
+from cantocaptions_ai.utils.audio import SAMPLE_RATE, load_audio, log_mel_spectrogram, resolve_device
+from cantocaptions_ai.utils.output import PUNKT_LANGUAGES
 from cantocaptions_ai.utils.schema import (
     AlignedTranscriptionResult,
     SingleSegment,
@@ -19,8 +19,9 @@ from cantocaptions_ai.utils.schema import (
     SegmentData,
     ProgressCallback,
     VadAudioSegment,
+    interpolate_nans,
 )
-from cantocaptions_ai.cantonese.text import SPLIT_CHARS, standardize_chars_hk, locate_particles, get_particle_candidates
+from cantocaptions_ai.cantonese.text import SPLIT_CHARS, get_particle_candidates
 
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.output import LANGUAGES_WITHOUT_SPACES
@@ -301,7 +302,6 @@ def _preprocess_transcript(
     model_lang: str,
     model_dictionary: dict,
     print_progress: bool = False,
-    combined_progress: bool = False,
 ) -> dict:
     """First pass: build SegmentData for every transcript segment."""
     total = len(transcript)
@@ -348,6 +348,11 @@ def _compute_vad_emissions(
         frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
         results.append((emission, frame_rate))
     return results
+
+
+def compute_vad_emissions(vad_segments, model, model_type, bert_processor, device):
+    """Public wrapper around _compute_vad_emissions for use by the retime pipeline."""
+    return _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device)
 
 
 def _get_emission_for_segment(
@@ -425,7 +430,7 @@ def _align_segment(
     trellis = get_trellis(emission, tokens, blank_id)
     path = backtrack(trellis, emission, tokens, blank_id)
 
-    print(f"Checking particle candidates for text: '{text_clean}'.")
+    logger.debug("Checking particle candidates for text: '%s'.", text_clean)
 
     lowercase_text = text.lower()
     t_i = 0
@@ -458,34 +463,9 @@ def _align_segment(
             text_clean = text_clean[:p_i] + best_candidate + text_clean[p_i + 1:]
             text = text[:t_i - 1] + best_candidate + text[t_i:] # messy :(
 
-        print(f"Best candidate for char '{p_i}' ('{p}') : '{best_candidate}' (score {round(max_score, 3)}).")
+        logger.debug("Best candidate for char '%d' ('%s'): '%s' (score %.3f).", p_i, p, best_candidate, max_score)
 
     seg_data["clean_char"] = [c for c in text_clean]
-    #t_particles = locate_particles(text_clean)
-    #last_p_e = 0
-    #for (p_sx, p_e), p in t_particles:
-    #    candidates = get_particle_candidates(p)
-    #    if len(candidates) <= 1:
-    #        last_p_e = p_e
-    #        continue
-    #
-    #    p_s = p_sx - 1 if p_sx >= 1 else p_sx
-    #    path_s_i = min(x.time_index for x in path if x.token_index == p_s)
-    #    path_e_i = max(x.time_index for x in path if x.token_index == p_e)
-    #
-    #    max_score = 0.0
-    #    best_candidate = None
-    #    for c in candidates:
-    #        c_tokens = [model_dictionary[c_tk] for c_tk in c]
-    #        c_tokens.append(spacing_char_id)
-    #        if p_s < p_sx:
-    #            c_tokens.insert(0, model_dictionary[text_clean[p_s]] if text_clean[p_s] in model_dictionary else spacing_char_id)
-    #        score = get_score(emission[path_s_i:path_e_i + 1, :], c_tokens, blank_id)
-    #        if score > max_score:
-    #            best_candidate, max_score = c, score
-    #
-    #    print(f"Best candidate for '{text_clean[last_p_e:p_e]}': '{best_candidate}' (score {round(max_score, 3)}).")
-    #    last_p_e = p_e
 
     if path is None:
         logger.warning(f'Failed to align segment ("{text}"): backtrack failed, resorting to original')
@@ -588,7 +568,7 @@ def _align_segment(
 
 # --- Public functions ---
 
-def load_align_model(language_code: str, device: str, model_name: Optional[str] = None, model_dir=None, model_cache_only: bool = False):
+def load_align_model(language_code: str, device: str, device_index: int = 0, model_name: Optional[str] = None, model_dir=None, model_cache_only: bool = False):
     if model_name is None:
         if language_code in DEFAULT_ALIGN_MODELS_TORCH:
             model_name = DEFAULT_ALIGN_MODELS_TORCH[language_code]
@@ -601,6 +581,8 @@ def load_align_model(language_code: str, device: str, model_name: Optional[str] 
                 f"then pass the model name via --align_model [MODEL_NAME]"
             )
             raise ValueError(f"No default align-model for language: {language_code}")
+
+    device = resolve_device(device, device_index)
 
     import torchaudio
     if model_name in torchaudio.pipelines.__all__:
@@ -619,8 +601,7 @@ def load_align_model(language_code: str, device: str, model_name: Optional[str] 
             processor = ProcessorClass.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
             align_model = ModelClass.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
         except Exception as e:
-            print(e)
-            print(f"Error loading model from huggingface, check https://huggingface.co/models for finetuned {model_flavor} models")
+            logger.error("Error loading model from huggingface (%s): %s", model_name, e)
             raise ValueError(
                 f'The chosen align_model "{model_name}" could not be found in huggingface '
                 f'(https://huggingface.co/models) or torchaudio (https://pytorch.org/audio/stable/pipelines.html#id14)'
@@ -645,7 +626,6 @@ def align(
     interpolate_method: str = "nearest",
     return_char_alignments: bool = False,
     print_progress: bool = False,
-    combined_progress: bool = False,
     progress_callback: ProgressCallback = None,
     batch_size: int = 4,
 ) -> AlignedTranscriptionResult:
@@ -680,7 +660,7 @@ def align(
     # --- Preprocess transcript ---
     transcript = list(transcript)
     total_segments = len(transcript)
-    segment_data = _preprocess_transcript(transcript, model_lang, model_dictionary, print_progress, combined_progress)
+    segment_data = _preprocess_transcript(transcript, model_lang, model_dictionary, print_progress)
 
     # --- Align each segment ---
     aligned_segments: List[SingleAlignedSegment] = []
@@ -718,7 +698,7 @@ def align(
         aligned_segments += subsegments
 
         if progress_callback is not None:
-            progress_callback(((sdx + 1) / total_segments) * 100)
+            progress_callback((sdx + 1) / total_segments)
 
     # --- Collect word segments ---
     word_segments: List[SingleWordSegment] = [w for seg in aligned_segments for w in seg["words"]]

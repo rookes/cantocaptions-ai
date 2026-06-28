@@ -50,24 +50,10 @@ QUESTION_WORDS = ['做乜', '係咪', '未', '有冇', '好冇', '邊', '咩', '
 RE_QUESTION_DELIMITING_PUNCTUATION = re.compile(r'([？！。：；]+)')
 ZH = r'[一-鿿]'
 
-def _resub(text, pattern, repl):
-    """Helper function to perform regex substitution."""
-
-    return re.sub(pattern, repl, text)
-
 def _resub(text, regex_list):
-    """Helper function to perform multiple regex substitutions."""
-
     for pattern, repl in regex_list:
         text = re.sub(pattern, repl, text)
-
     return text
-
-def _segments(text) -> List[str]:
-    line = re.sub(RE_QUESTION_DELIMITING_PUNCTUATION, r'\1,', line) # add an English comma as our new delimiter
-    line = [x for x in line.split(',') if x] # remove empty segments
-
-    return line
 
 def _clean_punctuation(text):
     regex_list = [
@@ -91,56 +77,6 @@ def _clean_punctuation(text):
     ]
 
     return _resub(text, regex_list)
-
-def _clean_question_particles(text):
-    # Smart replacement of final particles based on question context
-    segments = _segments(text)
-
-    def _is_question(s):
-        if s[-1] == '？':
-            if re.search(r'([一-鿿])唔\1', s) or any(word in s for word in QUESTION_WORDS):
-                return True
-
-        return False
-
-    def _update_segment(s):
-        if s == '':
-            return s
-
-        has_question_mark = s[-1] == '？'
-
-        if _is_question(s):        # has question mark and question word
-            s = s.replace('呀', '啊')
-            s = s.replace('嘎', '㗎')
-            s = s.replace('啫？', '唧？')
-
-            # 啊 -> 呀 in cases like "乜你覺得唔開心啊？"
-            if s[0] == '乜' and s[1] != '嘢':
-                s = s.replace('啊？', '呀？')
-        elif has_question_mark:         # has question mark and no question word
-            s = s.replace('㗎？','嘎？')
-            s = s.replace('啊？','呀？')
-        else:                           # no question mark and no question word
-            s = s.replace('呀', '啊')
-            s = s.replace('嘎', '㗎')
-
-        return s
-
-    segments = map(_update_segment, segments)
-    text = ''.join(segments)
-
-    regex_list = [
-        (r'(?<![，。！!?.;？；…])係咪(?=[呀啊吖？])', '，係咪'), # add comma to tag question 係咪
-        (r'[㗎喇]㗎', '㗎'),
-        (r'嘅？', '𠸏？'),
-        ('啦啦聲', '嗱嗱聲'),
-        (r'([啊喎喇啦㗎咋噃嗎嘛])(?![？\n！，…啊呀吖喇啦喎啝噃咩吒咋喳啫唧嗎嗱呢𠻹添㖭嘛嗎囉囖咯])', r'\1，'), #Add comma after final particles
-        (r'^啊…', '') # Remove isolated 啊…
-    ]
-
-    text = _resub(text, regex_list)
-
-    return text
 
 def simplified_to_traditional(text: str) -> str:
     return cc.convert(text)
@@ -322,8 +258,3 @@ def separate_particle_candidates(sentence: str, particle_map: Dict[str, List[str
     candidate_p = particle_map.get(p, [p])
     return [(s, px) for px in candidate_p]
 
-def preprocess_line(text: str) -> str:
-    return standardize_chars_hk(str)
-
-def postprocess_line(text: str) -> str:
-    return str

@@ -21,6 +21,11 @@ N_SAMPLES_PER_TOKEN = HOP_LENGTH * 2  # the initial convolutions has stride 2
 FRAMES_PER_SECOND = exact_div(SAMPLE_RATE, HOP_LENGTH)  # 10ms per audio frame
 TOKENS_PER_SECOND = exact_div(SAMPLE_RATE, N_SAMPLES_PER_TOKEN)  # 20ms per audio token
 
+def resolve_device(device: str, device_index: int = 0) -> str:
+    """Return a torch-compatible device string (e.g. 'cuda:0', 'cpu')."""
+    return f"cuda:{device_index}" if device == "cuda" else device
+
+
 def load_audio(file: str, sr: int = SAMPLE_RATE) -> np.ndarray:
     """
     Open an audio file and read as mono waveform, resampling as necessary

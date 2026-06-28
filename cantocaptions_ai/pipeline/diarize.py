@@ -108,7 +108,6 @@ class DiarizationPipeline:
         model_config = model_name or "pyannote/speaker-diarization-community-1"
         logger.info(f"Loading diarization model: {model_config}")
 
-        #self.model = Pipeline.from_pretrained(model_config, token=token, cache_dir=cache_dir).to(device)
         self.model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained("nvidia/speakerverification_en_titanet_large").to(device)
         self.model.eval()
 
@@ -165,22 +164,11 @@ class DiarizationPipeline:
                         last_pct[0] = pct
                         progress_callback(pct)
 
-        # output = self.model(
-        #     audio_data,
-        #     num_speakers=num_speakers,
-        #     min_speakers=min_speakers,
-        #     max_speakers=max_speakers,
-        #     **({"hook": hook} if hook is not None else {}),
-        # )
-
         # Convert to Mel spectrogram
         processed_signal, processed_len = self.model.preprocessor(
             input_signal=audio_data["input_signal"],
             length=audio_data["input_len"]
         )
-
-        #encoder_output = self.model.encoder(audio_signal=processed_signal, length=processed_len)
-        #embeddings = self.model.decoder(encoder_output)
 
         _, embs = self.model.forward(input_signal=audio_data["input_signal"], input_signal_length=audio_data["input_len"])
         emb_shape = embs.shape[-1]
@@ -192,11 +180,6 @@ class DiarizationPipeline:
 
         import torch.nn.functional as F
         diarization = F.cosine_similarity(all_embs, all_embs)
-
-        #diarization, embeddings = output
-        #diarization = output.speaker_diarization
-        #embeddings = output.speaker_embeddings if return_embeddings else None
-        #exclusive = output.exclusive_speaker_diarization #TODO: test exclusive mode with pyannote
 
         diarize_df = pd.DataFrame(diarization.itertracks(yield_label=True), columns=['segment', 'label', 'speaker'])
         diarize_df['start'] = diarize_df['segment'].apply(lambda x: x.start)
@@ -244,20 +227,6 @@ def assign_word_speakers(
         for _, row in diarize_df.iterrows()
     ]
     tree = IntervalTree(intervals)
-
-    # For testing: draw a plot of the diarization
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(10, 4))
-    colors = {'SPEAKER_00': 'black', 'SPEAKER_01': 'blue', 'SPEAKER_02': 'green', 'SPEAKER_03': 'red', 'SPEAKER_04': 'yellow', 'SPEAKER_05': 'purple'}
-    for i, speaker in enumerate(diarize_df['speaker'].unique()):
-        speaker_data = diarize_df[diarize_df['speaker'] == speaker]
-        xranges = [(row['start'], row['end'] - row['start']) for _, row in speaker_data.iterrows()]
-        ax.broken_barh(xranges, (i-0.4, 0.8), facecolors=colors[speaker], label=speaker)
-    ax.set_yticks(range(len(diarize_df['speaker'].unique())))
-    ax.set_yticklabels(diarize_df['speaker'].unique())
-    ax.set_xlabel('Time (seconds)')
-    ax.set_title('Speaker Diarization Timeline')
-    plt.show()
 
     for seg in transcript_segments:
         seg_start = seg.get('start', 0.0)
