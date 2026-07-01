@@ -15,6 +15,7 @@ class PipelineConfig:
     device: str = "cpu"
     device_index: int = 0
     compute_type: str = "default"
+    attn_implementation: str = "sdpa"
     batch_size: int = 16
     threads: int = 0
     hf_token: Optional[str] = None
@@ -87,6 +88,10 @@ class PipelineConfig:
 
     # Retime
     retime: Optional[str] = None
+
+    # Reference subtitle correction
+    reference_subtitle: Optional[str] = None
+    reference_correction_semantic: bool = False
 
     @classmethod
     def from_args(cls, args: dict) -> "PipelineConfig":

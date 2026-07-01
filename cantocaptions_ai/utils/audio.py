@@ -1,7 +1,8 @@
+import json
 import os
 import subprocess
 from functools import lru_cache
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -26,7 +27,49 @@ def resolve_device(device: str, device_index: int = 0) -> str:
     return f"cuda:{device_index}" if device == "cuda" else device
 
 
-def load_audio(file: str, sr: int = SAMPLE_RATE) -> np.ndarray:
+def probe_audio_tracks(file: str) -> List[dict]:
+    """Return ffprobe metadata for all audio streams in *file*.
+
+    Returns an empty list if the file has no audio streams, ffprobe cannot read
+    the file, or ffprobe is unavailable. Raises RuntimeError if ffprobe is not
+    found on PATH (i.e. ffmpeg is not installed).
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        "-select_streams", "a",
+        file,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, check=False)
+    except FileNotFoundError:
+        raise RuntimeError("ffprobe not found; ensure ffmpeg is installed and on PATH")
+    try:
+        data = json.loads(result.stdout)
+        return data.get("streams", [])
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+def select_cantonese_track(streams: List[dict]) -> int:
+    """Return the 0-based audio stream index for the first Cantonese track.
+
+    Checks each stream's tags for ``language == "yue"`` or a title containing
+    ``"cantonese"`` (case-insensitive). Returns 0 if no matching track is found,
+    which causes ffmpeg to use its default stream-selection heuristic.
+    """
+    for i, stream in enumerate(streams):
+        tags = stream.get("tags", {})
+        if tags.get("language") == "yue":
+            return i
+        if "cantonese" in tags.get("title", "").lower():
+            return i
+    return 0
+
+
+def load_audio(file: str, sr: int = SAMPLE_RATE, audio_track: int = 0) -> np.ndarray:
     """
     Open an audio file and read as mono waveform, resampling as necessary
 
@@ -43,23 +86,10 @@ def load_audio(file: str, sr: int = SAMPLE_RATE) -> np.ndarray:
     A NumPy array containing the audio waveform, in float32 dtype.
     """
     try:
-        cmd = [
-            "ffmpeg",
-            "-nostdin",
-            "-threads",
-            "0",
-            "-i",
-            file,
-            "-f",
-            "s16le",
-            "-ac",
-            "1",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            str(sr),
-            "-",
-        ]
+        cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", file]
+        if audio_track != 0:
+            cmd += ["-map", f"0:a:{audio_track}"]
+        cmd += ["-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), "-"]
         out = subprocess.run(cmd, capture_output=True, check=True).stdout
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e

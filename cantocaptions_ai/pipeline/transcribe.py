@@ -1,158 +1,44 @@
 import argparse
 import os
+import time
 import warnings
 
 import numpy as np
 import torch
 
 from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE
-from cantocaptions_ai.utils.schema import AlignedTranscriptionResult, ProcessingItem, ProgressCallback, TranscriptionResult, VadItem, merge_segments
+from cantocaptions_ai.utils.schema import AlignedTranscriptionResult, ProcessingItem, ProgressCallback, VadItem, merge_segments
 from typing import Callable, List, Optional
 from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer
 from cantocaptions_ai.utils.log_utils import StageTimer, TranscriptionSummary, get_logger
-from cantocaptions_ai.utils.model_utils import model_scope, flush_vram
-from cantocaptions_ai.cantonese.text import is_mergeable, normalize_segment_text
-from cantocaptions_ai.utils.debug import (
-    write_vad_debug, write_isolation_debug, write_transcription_debug,
-    write_ensemble_debug, write_llm_correction_debug,
-    load_vad_debug, load_isolation_debug, load_transcription_debug,
-    load_ensemble_debug, load_llm_correction_debug,
-    _debug_stage_exists,
-)
+from cantocaptions_ai.utils.model_utils import model_scope, flush_vram, vram_stats
+from cantocaptions_ai.cantonese.text import is_mergeable
+from cantocaptions_ai.utils.debug import _debug_stage_exists
 
 logger = get_logger(__name__)
 
-
-def _load_or_compute(audio_path, load_debug_dir, debug_dir, load_fn, write_fn, compute_fn):
-    """Load a stage result from debug cache, or compute and optionally save it."""
-    if load_debug_dir:
-        cached = load_fn(audio_path, load_debug_dir)
-        if cached is not None:
-            return cached
-    result = compute_fn()
-    if debug_dir:
-        write_fn(audio_path, result, debug_dir)
-    return result
+_VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.ts', '.m2ts'}
 
 
-def _run_vad(
-    audio_paths: List[str],
-    vad_processor,
-    debug_dir: Optional[str] = None,
-    load_debug_dir: Optional[str] = None,
-) -> List[VadItem]:
-    items: List[VadItem] = []
-    for audio_path in audio_paths:
-        def _compute():
-            audio = load_audio(audio_path)
-            logger.info("Performing voice activity detection...")
-            return vad_processor.process(audio)
-        vad_segments = _load_or_compute(
-            audio_path, load_debug_dir, debug_dir,
-            load_vad_debug, write_vad_debug, _compute,
-        )
-        items.append({'audio_path': audio_path, 'vad_segments': vad_segments})
-    return items
+def _select_audio_track(path: str) -> int:
+    """Return the 0-based audio stream index to use for *path*.
 
-
-def _run_isolation(
-    items: List[VadItem],
-    vocal_isolation_processor,
-    debug_dir: Optional[str] = None,
-    load_debug_dir: Optional[str] = None,
-    progress_callback: ProgressCallback = None,
-) -> List[VadItem]:
-    result_items: List[VadItem] = []
-    for item in items:
-        audio_path = item['audio_path']
-        def _compute():
-            logger.info("Performing vocal isolation...")
-            return vocal_isolation_processor.process(item['vad_segments'], progress_callback=progress_callback)
-        vad_segments = _load_or_compute(
-            audio_path, load_debug_dir, debug_dir,
-            load_isolation_debug, write_isolation_debug, _compute,
-        )
-        result_items.append({'audio_path': audio_path, 'vad_segments': vad_segments})
-    return result_items
-
-
-def _run_transcription(
-    items: List[VadItem],
-    model,
-    debug_dir: Optional[str] = None,
-    load_debug_dir: Optional[str] = None,
-    progress_callback: ProgressCallback = None,
-) -> List[ProcessingItem]:
-    result_items: List[ProcessingItem] = []
-    for item in items:
-        audio_path = item['audio_path']
-        def _compute():
-            logger.info("Performing transcription...")
-            result: TranscriptionResult = model.process(
-                item['vad_segments'],
-                progress_callback=progress_callback,
-            )
-            return {**result, 'segments': [normalize_segment_text(seg) for seg in result['segments']]}
-        result = _load_or_compute(
-            audio_path, load_debug_dir, debug_dir,
-            load_transcription_debug, write_transcription_debug, _compute,
-        )
-        result_items.append({'audio_path': audio_path, 'result': result, 'vad_segments': item['vad_segments']})
-    return result_items
-
-
-def _run_ensemble(
-    items: List[ProcessingItem],
-    ensemble_model,
-    debug_dir: Optional[str] = None,
-    load_debug_dir: Optional[str] = None,
-    progress_callback: ProgressCallback = None,
-) -> List[ProcessingItem]:
-    result_items: List[ProcessingItem] = []
-    for item in items:
-        audio_path = item['audio_path']
-        def _compute():
-            logger.info("Running ensemble ASR (faster-whisper)...")
-            return ensemble_model.process(
-                item['vad_segments'],
-                progress_callback=progress_callback,
-            )
-        alt_texts = _load_or_compute(
-            audio_path, load_debug_dir, debug_dir,
-            load_ensemble_debug, write_ensemble_debug, _compute,
-        )
-        result_items.append({**item, 'ensemble_texts': alt_texts})
-    return result_items
-
-
-def _run_llm_correction(
-    items: List[ProcessingItem],
-    corrector,
-    debug_dir: Optional[str] = None,
-    load_debug_dir: Optional[str] = None,
-    progress_callback: ProgressCallback = None,
-) -> List[ProcessingItem]:
-    result_items: List[ProcessingItem] = []
-    for item in items:
-        audio_path = item['audio_path']
-        def _compute():
-            logger.info("Running LLM correction...")
-            segments = item['result']['segments']
-            ensemble_texts = item.get('ensemble_texts')
-            corrected_texts = corrector.correct_segments(
-                segments,
-                ensemble_texts=ensemble_texts,
-                progress_callback=progress_callback,
-            )
-            corrected_texts = corrector.normalize_names(corrected_texts)
-            new_segments = [{**seg, 'text': corrected_texts[i]} for i, seg in enumerate(segments)]
-            return {**item['result'], 'segments': new_segments}
-        result = _load_or_compute(
-            audio_path, load_debug_dir, debug_dir,
-            load_llm_correction_debug, write_llm_correction_debug, _compute,
-        )
-        result_items.append({**item, 'result': result})
-    return result_items
+    For video files, probes with ffprobe and selects the first stream tagged
+    language=yue or with a title containing "Cantonese". For audio-only files
+    (or when probing returns nothing), returns 0 (ffmpeg default).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _VIDEO_EXTENSIONS:
+        return 0
+    from cantocaptions_ai.utils.audio import probe_audio_tracks, select_cantonese_track
+    streams = probe_audio_tracks(path)
+    if not streams:
+        logger.warning("No audio streams found via ffprobe for '%s'; using default track", path)
+        return 0
+    track = select_cantonese_track(streams)
+    if track != 0:
+        logger.info("Selected audio track index %d (Cantonese) for '%s'", track, path)
+    return track
 
 
 def _run_alignment(
@@ -221,11 +107,14 @@ def _run_diarization(
     max_speakers: Optional[int],
     return_speaker_embeddings: bool,
     progress_callback: ProgressCallback = None,
+    load_complete_callback: Optional[Callable[[], None]] = None,
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.diarize import DiarizationPipeline, assign_word_speakers
     logger.info("Performing diarization...")
     logger.info(f"Using model: {diarize_model_name}")
     diarize_model = DiarizationPipeline(model_name=diarize_model_name, token=hf_token, device=device, cache_dir=model_dir)
+    if load_complete_callback:
+        load_complete_callback()
 
     diarized_items = []
     for item in items:
@@ -250,14 +139,17 @@ def _run_speaker_verification(
     device: str,
     model_dir: Optional[str],
     progress_callback: ProgressCallback = None,
+    load_complete_callback: Optional[Callable[[], None]] = None,
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.speaker_verification import SpeakerVerificationPipeline
     logger.info("Performing speaker verification...")
     speaker_verification_model = SpeakerVerificationPipeline(device=device, cache_dir=model_dir)
+    if load_complete_callback:
+        load_complete_callback()
 
     verified_items = []
     for item in items:
-        audio = load_audio(item['audio_path'])
+        audio = load_audio(item['audio_path'], audio_track=item.get('audio_track', 0))
         audio_segments = [
             audio[int(seg["start"] * SAMPLE_RATE):int(seg["end"] * SAMPLE_RATE)]
             for seg in item['result']["segments"]
@@ -356,6 +248,11 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     if cfg.speaker_embeddings and not cfg.diarize:
         warnings.warn("--speaker_embeddings has no effect without --diarize")
 
+    if cfg.reference_subtitle and not cfg.llm_correction:
+        parser.error("--reference_subtitle requires --llm_correction")
+    if cfg.reference_correction_semantic and not cfg.reference_subtitle:
+        warnings.warn("--reference_correction_semantic has no effect without --reference_subtitle")
+
     if cfg.language is not None:
         cfg.language = cfg.language.lower()
         if cfg.language not in LANGUAGES:
@@ -434,11 +331,13 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     )
 
     summary = TranscriptionSummary(enabled=cfg.print_progress)
+    process_start = time.perf_counter()
 
-    # Stage 1: VAD loading & processing
-    with StageTimer("VAD loading & processing", summary):
+    # Stage 1: VAD
+    with StageTimer("VAD", summary) as stage:
+        stub_items = [{'audio_path': p, 'audio_track': _select_audio_track(p)} for p in audio_paths]
         if need_vad:
-            from cantocaptions_ai.pipeline.vad import load_vad
+            from cantocaptions_ai.pipeline.vad import load_vad, VadProcessor
             vad_processor = load_vad(
                 vad_method=cfg.vad_method,
                 device=cfg.device,
@@ -448,12 +347,14 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 chunk_size=cfg.chunk_size,
                 use_auth_token=cfg.hf_token,
             )
+            stage.mark_inference_start()
+            items = vad_processor.run(stub_items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir)
+            del vad_processor
         else:
-            vad_processor = None
-        items = _run_vad(audio_paths, vad_processor, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir)
+            from cantocaptions_ai.pipeline.vad import VadProcessor
+            items = VadProcessor.load_cache(stub_items, cfg.load_debug_dir)
 
     # Stage 2: Vocal Isolation (conditional)
-    vocal_isolation_processor = None
     if need_vocal_isolation:
         with StageTimer("Vocal isolation", summary) as stage:
             from cantocaptions_ai.pipeline.vocal_isolation import load_vocal_isolation
@@ -462,25 +363,23 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 device=cfg.device,
                 device_index=cfg.device_index,
             )
-            items = _run_isolation(items, vocal_isolation_processor, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+            stage.mark_inference_start()
+            items = vocal_isolation_processor.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+            del vocal_isolation_processor
 
-    # Free VAD and isolation models before loading ASR to maximise available GPU memory.
-    if vad_processor is not None:
-        del vad_processor
-    if vocal_isolation_processor is not None:
-        del vocal_isolation_processor
     flush_vram()
 
     if cfg.retime:
         # Retime mode: skip ASR entirely; use the alignment model for both search and fine alignment.
-        from transformers import Wav2Vec2BertProcessor
-        from cantocaptions_ai.pipeline.alignment import load_align_model
-        bert_processor = Wav2Vec2BertProcessor.from_pretrained("alvanlii/wav2vec2-BERT-cantonese")
-        align_model, align_metadata = load_align_model(
-            align_language, cfg.device, cfg.device_index,
-            model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
-        )
         with StageTimer("Subtitle retiming + alignment", summary) as stage:
+            from transformers import Wav2Vec2BertProcessor
+            from cantocaptions_ai.pipeline.alignment import load_align_model
+            bert_processor = Wav2Vec2BertProcessor.from_pretrained("alvanlii/wav2vec2-BERT-cantonese")
+            align_model, align_metadata = load_align_model(
+                align_language, cfg.device, cfg.device_index,
+                model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
+            )
+            stage.mark_inference_start()
             items = _run_retime(items, cfg.retime, align_model, align_metadata, bert_processor, cfg.device)
             if not cfg.no_align:
                 items = _run_alignment(
@@ -495,74 +394,102 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         flush_vram()
     else:
         # Stage 3: Transcription
-        load_model = None
         if need_asr:
             from cantocaptions_ai.pipeline.asr import load_model
-        with model_scope(
-            load_model,
-            cfg.model,
-            device=cfg.device,
-            device_index=cfg.device_index,
-            download_root=cfg.model_dir,
-            compute_type=cfg.compute_type,
-            language=cfg.language,
-            asr_options=asr_options,
-            vocal_isolation_method=cfg.vocal_isolation_method,
-            task=task,
-            local_files_only=cfg.model_cache_only,
-            threads=qwen_threads,
-            use_auth_token=cfg.hf_token,
-            batch_size=cfg.batch_size,
-            print_progress=cfg.print_progress,
-            verbose=cfg.verbose,
-        ) as model:
             with StageTimer("Transcription", summary) as stage:
-                items = _run_transcription(
-                    items, model,
-                    debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir,
-                    progress_callback=stage.callback,
-                )
+                with model_scope(
+                    load_model,
+                    cfg.model,
+                    device=cfg.device,
+                    device_index=cfg.device_index,
+                    download_root=cfg.model_dir,
+                    compute_type=cfg.compute_type,
+                    attn_implementation=cfg.attn_implementation,
+                    language=cfg.language,
+                    asr_options=asr_options,
+                    vocal_isolation_method=cfg.vocal_isolation_method,
+                    task=task,
+                    local_files_only=cfg.model_cache_only,
+                    threads=qwen_threads,
+                    use_auth_token=cfg.hf_token,
+                    batch_size=cfg.batch_size,
+                    print_progress=cfg.print_progress,
+                    verbose=cfg.verbose,
+                ) as model:
+                    stage.mark_inference_start()
+                    items = model.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+        else:
+            from cantocaptions_ai.pipeline.asr import QwenPipeline
+            items = QwenPipeline.load_cache(items, cfg.load_debug_dir)
 
         # Stage 3b: Ensemble ASR (optional)
         if cfg.ensemble_model != "none":
-            load_faster_whisper = None
             if need_ensemble:
                 from cantocaptions_ai.pipeline.ensemble import load_faster_whisper
-            with model_scope(
-                load_faster_whisper,
-                device=cfg.device,
-                device_index=cfg.device_index,
-                model_dir=cfg.model_dir,
-                local_files_only=cfg.model_cache_only,
-            ) as ensemble:
                 with StageTimer("Ensemble ASR (faster-whisper)", summary) as stage:
-                    items = _run_ensemble(items, ensemble, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+                    with model_scope(
+                        load_faster_whisper,
+                        device=cfg.device,
+                        device_index=cfg.device_index,
+                        model_dir=cfg.model_dir,
+                        local_files_only=cfg.model_cache_only,
+                    ) as ensemble:
+                        stage.mark_inference_start()
+                        items = ensemble.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+            else:
+                from cantocaptions_ai.pipeline.ensemble import FasterWhisperEnsemble
+                items = FasterWhisperEnsemble.load_cache(items, cfg.load_debug_dir)
 
         # Stage 3c: LLM correction (optional)
         if cfg.llm_correction:
-            load_llm = None
+            if cfg.reference_subtitle:
+                from cantocaptions_ai.pipeline.retime import load_subtitle_file
+                from cantocaptions_ai.pipeline.llm_correction import match_reference_to_segments
+                with StageTimer("Reference subtitle matching", summary):
+                    logger.info(f"Loading reference subtitle: {cfg.reference_subtitle}")
+                    reference_subs = load_subtitle_file(cfg.reference_subtitle)
+                    logger.info(f"Loaded {len(reference_subs)} reference subtitle lines.")
+                    for item in items:
+                        item['reference_texts'] = match_reference_to_segments(
+                            item['result']['segments'], reference_subs
+                        )
+
             if need_llm:
                 from cantocaptions_ai.pipeline.llm_correction import load_llm
-            with model_scope(
-                load_llm,
-                model_id=cfg.llm_model,
-                model_dir=cfg.llm_model_dir,
-                device=cfg.device,
-                local_files_only=cfg.model_cache_only,
-            ) as corrector:
+                stats = vram_stats()
+                if stats:
+                    logger.info(
+                        f"VRAM before LLM load: allocated={stats['allocated_mb']:.0f} MB, "
+                        f"reserved={stats['reserved_mb']:.0f} MB, "
+                        f"free={stats['free_mb']:.0f} MB / {stats['total_mb']:.0f} MB"
+                    )
                 with StageTimer("LLM correction", summary) as stage:
-                    items = _run_llm_correction(items, corrector, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+                    with model_scope(
+                        load_llm,
+                        model_id=cfg.llm_model,
+                        model_dir=cfg.llm_model_dir,
+                        device=cfg.device,
+                        local_files_only=cfg.model_cache_only,
+                        semantic_mode=cfg.reference_correction_semantic,
+                        attn_implementation=cfg.attn_implementation,
+                    ) as corrector:
+                        stage.mark_inference_start()
+                        items = corrector.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+            else:
+                from cantocaptions_ai.pipeline.llm_correction import LLMCorrector
+                items = LLMCorrector.load_cache(items, cfg.load_debug_dir)
 
         # Stage 4: Alignment
         if not cfg.no_align:
-            from transformers import Wav2Vec2BertProcessor
-            from cantocaptions_ai.pipeline.alignment import load_align_model
-            bert_processor = Wav2Vec2BertProcessor.from_pretrained("alvanlii/wav2vec2-BERT-cantonese")
-            align_model, align_metadata = load_align_model(
-                align_language, cfg.device, cfg.device_index,
-                model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
-            )
             with StageTimer("Alignment", summary) as stage:
+                from transformers import Wav2Vec2BertProcessor
+                from cantocaptions_ai.pipeline.alignment import load_align_model
+                bert_processor = Wav2Vec2BertProcessor.from_pretrained("alvanlii/wav2vec2-BERT-cantonese")
+                align_model, align_metadata = load_align_model(
+                    align_language, cfg.device, cfg.device_index,
+                    model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
+                )
+                stage.mark_inference_start()
                 items = _run_alignment(
                     items, align_model, align_metadata, bert_processor, cfg.device,
                     cfg.align_padding, cfg.align_release, cfg.interpolate_method,
@@ -585,14 +512,19 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 items, cfg.diarize_model, cfg.hf_token, cfg.device, cfg.model_dir,
                 cfg.min_speakers, cfg.max_speakers, cfg.speaker_embeddings,
                 progress_callback=stage.callback,
+                load_complete_callback=stage.mark_inference_start,
             )
 
     # Stage 6: Speaker Verification
     if cfg.verify_speakers:
         with StageTimer("Speaker verification", summary) as stage:
-            items = _run_speaker_verification(items, cfg.device, cfg.model_dir, progress_callback=stage.callback)
+            items = _run_speaker_verification(
+                items, cfg.device, cfg.model_dir,
+                progress_callback=stage.callback,
+                load_complete_callback=stage.mark_inference_start,
+            )
 
     # Write
     _merge_and_write(items, writer, align_language, cfg.align_merge_distance, cfg.align_padding, writer_args)
 
-    summary.print_summary()
+    summary.print_summary(process_elapsed=time.perf_counter() - process_start)

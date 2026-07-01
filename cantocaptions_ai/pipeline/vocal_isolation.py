@@ -14,6 +14,7 @@ from cantocaptions_ai.pipeline.mbroformer.model import MelBandRoformer
 from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
 from cantocaptions_ai.utils.model_utils import PipelineStage
+from cantocaptions_ai.utils.debug import load_isolation_debug, write_isolation_debug
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -129,8 +130,21 @@ def _demix_track(config, model, mix, device, first_chunk_time=None):
 class VocalIsolationProcessor(PipelineStage["List[VadAudioSegment]", "List[VadAudioSegment]"]):
     """Base class for vocal isolation processors."""
 
+    @staticmethod
+    def read_debug(audio_path, debug_dir): return load_isolation_debug(audio_path, debug_dir)
+
+    @staticmethod
+    def write_debug(audio_path, result, debug_dir): write_isolation_debug(audio_path, result, debug_dir)
+
+    @staticmethod
+    def _extract(item): return item['vad_segments']
+
+    @staticmethod
+    def _pack(item, result): return {'audio_path': item['audio_path'], 'vad_segments': result}
+
     def process(self, input: List[VadAudioSegment], *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
         """Run isolation then validate that segment durations are consistent."""
+        logger.info("Performing vocal isolation...")
         result = self._isolate(input, progress_callback=progress_callback)
         for seg in result:
             expected = seg["end"] - seg["start"]

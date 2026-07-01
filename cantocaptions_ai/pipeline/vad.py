@@ -3,13 +3,18 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 
-from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
+from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
 from cantocaptions_ai.utils.model_utils import PipelineStage
-from cantocaptions_ai.pipeline.vads import Vad, Pyannote
+from cantocaptions_ai.utils.debug import load_vad_debug, write_vad_debug
 from cantocaptions_ai.utils.log_utils import get_logger
 
+# get_logger initializes logging (including flop_counter suppression) before
+# pyannote/lightning are imported below, which would otherwise emit a spurious
+# triton-not-found warning from torch.utils.flop_counter.
 logger = get_logger(__name__)
+
+from cantocaptions_ai.pipeline.vads import Vad, Pyannote
 
 
 class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
@@ -25,8 +30,25 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
         self.vad_offset = vad_offset
         self.chunk_size = chunk_size
 
+    @staticmethod
+    def read_debug(audio_path, debug_dir): return load_vad_debug(audio_path, debug_dir)
+
+    @staticmethod
+    def write_debug(audio_path, result, debug_dir): write_vad_debug(audio_path, result, debug_dir)
+
+    @staticmethod
+    def _extract(item): return load_audio(item['audio_path'], audio_track=item.get('audio_track', 0))
+
+    @staticmethod
+    def _pack(item, result):
+        out = {'audio_path': item['audio_path'], 'vad_segments': result}
+        if 'audio_track' in item:
+            out['audio_track'] = item['audio_track']
+        return out
+
     def process(self, input: np.ndarray, *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
         """Run VAD on audio and return merged audio segments with timestamps."""
+        logger.info("Performing voice activity detection...")
         if issubclass(type(self.vad_model), Vad):
             waveform = self.vad_model.preprocess_audio(input)
             merge_chunks = self.vad_model.merge_chunks

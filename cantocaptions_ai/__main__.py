@@ -8,10 +8,36 @@ from cantocaptions_ai.utils.output import (LANGUAGES, TO_LANGUAGE_CODE,
                             optional_int, str2bool)
 from cantocaptions_ai.utils.log_utils import setup_logging
 
+_MEDIA_EXTENSIONS = {
+    '.mp4', '.mkv', '.avi', '.mov', '.webm', '.ts', '.m2ts',
+    '.wav', '.mp3', '.flac', '.aac', '.ogg', '.m4a', '.opus',
+}
+
+
+def discover_media_files(directory: str, recursive: bool = False) -> list:
+    """Return sorted list of media file paths found in *directory*.
+
+    Searches for files whose extension is in _MEDIA_EXTENSIONS. Raises
+    ValueError if *directory* does not exist or contains no eligible files.
+    """
+    from pathlib import Path
+    base = Path(directory)
+    if not base.is_dir():
+        raise ValueError(f"--input_dir '{directory}' is not a directory or does not exist")
+    pattern = "**/*" if recursive else "*"
+    files = sorted(
+        str(p) for p in base.glob(pattern)
+        if p.is_file() and p.suffix.lower() in _MEDIA_EXTENSIONS
+    )
+    if not files:
+        raise ValueError(f"No eligible media files found in '{directory}'")
+    return files
+
+
 def cli():
     # fmt: off
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("audio", nargs="+", type=str, help="audio file(s) to transcribe")
+    parser.add_argument("audio", nargs="*", type=str, help="audio file(s) to transcribe")
     parser.add_argument("--language", type=str, default="yue", choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio, specify None to perform language detection")
     parser.add_argument("--retime", type=str, default=None, metavar="SUBTITLE_FILE", help="subtitle file to retime against the audio (SRT, VTT, etc.). Skips ASR; updates timings only, text is preserved.")
     parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {importlib.metadata.version('cantocaptions-ai')}", help="Show cantocaptions-ai version information and exit")
@@ -25,8 +51,9 @@ def cli():
     inference_grp = parser.add_argument_group("inference")
     inference_grp.add_argument("--device", default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"), help="device type to use for PyTorch inference (e.g. cpu, cuda, mps)")
     inference_grp.add_argument("--device_index", default=0, type=int, help="device index to use for inference")
-    inference_grp.add_argument("--batch_size", default=28, type=int, help="the preferred batch size for inference")
+    inference_grp.add_argument("--batch_size", default=24, type=int, help="the preferred batch size for inference")
     inference_grp.add_argument("--compute_type", default="default", type=str, choices=["default", "float16", "float32", "int8"], help="compute type for computation; 'default' uses float16 on GPU, float32 on CPU")
+    inference_grp.add_argument("--attn_implementation", default="flash_attention_2", type=str, choices=["sdpa", "flash_attention_2", "eager"], help="attention implementation for transformer models; 'flash_attention_2' requires flash-attn to be installed")
     inference_grp.add_argument("--threads", type=optional_int, default=0, help="number of threads used by torch for CPU inference; supercedes MKL_NUM_THREADS/OMP_NUM_THREADS")
     inference_grp.add_argument("--hf_token", type=str, default=None, help="Hugging Face Access Token to access PyAnnote gated models")
 
@@ -34,7 +61,7 @@ def cli():
     output_grp.add_argument("--output_dir", "-o", type=str, default=".", help="directory to save the outputs")
     output_grp.add_argument("--output_format", "-f", type=str, default="srt", choices=["all", "srt", "vtt", "txt", "tsv", "json", "aud"], help="format of the output file; if not specified, all available formats will be produced")
     output_grp.add_argument("--verbose", type=str2bool, default=True, help="whether to print out the progress and debug messages")
-    output_grp.add_argument("--log-level", type=str, default=None, choices=["debug", "info", "warning", "error", "critical"], help="logging level (overrides --verbose if set)")
+    output_grp.add_argument("--log_level", type=str, default=None, choices=["debug", "info", "warning", "error", "critical"], help="logging level (overrides --verbose if set)")
     output_grp.add_argument("--log_file", type=str, default=None, help="redirect third-party stdout/stderr to this file; cantocaptions_ai log messages are written to both terminal and file")
     output_grp.add_argument("--print_progress", type=str2bool, default=True, help="if True, display stage progress bars and a timing summary; also enables per-batch progress in transcribe() and align() methods")
     output_grp.add_argument("--debug_dir", type=str, default=None, help="if set, write intermediate stage data (audio segments and JSON manifests) to this directory for debugging and replay")
@@ -48,7 +75,7 @@ def cli():
     vad_grp.add_argument("--vad_method", type=str, default="pyannote", choices=["pyannote"], help="VAD method to be used")
     vad_grp.add_argument("--vad_onset", type=float, default=0.500, help="Onset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected")
     vad_grp.add_argument("--vad_offset", type=float, default=0.363, help="Offset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected.")
-    vad_grp.add_argument("--chunk_size", type=int, default=30, help="Chunk size for merging VAD segments. Default is 30, reduce this if the chunk is too long.")
+    vad_grp.add_argument("--chunk_size", type=int, default=25, help="Chunk size for merging VAD segments. Default is 30, reduce this if the chunk is too long.")
 
     isol_grp = parser.add_argument_group("vocal isolation")
     isol_grp.add_argument("--vocal_isolation_method", type=str, default="mbroformer", choices=["none", "mbroformer"], help="vocal isolation method to be used")
@@ -66,6 +93,8 @@ def cli():
     ensemble_grp.add_argument("--llm_correction", action="store_true", help="run LLM-based per-segment particle correction and full-document name normalization after transcription")
     ensemble_grp.add_argument("--llm_model", type=str, default="Qwen/Qwen3-4B", help="HuggingFace model ID for LLM correction (used with --llm_correction)")
     ensemble_grp.add_argument("--llm_model_dir", type=str, default=None, help="local path to LLM weights; uses HF cache if not set")
+    ensemble_grp.add_argument("--reference_subtitle", type=str, default=None, metavar="SUBTITLE_FILE", help="standard Chinese subtitle file (SRT/VTT) used as reference for LLM correction; fixes homophone errors in proper nouns, idioms, etc. (requires --llm_correction)")
+    ensemble_grp.add_argument("--reference_correction_semantic", action="store_true", help="also attempt semantic fixes from the reference subtitle (e.g. missing negations, punctuation); higher false-positive risk, requires --reference_subtitle")
 
     align_grp = parser.add_argument_group("alignment")
     align_grp.add_argument("--align_model", default=None, help="Name of phoneme-level ASR model to do alignment")
@@ -92,6 +121,10 @@ def cli():
 
     verify_grp = parser.add_argument_group("speaker verification")
     verify_grp.add_argument("--verify_speakers", action="store_true", help="Apply speaker verification to split out segments where speakers don't match")
+
+    input_grp = parser.add_argument_group("batch input")
+    input_grp.add_argument("--input_dir", type=str, default=None, metavar="DIR", help="directory of media files to transcribe (mutually exclusive with positional audio args)")
+    input_grp.add_argument("--recursive", action="store_true", help="when used with --input_dir, also scan subdirectories for media files")
     # fmt: on
 
     args = parser.parse_args().__dict__
@@ -106,6 +139,20 @@ def cli():
         setup_logging(level="info", log_file=log_file)
     else:
         setup_logging(level="warning", log_file=log_file)
+
+    audio = args.get("audio") or []
+    input_dir = args.pop("input_dir", None)
+    recursive = args.pop("recursive", False)
+    if audio and input_dir:
+        parser.error("positional audio files and --input_dir are mutually exclusive")
+    if not audio and not input_dir:
+        parser.error("provide at least one audio file or --input_dir")
+    if input_dir:
+        try:
+            audio = discover_media_files(input_dir, recursive=recursive)
+        except ValueError as e:
+            parser.error(str(e))
+    args["audio"] = audio
 
     from cantocaptions_ai.pipeline.transcribe import transcribe_task
 

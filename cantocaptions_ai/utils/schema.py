@@ -108,6 +108,7 @@ class VadItem(TypedDict):
     """Intermediate carrier for the VAD and vocal-isolation stages (before transcription)."""
     audio_path: str
     vad_segments: List[VadAudioSegment]
+    audio_track: NotRequired[int]
 
 
 class ProcessingItem(TypedDict):
@@ -116,6 +117,8 @@ class ProcessingItem(TypedDict):
     result: Union[TranscriptionResult, AlignedTranscriptionResult]
     vad_segments: NotRequired[List[VadAudioSegment]]
     ensemble_texts: NotRequired[List[str]]  # index-aligned alternative ASR hypotheses
+    reference_texts: NotRequired[List[str]]  # time-matched standard Chinese reference; one per segment
+    audio_track: NotRequired[int]
 
 
 def merge_segments(seg1: SingleAlignedSegment, seg2: SingleAlignedSegment) -> SingleAlignedSegment:

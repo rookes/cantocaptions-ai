@@ -2,18 +2,19 @@
 urls = { repository = "https://github.com/rookes/cantocaptions-ai" }
 authors = [{ name = "Jon Miller" }]
 name = "cantocaptions-ai"
-version = "0.1.0"
+version = "0.8.0"
 description = "End-to-end pipeline for high-quality, time-accurate written Cantonese subtitles."
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
 license = "GPL-3.0-only"
 
 dependencies = [
+    "transformers>=4.57.6",
     "qwen-asr>=0.0.6",
     "numpy>=2.1.0",
     "pandas>=2.2.3",
     "pyannote-audio>=4.0.0",
-    "huggingface-hub<1.0.0",
+    "huggingface-hub>=0.34.0",
     "torch>=2.0.0",
     "torchaudio>=2.0.0",
     "opencc>=1.0.0",
@@ -30,7 +31,24 @@ dependencies = [
 ensemble = ["faster-whisper>=1.0.0"]
 llm = ["bitsandbytes>=0.43.0"]
 diarize = ["nemo_toolkit[asr]; sys_platform == 'linux'", "matplotlib"]
-full = ["faster-whisper>=1.0.0", "bitsandbytes>=0.43.0", "nemo_toolkit[asr]; sys_platform == 'linux'", "matplotlib"]
+compile = [
+    "triton; sys_platform == 'linux'",
+    "triton-windows<3.7; sys_platform == 'win32'",
+]
+flash-attn = [
+    "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+xet = ["hf-xet"]
+full = [
+    "faster-whisper>=1.0.0",
+    "bitsandbytes>=0.43.0",
+    "nemo_toolkit[asr]; sys_platform == 'linux'",
+    "matplotlib",
+    "triton; sys_platform == 'linux'",
+    "triton-windows<3.7; sys_platform == 'win32'",
+    "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "hf-xet",
+]
 
 [project.scripts]
 cantocaptions = "cantocaptions_ai.__main__:cli"
@@ -55,6 +73,10 @@ environments = [
 ]
 override-dependencies = [
     "torchcodec>=0.6.0; sys_platform != 'linux' or platform_machine != 'x86_64'",
+    # qwen-asr 0.0.6 hard-pins transformers==4.57.6.  Pin here too so uv doesn't
+    # resolve to a newer PyPI release.  Remove once qwen-asr is updated or
+    # transformers ships an official release with qwen3_asr built in.
+    "transformers==4.57.6",
 ]
 
 [tool.uv.sources]

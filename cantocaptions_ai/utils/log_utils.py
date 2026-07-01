@@ -5,6 +5,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
+import torch
+
 if TYPE_CHECKING:
     from tqdm import tqdm as _TqdmBar
 
@@ -47,6 +49,10 @@ def setup_logging(
     logger.addHandler(console_handler)
 
     logger.propagate = False
+
+    # lightning.pytorch imports torch.utils.flop_counter at load time, which logs a
+    # spurious warning about triton being absent on CUDA-only builds (no Windows wheels).
+    logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 
     logging.captureWarnings(True)
     warnings_logger = logging.getLogger("py.warnings")
@@ -91,27 +97,39 @@ class TranscriptionSummary:
 
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled
-        self._stages: list[tuple[str, float]] = []
+        self._stages: list[tuple[str, Optional[float], float, Optional[float]]] = []
 
-    def record(self, label: str, elapsed: float) -> None:
+    def record(self, label: str, load_time: Optional[float], run_time: float, vram_peak_mb: Optional[float] = None) -> None:
         if self.enabled:
-            self._stages.append((label, elapsed))
+            self._stages.append((label, load_time, run_time, vram_peak_mb))
 
-    def print_summary(self) -> None:
+    def print_summary(self, process_elapsed: Optional[float] = None) -> None:
         if not self.enabled or not self._stages:
             return
-        total = sum(e for _, e in self._stages)
-        col_w = max(len(label) for label, _ in self._stages) + 2
-        width = col_w + 12
+        show_vram = any(v is not None for _, _, _, v in self._stages)
+        col_w = max(len(label) for label, _, _, _ in self._stages) + 2
+        vram_col_w = 10 if show_vram else 0  # "  X.XX GB" = 10 chars
+        # 1 leading space + col_w label + 3 × 11-char time columns + optional VRAM
+        width = 1 + col_w + 33 + vram_col_w
         eq = "═" * width
         dash = "─" * width
         print(f"\n{eq}", file=sys.__stdout__)
         print(" Transcription complete", file=sys.__stdout__)
         print(eq, file=sys.__stdout__)
-        for label, elapsed in self._stages:
-            print(f" {label:<{col_w}}{elapsed:>7.2f} s", file=sys.__stdout__)
-        print(dash, file=sys.__stdout__)
-        print(f" {'Total':<{col_w}}{total:>7.2f} s", file=sys.__stdout__)
+        vram_header = "Peak VRAM".center(10) if show_vram else ""
+        print(
+            f" {'':>{col_w}}{'Load Time'.center(11)}{'Run Time'.center(11)}{'Total'.center(11)}{vram_header}",
+            file=sys.__stdout__,
+        )
+        for label, load_time, run_time, vram_mb in self._stages:
+            load_str  = f" {load_time:>8.2f} s" if load_time is not None else f"{'—':^11}"
+            run_str   = f" {run_time:>8.2f} s"
+            total_str = f" {(load_time or 0.0) + run_time:>8.2f} s"
+            vram_str  = f"  {vram_mb / 1000:>5.1f} GB" if vram_mb is not None else ""
+            print(f" {label:<{col_w}}{load_str}{run_str}{total_str}{vram_str}", file=sys.__stdout__)
+        if process_elapsed is not None:
+            print(dash, file=sys.__stdout__)
+            print(f" Total Process Time   {process_elapsed:.2f} s", file=sys.__stdout__)
         print(f"{eq}\n", file=sys.__stdout__)
 
 
@@ -122,12 +140,15 @@ class StageTimer:
         self._label = label
         self._summary = summary
         self._start: float = 0.0
+        self._load_end: Optional[float] = None
         self._bar: "Optional[_TqdmBar]" = None
         self._determinate: bool = False
         self._spinner_stop: threading.Event = threading.Event()
         self._spinner_thread: Optional[threading.Thread] = None
 
     def __enter__(self) -> "StageTimer":
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         if not self._summary.enabled:
             self._start = time.perf_counter()
             return self
@@ -155,7 +176,8 @@ class StageTimer:
             self._spinner_stop.wait(0.12)
 
     def __exit__(self, *_: object) -> None:
-        elapsed = time.perf_counter() - self._start
+        end = time.perf_counter()
+        vram_peak_mb = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else None
         self._spinner_stop.set()
         if self._spinner_thread is not None:
             self._spinner_thread.join(timeout=0.5)
@@ -166,7 +188,17 @@ class StageTimer:
             else:
                 self._bar.set_description_str(f"{self._label}: Complete")
             self._bar.close()
-        self._summary.record(self._label, elapsed)
+        if self._load_end is not None:
+            load_time: Optional[float] = self._load_end - self._start
+            run_time: float = end - self._load_end
+        else:
+            load_time = None
+            run_time = end - self._start
+        self._summary.record(self._label, load_time, run_time, vram_peak_mb)
+
+    def mark_inference_start(self) -> None:
+        """Record the boundary between model loading and inference within this stage."""
+        self._load_end = time.perf_counter()
 
     @property
     def callback(self):
@@ -194,5 +226,5 @@ class StageTimer:
             )
             self._determinate = True
         if self._bar is not None:
-            self._bar.n = pct * 100
+            self._bar.n = round(pct * 100, 2)
             self._bar.refresh()
