@@ -61,10 +61,9 @@ uv sync --extra full       # All of the above
 Current updates planned for the near future:
 
 - [x] Add Cantonese standardization and cleaning scripts (adapted from [rookes/canto-subtitle-cleaner](https://github.com/rookes/canto-subtitle-cleaner))
-- [x] Implement the "retime" feature to accurately run alignment on existing subtitles
-- [ ] Add an option to use Qwen LLM to do error-correction based on a reference standard Chinese subtitle file (in progress)
+- [x] Add [SubER](https://github.com/apptek/SubER) metric calculation compatibility, and use its Levenshtein distance algorithm to parallelize ensemble subs
+- [ ] Implement the "retime" feature to accurately run alignment on existing subtitles (IN PROGRESS)
+- [ ] Add an option to use Qwen LLM to do error-correction based on a reference standard Chinese subtitle file (IN PROGRESS)
 - [ ] Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
 - [ ] Add better multilingual recognition for Mandarin and English
 - [ ] Complete diarization implementation to separate lines from different speakers
-* Add [SubER](https://github.com/apptek/SubER) metric calculation compatibility, and use its Levenshtein distance algorithm to parallelize ensemble subs
-* Add some subtitle processing helper utilities, such as an SRT retiming utility
