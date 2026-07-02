@@ -41,123 +41,17 @@ QWEN_PARTICLE_MAP = {
     #'㗎喇': ['㗎喇', '㗎啦'],
 }
 
-REMOVE_CHARS_TRANS = str.maketrans('', '', "~～.,!?;")
 SPLIT_CHARS = ["，", "。", "？", "！", "；", "…"]
 MERGEABLE_CHARS = ["，"]
 REMOVE_STANDALONE_CHARS = ["噢", "嗯", "哦", "嘩", "嗌", "唉", "誒", "哎", "啊", "嘿", "吓"]
-QUESTION_WORDS = ['做乜', '係咪', '未', '有冇', '好冇', '邊', '咩', '邊個', '點解', '幾歲', '幾耐', '幾時', '邊度', '點', '點樣', '幾多', '乜嘢', '嗎']
-
-RE_QUESTION_DELIMITING_PUNCTUATION = re.compile(r'([？！。：；]+)')
-ZH = r'[一-鿿]'
-
-def _resub(text, regex_list):
-    for pattern, repl in regex_list:
-        text = re.sub(pattern, repl, text)
-    return text
-
-def _clean_punctuation(text):
-    regex_list = [
-        (r'[\n\t]+', ' '), # Replace all line breaks and tabs with a space (to be removed later)
-        (r'﹑', '\''), # restore normal apostrophe
-        (r'([a-zA-Z])-([a-zA-Z])', r'\1\2'), # remove random hyphens
-        (r'(?<![a-zA-Z])\s+(?![a-zA-Z])', ''), # remove spaces when not next to Latin characters
-        (r'(?<=' + ZH + r')\s+', ''), # remove spaces next to Chinese characters
-        (r'\s+(?=' + ZH + r')', ''),
-        (r'\s+', ' '), # reduce all spaces to single space
-        ('％', '%'), # Netflix standard uses half-width percent sign
-        (r'\?', '？'),
-        (r'\.\.\.', '…'),
-        (r'[。.]$', ''),
-        (r'^[。.]', ''),
-        (r'[!！]', '，'),
-        (r',', '，'),
-        (r'^，', ''),
-        (r'，$', ''),
-        (r'([，？…])[，？…]+', r'\1') # remove repeated punctuation
-    ]
-
-    return _resub(text, regex_list)
 
 def simplified_to_traditional(text: str) -> str:
     return cc.convert(text)
 
 def standardize_chars_hk(text: str) -> str:
-    regex_list = [
-        ('爲', '為'),
-        ('嬀', '媯'),
-        ('僞', '偽'),
-        ('潙', '溈'),
-        ('蔿', '蒍'),
-        ('搵', '揾'),
-        ('溫', '温'),
-        ('慍', '愠'),
-        ('醞', '醖'),
-        ('媼', '媪'),
-        ('榲', '榅'),
-        ('熅', '煴'),
-        ('縕', '緼'),
-        ('膃', '腽'),
-        ('轀', '輼'),
-        ('鰮', '鰛'),
-        ('蒕', '蒀'),
-        ('蘊', '藴'),
-        ('氳', '氲'),
-        ('兌', '兑'),
-        ('說', '説'),
-        ('脫', '脱'),
-        ('稅', '税'),
-        ('悅', '悦'),
-        ('挩', '捝'),
-        ('敓', '敚'),
-        ('梲', '棁'),
-        ('涗', '涚'),
-        ('蛻', '蜕'),
-        ('銳', '鋭'),
-        ('閱', '閲'),
-        ('㨂', '揀'),
-        ('錬', '鍊'),
-        ('床', '牀'),
-        ('羣', '群'),
-        ('裡', '裏'),
-        ('麵', '麪'),
-        ('敎', '教'),
-        ('祕', '秘'),
-        ('巿', '市'),
-        ('衆', '眾'),
-        ('潨', '潀'),
-        ('溼', '濕'),
-        ('鷄', '雞'),
-        ('吿', '告'),
-        ('汙', '污'),
-        ('洩', '泄'),
-        ('駡', '罵'),
-        ('銹', '鏽'),
-        ('鉤', '鈎'),
-        ('衛', '衞'),
-        ('蔥', '葱'),
-        ('艷', '豔'),
-        ('葯', '藥'),
-        ('滙', '匯'),
-        ('啟', '啓'),
-        ('奬', '獎'),
-        ('俾', '畀'),
-        ('我地', '我哋'),
-        ('你地', '你哋'),
-        ('佢地', '佢哋'),
-        ('人地', '人哋'),
-        ('爹地', '爹哋'),
-        ('妳', '你'),
-        ('您', '你'),
-        ('癐', '攰'),
-        ('倆', '兩'),
-        ('咧', '呢'),
-        ('噶', '㗎'),
-    ]
-
-    s = _resub(text, regex_list)
-    s.translate(REMOVE_CHARS_TRANS)
-
-    return s
+    """Convert character variants to the Hong Kong standard forms (rules/chars_hk.toml)."""
+    from cantocaptions_ai.cantonese.rules import apply_ruleset, get_builtin_ruleset
+    return apply_ruleset(text, get_builtin_ruleset("chars_hk"))
 
 def normalize_segment_text(segment: "SingleSegment") -> "SingleSegment":
     """Return a copy of segment with text converted to HK traditional Chinese."""

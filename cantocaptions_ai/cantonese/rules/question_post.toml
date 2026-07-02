@@ -1,0 +1,27 @@
+# Post-processing rules after coded question-particle step (legacy clean_question_final_particles)
+# Rules are applied in order, top to bottom, one re.sub pass each.
+# Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+
+[[rules]]
+pattern = '(?<![，。！!?.;？；…])係咪(?=[呀啊吖？])'
+replace = '，係咪'
+
+[[rules]]
+pattern = '[㗎喇]㗎'
+replace = '㗎'
+
+[[rules]]
+pattern = '嘅？'
+replace = '𠸏？'
+
+[[rules]]
+pattern = '啦啦聲'
+replace = '嗱嗱聲'
+
+[[rules]]
+pattern = '([啊喎喇啦㗎咋噃嗎嘛])(?![？\n！，…啊呀吖喇啦喎啝噃咩吒咋喳啫唧嗎嗱呢𠻹添㖭嘛嗎囉囖咯吓])'
+replace = '\1，'
+
+[[rules]]
+pattern = '^啊…'
+replace = ''

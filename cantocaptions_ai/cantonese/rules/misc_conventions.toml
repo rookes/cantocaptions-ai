@@ -1,0 +1,91 @@
+# Miscellaneous written-Cantonese conventions (legacy clean_subtitle_misc)
+# Rules are applied in order, top to bottom, one re.sub pass each.
+# Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+
+[[rules]]
+pattern = '咁(好[喇啦])'
+replace = '噉\1'
+
+[[rules]]
+pattern = '噉([\u4e00-\u9fff][\u4e00-\u9fff])嘅'
+replace = '咁\1嘅'
+
+[[rules]]
+pattern = '噉(認真|緊張|困難|容易|百厭)'
+replace = '咁\1'
+
+[[rules]]
+pattern = '([冇幾])噉'
+replace = '\1咁'
+
+[[rules]]
+pattern = '噉上下'
+replace = '咁上下'
+
+[[rules]]
+pattern = '(?<![譯原])著(?![述名作])'
+replace = '着'
+
+[[rules]]
+pattern = '(?<![空])翻(?![身閲轉譯一二兩三四五六七八九十百千萬數])'
+replace = '返'
+
+[[rules]]
+pattern = '(?<![\d一二兩三四五六七八九十百千萬數呢嗰])番(?![\d一二兩三四五六七八九十百千萬數心])'
+replace = '返'
+
+[[rules]]
+pattern = '[哂曬]'
+replace = '晒'
+
+[[rules]]
+pattern = '(?<![曝沖])晒(?=[招馬衫命乾張蓆])'
+replace = '曬'
+
+[[rules]]
+pattern = '晒(?=太陽|水艇|雨淋|月光|相舖)'
+replace = '曬'
+
+[[rules]]
+pattern = '(?<=[睇諗試求])吓'
+replace = '下'
+
+[[rules]]
+pattern = '(?<!，)之不過(?!，)'
+replace = '之不過，'
+
+[[rules]]
+pattern = '[姐唧啫]係'
+replace = '即係'
+
+[[rules]]
+pattern = '宜家'
+replace = '而家'
+
+[[rules]]
+pattern = '黎$'
+replace = '嚟'
+
+[[rules]]
+pattern = '黎([？！，…\n])'
+replace = '嚟\1'
+
+[[rules]]
+pattern = '黎([\u4e00-\u9fff][？！，…\n])'
+replace = '嚟\1'
+
+[[rules]]
+pattern = '^難道'
+replace = '唔通'
+
+[[rules]]
+pattern = '傾計'
+replace = '傾偈'
+
+[[rules]]
+pattern = '傾([\u4e00-\u9fff])計'
+replace = '傾\1偈'
+
+[[rules]]
+pattern = '日圓'
+replace = '円'

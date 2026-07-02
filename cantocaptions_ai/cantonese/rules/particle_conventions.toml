@@ -1,0 +1,471 @@
+# Sentence-final particle conventions (legacy update_particle_conventions)
+# Rules are applied in order, top to bottom, one re.sub pass each.
+# Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+
+[[rules]]
+pattern = '(?<!衫書十頭招衣帽李咪相棚房高)架(?=[，？…喇啦喎咯囉囖啫])'
+replace = '㗎'
+
+[[rules]]
+pattern = '[弊閉][喇啦囉]'
+replace = '弊喇'
+
+[[rules]]
+pattern = '添[，…]'
+replace = '𠻹'
+
+[[rules]]
+pattern = '添$'
+replace = '𠻹'
+
+[[rules]]
+pattern = '添，'
+replace = '𠻹，'
+
+[[rules]]
+pattern = '添(?=[噃啵喎啊呀喇嘞啦㗎])'
+replace = '𠻹'
+
+[[rules]]
+pattern = '好嗎'
+replace = '好嘛'
+
+[[rules]]
+pattern = '[啫之姐咋][嗎嘛]'
+replace = '吒嘛'
+
+[[rules]]
+pattern = '[㗎嘅]嘛'
+replace = '𠺢嘛'
+
+[[rules]]
+pattern = '[唉哎][啊喲吔]'
+replace = '哎吔'
+
+[[rules]]
+pattern = '(啊){2,}'
+replace = '啊'
+
+[[rules]]
+pattern = '哎吔啊'
+replace = '哎吔'
+
+[[rules]]
+pattern = '冇([嘢事])吖嗎，'
+replace = '冇\1吖嘛？'
+
+[[rules]]
+pattern = '冇([嘢事])吖嗎(?!？)'
+replace = '冇\1吖嘛？'
+
+[[rules]]
+pattern = '唔係啊嘛？'
+replace = '唔係𠻺嗎？'
+
+[[rules]]
+pattern = '唔係啊嘛'
+replace = '唔係𠻺嗎？'
+
+[[rules]]
+pattern = '好啊嘛'
+replace = '好吖嘛'
+
+[[rules]]
+pattern = '好吖嘛，'
+replace = '好吖嘛？'
+
+[[rules]]
+pattern = '啊嘛？'
+replace = '𠻺嗎？'
+
+[[rules]]
+pattern = '呀嘛'
+replace = '𠻺嗎'
+
+[[rules]]
+pattern = '^嚟啊'
+replace = '嚟吖'
+
+[[rules]]
+pattern = '真係啊'
+replace = '真係吖'
+
+[[rules]]
+pattern = '話你知啊'
+replace = '話你知吖'
+
+[[rules]]
+pattern = '話時話啊'
+replace = '話時話吖'
+
+[[rules]]
+pattern = '老實講啊'
+replace = '老實講吖'
+
+[[rules]]
+pattern = '坦白講啊'
+replace = '坦白講吖'
+
+[[rules]]
+pattern = '都唔錯啊'
+replace = '都唔錯吖'
+
+[[rules]]
+pattern = '真係唔錯啊'
+replace = '真係唔錯吖'
+
+[[rules]]
+pattern = '^畀你啊'
+replace = '畀你吖'
+
+[[rules]]
+pattern = '^求下你啊'
+replace = '求下你吖'
+
+[[rules]]
+pattern = '，求下你啊'
+replace = '，求下你吖'
+
+[[rules]]
+pattern = '^聽我講啊'
+replace = '聽我講吖'
+
+[[rules]]
+pattern = '，聽我講啊'
+replace = '，聽我講吖'
+
+[[rules]]
+pattern = '(?<=[^睇諗試求傾])下？'
+replace = '吓？'
+
+[[rules]]
+pattern = '不如([^，…？]*?)啊'
+replace = '不如\1吖'
+
+[[rules]]
+pattern = '幫我([^，…？]*?)啊'
+replace = '幫我\1吖'
+
+[[rules]]
+pattern = '等我([^，…？]*?)啊'
+replace = '等我\1吖'
+
+[[rules]]
+pattern = '啊下'
+replace = '啊吓'
+
+[[rules]]
+pattern = '囉'
+replace = '囖'
+
+[[rules]]
+pattern = '[囖囉咯]喎'
+replace = '喇喎'
+
+[[rules]]
+pattern = '嘅咋'
+replace = '㗎咋'
+
+[[rules]]
+pattern = '嘅啫'
+replace = '㗎啫'
+
+[[rules]]
+pattern = '嘅喎'
+replace = '㗎喎'
+
+[[rules]]
+pattern = '㗎嗎'
+replace = '㗎咩'
+
+[[rules]]
+pattern = '嘅咩'
+replace = '㗎咩'
+
+[[rules]]
+pattern = '嘅([喇啦咯])'
+replace = '㗎\1'
+
+[[rules]]
+pattern = '㗎囖'
+replace = '㗎啦'
+
+[[rules]]
+pattern = '[喇啦]嗎'
+replace = '啦嘛'
+
+[[rules]]
+pattern = '(?<![太備])好喇'
+replace = '好啦'
+
+[[rules]]
+pattern = '你放心喇'
+replace = '你放心啦'
+
+[[rules]]
+pattern = '^放心喇'
+replace = '放心啦'
+
+[[rules]]
+pattern = '(?<=[，\n])放心喇'
+replace = '放心啦'
+
+[[rules]]
+pattern = '^嚟喇'
+replace = '嚟啦'
+
+[[rules]]
+pattern = '(?<=[，！？])嚟喇'
+replace = '嚟啦'
+
+[[rules]]
+pattern = '算數[喇囖]'
+replace = '算數啦'
+
+[[rules]]
+pattern = '梗係([^，？]*?)喇'
+replace = '梗係\1啦'
+
+[[rules]]
+pattern = '當然([^，？]*?)喇'
+replace = '當然\1啦'
+
+[[rules]]
+pattern = '反正([^，？]*?)喇'
+replace = '反正\1啦'
+
+[[rules]]
+pattern = '希望([^，？]*?)喇'
+replace = '希望\1啦'
+
+[[rules]]
+pattern = '隨便([^，？]*?)喇'
+replace = '隨便\1啦'
+
+[[rules]]
+pattern = '點都([^，？]*?)喇'
+replace = '點都\1啦'
+
+[[rules]]
+pattern = '唔使([^，？]*?)喇'
+replace = '唔使\1啦'
+
+[[rules]]
+pattern = '都話([^，？]*?)㗎喇'
+replace = '都話\1㗎啦'
+
+[[rules]]
+pattern = '都話([^，？]*?)[咯囖]'
+replace = '都話\1嚛'
+
+[[rules]]
+pattern = '(?<!係)咪([^，？$]*?)喇'
+replace = '咪\1啦'
+
+[[rules]]
+pattern = '唔係住([啊喇啦])'
+replace = '咪住\1'
+
+[[rules]]
+pattern = '一於([^，？]*?)喇'
+replace = '一於\1啦'
+
+[[rules]]
+pattern = '不如([^，？]*?)喇'
+replace = '不如\1啦'
+
+[[rules]]
+pattern = '不如([^，？]*?)囖'
+replace = '不如\1咯'
+
+[[rules]]
+pattern = '請([^，？]*?)喇'
+replace = '請\1啦'
+
+[[rules]]
+pattern = '唔怪得([^，？]*?)喇'
+replace = '唔怪得\1啦'
+
+[[rules]]
+pattern = '唔怪之([^，？]*?)喇'
+replace = '唔怪之\1啦'
+
+[[rules]]
+pattern = '已經([^，？]*?)㗎啦'
+replace = '已經\1㗎喇'
+
+[[rules]]
+pattern = '冇所謂([^，？]*?)喇'
+replace = '冇所謂\1啦'
+
+[[rules]]
+pattern = '你就應該([^，？]*?)喇'
+replace = '你就應該\1啦'
+
+[[rules]]
+pattern = '點就點喇'
+replace = '點就點啦'
+
+[[rules]]
+pattern = '你信我喇'
+replace = '你信我啦'
+
+[[rules]]
+pattern = '算喇'
+replace = '算啦'
+
+[[rules]]
+pattern = '冇辦法喇'
+replace = '冇辦法啦'
+
+[[rules]]
+pattern = '等陣先喇'
+replace = '等陣先啊'
+
+[[rules]]
+pattern = '住囖'
+replace = '住啦'
+
+[[rules]]
+pattern = '隨你囖'
+replace = '隨你啦'
+
+[[rules]]
+pattern = '^噉嘅$'
+replace = '噉𠸏？'
+
+[[rules]]
+pattern = '係噉樣啊，'
+replace = '係噉樣呀？'
+
+[[rules]]
+pattern = '係噉樣啊(?=$)'
+replace = '係噉樣呀？'
+
+[[rules]]
+pattern = '係噉啊，'
+replace = '係噉呀？'
+
+[[rules]]
+pattern = '係噉啊(?=$)'
+replace = '係噉呀？'
+
+[[rules]]
+pattern = '又係嘅'
+replace = '又係𠸏'
+
+[[rules]]
+pattern = '咩原來'
+replace = '乜原來'
+
+[[rules]]
+pattern = '原來([^，？$]*?)㗎'
+replace = '原來\1嘎'
+
+[[rules]]
+pattern = '喇？'
+replace = '嗱？'
+
+[[rules]]
+pattern = '即係(.*?)啫'
+replace = '只係\1啫'
+
+[[rules]]
+pattern = '呀呢'
+replace = '𠻺哩'
+
+[[rules]]
+pattern = '啊，你$'
+replace = '𠻺哩？'
+
+[[rules]]
+pattern = '啦喎'
+replace = '喇喎'
+
+[[rules]]
+pattern = '喂喇'
+replace = '弊喇'
+
+[[rules]]
+pattern = '係咩啊'
+replace = '係咪啊'
+
+[[rules]]
+pattern = '喇，可$'
+replace = '喇嗬'
+
+[[rules]]
+pattern = '喇，可？$'
+replace = '喇嗬？'
+
+[[rules]]
+pattern = '[吖啊呀]，可？$'
+replace = '啊嗬？'
+
+[[rules]]
+pattern = '^咩，原來'
+replace = '乜原來'
+
+[[rules]]
+pattern = '^咩([^，？$]*?)㗎咩'
+replace = '乜\1㗎咩'
+
+[[rules]]
+pattern = '^[何啊]？$'
+replace = '吓？'
+
+[[rules]]
+pattern = '唔([係會])掛'
+replace = '唔\1啩'
+
+[[rules]]
+pattern = '噉就係喇'
+replace = '噉咪係囖'
+
+[[rules]]
+pattern = '^就係喇'
+replace = '咪係囖'
+
+[[rules]]
+pattern = '吓先'
+replace = '下先'
+
+[[rules]]
+pattern = '^咪係咩$'
+replace = '乜係咩'
+
+[[rules]]
+pattern = '[冇無]喇喇'
+replace = '無啦啦'
+
+[[rules]]
+pattern = '[巴吧][喇啦]，'
+replace = '罷啦，'
+
+[[rules]]
+pattern = '咩啊[，]?話？'
+replace = '咩話？'
+
+[[rules]]
+pattern = '係邊([度]?)啊？'
+replace = '喺邊\1啊？'
+
+[[rules]]
+pattern = '就得啦'
+replace = '就得喇'
+
+[[rules]]
+pattern = '係啦'
+replace = '係喇'
+
+[[rules]]
+pattern = '飲吓'
+replace = '飲下'
+
+[[rules]]
+pattern = '咪得咯'
+replace = '咪得囖'
+
+[[rules]]
+pattern = '^咪([^，？]*?)咯'
+replace = '咪\1囖'

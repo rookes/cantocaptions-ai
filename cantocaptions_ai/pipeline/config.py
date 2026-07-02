@@ -71,9 +71,13 @@ class PipelineConfig:
 
     # Subtitle formatting
     max_line_width: Optional[int] = 18
-    max_line_count: Optional[int] = 1
+    max_line_count: Optional[int] = 2
     highlight_words: bool = False
     segment_resolution: str = "sentence"
+
+    # Text cleaning
+    no_clean_text: bool = False
+    clean_rules_dir: Optional[str] = None
 
     # Diarization
     diarize: bool = False

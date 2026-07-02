@@ -1,0 +1,23 @@
+# Comma insertion around conjunctions (legacy clean_subtitle_misc)
+# Rules are applied in order, top to bottom, one re.sub pass each.
+# Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+
+[[rules]]
+pattern = '(?<![？！，…])(?<!^)(?<![？！，…之])但係(?![，！？])'
+replace = '，但係'
+
+[[rules]]
+pattern = '(?<![？！，])(?<!^)(?<![之只])不過(?![，！？])'
+replace = '，不過'
+
+[[rules]]
+pattern = '(?<![？！，])(?<!^)雖然(?![，！？])'
+replace = '，雖然'
+
+[[rules]]
+pattern = '(?<![？！，哋咁噉你佢我])(?<!^)首先(?![，！？])'
+replace = '，首先'
+
+[[rules]]
+pattern = '(?<![？！，])(?<!^)嘅話(?![…，！？])'
+replace = '嘅話，'

@@ -1,0 +1,513 @@
+# Common ASR / homophone error fixes (legacy clean_subtitle_misc)
+# Rules are applied in order, top to bottom, one re.sub pass each.
+# Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+
+[[rules]]
+pattern = '果陣'
+replace = '嗰陣'
+comment = 'promoted from legacy replace_standard_chinese'
+
+[[rules]]
+pattern = '果啲'
+replace = '嗰啲'
+comment = 'promoted from legacy replace_standard_chinese'
+
+[[rules]]
+pattern = '喺到'
+replace = '喺度'
+
+[[rules]]
+pattern = '呢到'
+replace = '呢度'
+
+[[rules]]
+pattern = '嗰到'
+replace = '嗰度'
+
+[[rules]]
+pattern = '割到'
+replace = '嗰度'
+
+[[rules]]
+pattern = '([係答])岩'
+replace = '\1啱'
+
+[[rules]]
+pattern = '講得岩'
+replace = '講得啱'
+
+[[rules]]
+pattern = '係呢邊'
+replace = '喺呢邊'
+
+[[rules]]
+pattern = '係呢度'
+replace = '喺呢度'
+
+[[rules]]
+pattern = '係呢個時候'
+replace = '喺呢個時候'
+
+[[rules]]
+pattern = '係嗰個時候'
+replace = '喺嗰個時候'
+
+[[rules]]
+pattern = '係([^，？$]*?)前'
+replace = '喺\1前'
+
+[[rules]]
+pattern = '喺好耐之前嘅'
+replace = '係好耐之前嘅'
+
+[[rules]]
+pattern = '喺喺'
+replace = '係喺'
+
+[[rules]]
+pattern = '係係'
+replace = '係喺'
+
+[[rules]]
+pattern = '喺邊到'
+replace = '喺邊度'
+
+[[rules]]
+pattern = '幾好嘛'
+replace = '你好嘛'
+
+[[rules]]
+pattern = '冷靜點'
+replace = '冷靜啲'
+
+[[rules]]
+pattern = '無得'
+replace = '冇得'
+
+[[rules]]
+pattern = '水果'
+replace = '生果'
+
+[[rules]]
+pattern = '蒼蠅'
+replace = '烏蠅'
+
+[[rules]]
+pattern = '碰'
+replace = '掂'
+
+[[rules]]
+pattern = '比心'
+replace = '畀心'
+
+[[rules]]
+pattern = '舊鐘'
+replace = '夠鐘'
+
+[[rules]]
+pattern = '一舊'
+replace = '一嚿'
+
+[[rules]]
+pattern = '啪啪'
+replace = '噼噼'
+
+[[rules]]
+pattern = '唔洗'
+replace = '唔使'
+
+[[rules]]
+pattern = '洗([乜咩])'
+replace = '使\1'
+
+[[rules]]
+pattern = '任工'
+replace = '陰功'
+
+[[rules]]
+pattern = '好無？'
+replace = '好唔好？'
+
+[[rules]]
+pattern = '隔嚟'
+replace = '隔籬'
+
+[[rules]]
+pattern = '隔離'
+replace = '隔籬'
+
+[[rules]]
+pattern = '快乜'
+replace = '廢物'
+
+[[rules]]
+pattern = '癌石'
+replace = '岩石'
+
+[[rules]]
+pattern = '拔命'
+replace = '搏命'
+
+[[rules]]
+pattern = '得濟'
+replace = '得滯'
+
+[[rules]]
+pattern = '好餓'
+replace = '好肚餓'
+
+[[rules]]
+pattern = '除然'
+replace = '雖然'
+
+[[rules]]
+pattern = '算熟'
+replace = '算數'
+
+[[rules]]
+pattern = '雪掃'
+replace = '算數'
+
+[[rules]]
+pattern = '[噉敢]啱'
+replace = '咁啱'
+
+[[rules]]
+pattern = '睇黎'
+replace = '睇嚟'
+
+[[rules]]
+pattern = '出黎'
+replace = '出嚟'
+
+[[rules]]
+pattern = '黎緊'
+replace = '嚟緊'
+
+[[rules]]
+pattern = '快點'
+replace = '快啲'
+
+[[rules]]
+pattern = '舊嘢'
+replace = '嚿嘢'
+
+[[rules]]
+pattern = '其樂|奇訥'
+replace = '奇喇'
+
+[[rules]]
+pattern = '果(?=[一二三四五六七八九十白千萬])'
+replace = '過'
+
+[[rules]]
+pattern = '無啲'
+replace = '冇啲'
+
+[[rules]]
+pattern = '乜野'
+replace = '乜嘢'
+
+[[rules]]
+pattern = '隻野'
+replace = '隻嘢'
+
+[[rules]]
+pattern = '等我比'
+replace = '等我畀'
+
+[[rules]]
+pattern = '糟透'
+replace = '早唞'
+
+[[rules]]
+pattern = '晚晚咩'
+replace = '慢慢嚟'
+
+[[rules]]
+pattern = '[洗駛]人唔使本'
+replace = '使人唔使本'
+
+[[rules]]
+pattern = '亂噉'
+replace = '亂咁'
+
+[[rules]]
+pattern = '唔好練噉'
+replace = '唔好亂咁'
+
+[[rules]]
+pattern = '([咁噉])趕'
+replace = '\1講'
+
+[[rules]]
+pattern = '唔好吓氣'
+replace = '唔好客氣'
+
+[[rules]]
+pattern = '唔使吓氣'
+replace = '唔使客氣'
+
+[[rules]]
+pattern = '唔生客氣'
+replace = '唔使客氣'
+
+[[rules]]
+pattern = '噉客氣'
+replace = '咁客氣'
+
+[[rules]]
+pattern = '[份分訓]唔着'
+replace = '瞓唔着'
+
+[[rules]]
+pattern = '細哥'
+replace = '細個'
+
+[[rules]]
+pattern = '扣晒你'
+replace = '靠晒你'
+
+[[rules]]
+pattern = '^通，'
+replace = '唔通，'
+
+[[rules]]
+pattern = '咩都無'
+replace = '咩都冇'
+
+[[rules]]
+pattern = '^埋住'
+replace = '咪住'
+
+[[rules]]
+pattern = '^如過'
+replace = '如果'
+
+[[rules]]
+pattern = '瞓住'
+replace = '瞓着'
+
+[[rules]]
+pattern = '瞓([得到])好臨'
+replace = '瞓\1好稔'
+
+[[rules]]
+pattern = '晚啲'
+replace = '晏啲'
+
+[[rules]]
+pattern = '唔[濟齋]啊'
+replace = '唔制啊'
+
+[[rules]]
+pattern = '唔[濟齋]$'
+replace = '唔制'
+
+[[rules]]
+pattern = '食你一啖'
+replace = '錫你一啖'
+
+[[rules]]
+pattern = '[洗駛]唔使'
+replace = '使唔使'
+
+[[rules]]
+pattern = '洗費'
+replace = '使費'
+
+[[rules]]
+pattern = '你來'
+replace = '你嚟'
+
+[[rules]]
+pattern = '撲街'
+replace = '仆街'
+
+[[rules]]
+pattern = '撲你個街'
+replace = '仆你個街'
+
+[[rules]]
+pattern = '無𠸎𠸎'
+replace = '無啦啦'
+
+[[rules]]
+pattern = '就因為'
+replace = '就係因為'
+
+[[rules]]
+pattern = '([食過好])左'
+replace = '\1咗'
+
+[[rules]]
+pattern = '食燈'
+replace = '熄燈'
+
+[[rules]]
+pattern = '食咗啲燈'
+replace = '熄咗啲燈'
+
+[[rules]]
+pattern = '仲有做係'
+replace = '仲有就係'
+
+[[rules]]
+pattern = '^呢度做乜嘢'
+replace = '你喺度做乜嘢'
+
+[[rules]]
+pattern = '^呢度做咩'
+replace = '你喺度做咩'
+
+[[rules]]
+pattern = '細嚟([啊呀喎㗎])'
+replace = '犀利\1'
+
+[[rules]]
+pattern = '吓係([喇啦])'
+replace = '哦，係\1'
+
+[[rules]]
+pattern = '訓教'
+replace = '瞓覺'
+
+[[rules]]
+pattern = '沖([過咗完])糧'
+replace = '沖\1涼'
+
+[[rules]]
+pattern = '([有冇啲])野'
+replace = '\1嘢'
+
+[[rules]]
+pattern = '極氣'
+replace = '激氣'
+
+[[rules]]
+pattern = '東姑'
+replace = '冬菇'
+
+[[rules]]
+pattern = '排山'
+replace = '爬山'
+
+[[rules]]
+pattern = '屁屁'
+replace = '噼噼'
+
+[[rules]]
+pattern = '早頭'
+replace = '早唞'
+
+[[rules]]
+pattern = '錢鞍'
+replace = '錢罌'
+
+[[rules]]
+pattern = '先領'
+replace = '先令'
+
+[[rules]]
+pattern = '細理'
+replace = '犀利'
+
+[[rules]]
+pattern = '細利'
+replace = '犀利'
+
+[[rules]]
+pattern = '痴槍'
+replace = '枝槍'
+
+[[rules]]
+pattern = '漢寶包'
+replace = '漢堡包'
+
+[[rules]]
+pattern = '打[交擾攪]晒'
+replace = '打搞晒'
+
+[[rules]]
+pattern = '用黎'
+replace = '用嚟'
+
+[[rules]]
+pattern = '唔駛'
+replace = '唔使'
+
+[[rules]]
+pattern = '好耶'
+replace = '好嘢'
+
+[[rules]]
+pattern = '含辛遇苦'
+replace = '含辛茹苦'
+
+[[rules]]
+pattern = '聽手'
+replace = '停手'
+
+[[rules]]
+pattern = '別喇'
+replace = '弊喇'
+
+[[rules]]
+pattern = '中意'
+replace = '鍾意'
+
+[[rules]]
+pattern = '轉心'
+replace = '專心'
+
+[[rules]]
+pattern = '嘢獸'
+replace = '野獸'
+
+[[rules]]
+pattern = '知到'
+replace = '知道'
+
+[[rules]]
+pattern = '([好少咁噉常極太幾都乜別到])白煙'
+replace = '\1百厭'
+
+[[rules]]
+pattern = '打擾細'
+replace = '打搞晒'
+
+[[rules]]
+pattern = '喺([呢嗰邊])到'
+replace = '喺\1度'
+
+[[rules]]
+pattern = '癢癢沉沉'
+replace = '吟吟沉沉'
+
+[[rules]]
+pattern = '嗰嗰'
+replace = '個個'
+
+[[rules]]
+pattern = '偷偷地'
+replace = '偷偷哋'
+
+[[rules]]
+pattern = '好野'
+replace = '好嘢'
+
+[[rules]]
+pattern = '黑人爭'
+replace = '乞人憎'
+
+[[rules]]
+pattern = '[冇無]([\u4e00-\u9fff])[冇無]([\u4e00-\u9fff])'
+replace = '無\1無\2'
+
+[[rules]]
+pattern = '準唔準(?!備)'
+replace = '准唔准'
+
+[[rules]]
+pattern = '唔準(?!備)'
+replace = '唔准'

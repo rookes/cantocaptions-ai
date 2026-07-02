@@ -1,0 +1,60 @@
+# Cleaning step sequence, applied in order to each subtitle line.
+#
+#   type = "rules"    applies the ordered regex rules in `file` (same directory)
+#   type = "builtin"  runs a coded step from SubtitleCleaner.BUILTIN_STEPS:
+#                     question_particles, chinese_numbers, linebreak, trim
+#
+# This order mirrors the legacy canto_subtitle_cleaner clean_subtitle() chain and
+# is load-bearing: rules assume the transformations of every step before them.
+
+[[steps]]
+type = "rules"
+file = "punctuation.toml"
+
+[[steps]]
+type = "rules"
+file = "chars_hk.toml"
+
+[[steps]]
+type = "builtin"
+name = "question_particles"
+
+[[steps]]
+type = "rules"
+file = "question_post.toml"
+
+[[steps]]
+type = "rules"
+file = "comma_conjunctions.toml"
+
+[[steps]]
+type = "rules"
+file = "misc_conventions.toml"
+
+[[steps]]
+type = "rules"
+file = "asr_errors.toml"
+
+[[steps]]
+type = "builtin"
+name = "chinese_numbers"
+
+[[steps]]
+type = "rules"
+file = "particle_conventions.toml"
+
+[[steps]]
+type = "rules"
+file = "interjection_noise.toml"
+
+[[steps]]
+type = "rules"
+file = "repeated_speech.toml"
+
+[[steps]]
+type = "builtin"
+name = "linebreak"
+
+[[steps]]
+type = "builtin"
+name = "trim"

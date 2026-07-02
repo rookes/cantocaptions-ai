@@ -1,0 +1,47 @@
+# Collapse repeated speech, e.g. 喂喂喂 -> 喂… (legacy clean_interjections)
+# Rules are applied in order, top to bottom, one re.sub pass each.
+# Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+
+[[rules]]
+pattern = '([\u4e00-\u9fff]{2,})\1+[，…]*'
+replace = '\1…'
+
+[[rules]]
+pattern = '([\u4e00-\u9fff])\1{2,}[，…]*'
+replace = '\1…'
+
+[[rules]]
+pattern = '([\u4e00-\u9fff])([，…]\1){2,}[，…？]*？'
+replace = '\1…？'
+
+[[rules]]
+pattern = '([\u4e00-\u9fff])([，…]\1){2,}[，…]+'
+replace = '\1…'
+
+[[rules]]
+pattern = '([\u4e00-\u9fff])([，…]\1){2,}[，…]+$'
+replace = '\1…'
+
+[[rules]]
+pattern = '([\u4e00-\u9fff])([，…]\1){2,}'
+replace = '\1…\1'
+
+[[rules]]
+pattern = '(?<![\u4e00-\u9fff])([\u4e00-\u9fff])[，…](\1[，…$])+'
+replace = '\1…'
+
+[[rules]]
+pattern = '(?<![\u4e00-\u9fff])([\u4e00-\u9fff]{2,})[，…](\1[，…])+'
+replace = '\1…'
+
+[[rules]]
+pattern = '(?<![\u4e00-\u9fff])([\u4e00-\u9fff][啊㗎])[，…](\1[，…])*(\1)+[，…]?'
+replace = '\1…'
+
+[[rules]]
+pattern = '(?<=[？…，])([我你佢])，\1'
+replace = '\1…\1'
+
+[[rules]]
+pattern = '^([我你佢])，\1'
+replace = '\1…\1'

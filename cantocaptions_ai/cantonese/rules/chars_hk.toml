@@ -1,0 +1,279 @@
+# Hong Kong standard character variants (legacy standardize_chars_hk)
+# Rules are applied in order, top to bottom, one re.sub pass each.
+# Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+
+[[rules]]
+pattern = '爲'
+replace = '為'
+
+[[rules]]
+pattern = '嬀'
+replace = '媯'
+
+[[rules]]
+pattern = '僞'
+replace = '偽'
+
+[[rules]]
+pattern = '潙'
+replace = '溈'
+
+[[rules]]
+pattern = '蔿'
+replace = '蒍'
+
+[[rules]]
+pattern = '搵'
+replace = '揾'
+
+[[rules]]
+pattern = '溫'
+replace = '温'
+
+[[rules]]
+pattern = '慍'
+replace = '愠'
+
+[[rules]]
+pattern = '醞'
+replace = '醖'
+
+[[rules]]
+pattern = '媼'
+replace = '媪'
+
+[[rules]]
+pattern = '榲'
+replace = '榅'
+
+[[rules]]
+pattern = '熅'
+replace = '煴'
+
+[[rules]]
+pattern = '縕'
+replace = '緼'
+
+[[rules]]
+pattern = '膃'
+replace = '腽'
+
+[[rules]]
+pattern = '轀'
+replace = '輼'
+
+[[rules]]
+pattern = '鰮'
+replace = '鰛'
+
+[[rules]]
+pattern = '蒕'
+replace = '蒀'
+
+[[rules]]
+pattern = '蘊'
+replace = '藴'
+
+[[rules]]
+pattern = '氳'
+replace = '氲'
+
+[[rules]]
+pattern = '兌'
+replace = '兑'
+
+[[rules]]
+pattern = '說'
+replace = '説'
+
+[[rules]]
+pattern = '脫'
+replace = '脱'
+
+[[rules]]
+pattern = '稅'
+replace = '税'
+
+[[rules]]
+pattern = '悅'
+replace = '悦'
+
+[[rules]]
+pattern = '挩'
+replace = '捝'
+
+[[rules]]
+pattern = '敓'
+replace = '敚'
+
+[[rules]]
+pattern = '梲'
+replace = '棁'
+
+[[rules]]
+pattern = '涗'
+replace = '涚'
+
+[[rules]]
+pattern = '蛻'
+replace = '蜕'
+
+[[rules]]
+pattern = '銳'
+replace = '鋭'
+
+[[rules]]
+pattern = '閱'
+replace = '閲'
+
+[[rules]]
+pattern = '㨂'
+replace = '揀'
+
+[[rules]]
+pattern = '錬'
+replace = '鍊'
+
+[[rules]]
+pattern = '床'
+replace = '牀'
+
+[[rules]]
+pattern = '羣'
+replace = '群'
+
+[[rules]]
+pattern = '裡'
+replace = '裏'
+
+[[rules]]
+pattern = '麵'
+replace = '麪'
+
+[[rules]]
+pattern = '敎'
+replace = '教'
+
+[[rules]]
+pattern = '祕'
+replace = '秘'
+
+[[rules]]
+pattern = '巿'
+replace = '市'
+
+[[rules]]
+pattern = '衆'
+replace = '眾'
+
+[[rules]]
+pattern = '潨'
+replace = '潀'
+
+[[rules]]
+pattern = '溼'
+replace = '濕'
+
+[[rules]]
+pattern = '鷄'
+replace = '雞'
+
+[[rules]]
+pattern = '吿'
+replace = '告'
+
+[[rules]]
+pattern = '汙'
+replace = '污'
+
+[[rules]]
+pattern = '洩'
+replace = '泄'
+
+[[rules]]
+pattern = '駡'
+replace = '罵'
+
+[[rules]]
+pattern = '銹'
+replace = '鏽'
+
+[[rules]]
+pattern = '鉤'
+replace = '鈎'
+
+[[rules]]
+pattern = '衛'
+replace = '衞'
+
+[[rules]]
+pattern = '蔥'
+replace = '葱'
+
+[[rules]]
+pattern = '艷'
+replace = '豔'
+
+[[rules]]
+pattern = '葯'
+replace = '藥'
+
+[[rules]]
+pattern = '滙'
+replace = '匯'
+
+[[rules]]
+pattern = '啟'
+replace = '啓'
+
+[[rules]]
+pattern = '奬'
+replace = '獎'
+
+[[rules]]
+pattern = '俾'
+replace = '畀'
+
+[[rules]]
+pattern = '我地'
+replace = '我哋'
+
+[[rules]]
+pattern = '你地'
+replace = '你哋'
+
+[[rules]]
+pattern = '佢地'
+replace = '佢哋'
+
+[[rules]]
+pattern = '人地'
+replace = '人哋'
+
+[[rules]]
+pattern = '爹地'
+replace = '爹哋'
+
+[[rules]]
+pattern = '妳'
+replace = '你'
+
+[[rules]]
+pattern = '您'
+replace = '你'
+
+[[rules]]
+pattern = '癐'
+replace = '攰'
+
+[[rules]]
+pattern = '倆'
+replace = '兩'
+
+[[rules]]
+pattern = '咧'
+replace = '呢'
+
+[[rules]]
+pattern = '噶'
+replace = '㗎'

@@ -6,7 +6,9 @@ from typing import List, Optional
 import numpy as np
 
 from cantocaptions_ai.utils.audio import SAMPLE_RATE
-from cantocaptions_ai.utils.schema import VadAudioSegment, TranscriptionResult
+from typing import Union
+
+from cantocaptions_ai.utils.schema import VadAudioSegment, TranscriptionResult, AlignedTranscriptionResult
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -188,6 +190,32 @@ def write_llm_correction_debug(audio_path: str, result: TranscriptionResult, deb
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
     logger.info(f"LLM correction debug output written to {json_path} ({len(result['segments'])} segments)")
+
+
+def write_precleaning_debug(
+    audio_path: str,
+    result: Union[TranscriptionResult, AlignedTranscriptionResult],
+    debug_dir: str,
+) -> None:
+    """Write the merged, pre-cleaning subtitles to {debug_dir}/{stem}/pre_cleaning/.
+
+    Writes {stem}.srt (diffable against the final output) plus result.json for parity
+    with other stages. This is a snapshot, not a loadable checkpoint: cleaning always
+    re-runs so that rule-file edits take effect under --load_debug_dir.
+    """
+    from cantocaptions_ai.utils.output import WriteSRT
+
+    stage_dir = _stage_dir(audio_path, "pre_cleaning", debug_dir)
+    WriteSRT(stage_dir)(result, audio_path, {})
+    output = {
+        "audio_path": os.path.abspath(audio_path),
+        "language": result.get("language"),
+        "segments": result["segments"],
+    }
+    json_path = os.path.join(stage_dir, "result.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    logger.info(f"Pre-cleaning debug output written to {stage_dir} ({len(result['segments'])} segments)")
 
 
 def load_llm_correction_debug(audio_path: str, debug_dir: str) -> Optional[TranscriptionResult]:

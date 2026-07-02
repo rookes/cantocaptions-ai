@@ -106,10 +106,14 @@ def cli():
     align_grp.add_argument("--align_merge_distance", type=float, default=0.12, help="The maximum distance between utterances that allows them to be merged.")
 
     subtitle_grp = parser.add_argument_group("subtitle formatting")
-    subtitle_grp.add_argument("--max_line_width", type=optional_int, default=18, help="(not possible with --no_align) the maximum number of characters in a line before breaking the line")
-    subtitle_grp.add_argument("--max_line_count", type=optional_int, default=1, help="(not possible with --no_align) the maximum number of lines in a segment")
+    subtitle_grp.add_argument("--max_line_width", type=optional_int, default=18, help="(not possible with --no_align) the maximum number of characters in a line before text cleaning breaks the line")
+    subtitle_grp.add_argument("--max_line_count", type=optional_int, default=2, help="(not possible with --no_align) the maximum number of lines in a segment; text cleaning only breaks lines when this is 2 or more")
     subtitle_grp.add_argument("--highlight_words", type=str2bool, default=False, help="(not possible with --no_align) underline each word as it is spoken in srt and vtt")
     subtitle_grp.add_argument("--segment_resolution", type=str, default="sentence", choices=["sentence", "chunk"], help="(not possible with --no_align) the maximum number of characters in a line before breaking the line")
+
+    clean_grp = parser.add_argument_group("text cleaning")
+    clean_grp.add_argument("--no_clean_text", action="store_true", help="disable Cantonese subtitle text cleaning (punctuation, HK conventions, particle fixes, interjection removal, line breaking)")
+    clean_grp.add_argument("--clean_rules_dir", type=str, default=None, metavar="DIR", help="directory containing pipeline.toml and rule .toml files overriding the built-in cleaning rules")
 
     diarize_grp = parser.add_argument_group("diarization")
     diarize_grp.add_argument("--diarize", action="store_true", help="Apply diarization to assign speaker labels to each segment/word")

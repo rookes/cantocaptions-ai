@@ -12,8 +12,8 @@ from typing import Callable, List, Optional
 from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer
 from cantocaptions_ai.utils.log_utils import StageTimer, TranscriptionSummary, get_logger
 from cantocaptions_ai.utils.model_utils import model_scope, flush_vram, vram_stats
-from cantocaptions_ai.cantonese.text import is_mergeable
-from cantocaptions_ai.utils.debug import _debug_stage_exists
+from cantocaptions_ai.cantonese.text import is_mergeable, is_removable
+from cantocaptions_ai.utils.debug import _debug_stage_exists, write_precleaning_debug
 
 logger = get_logger(__name__)
 
@@ -198,6 +198,8 @@ def _merge_and_write(
     align_merge_distance: float,
     align_padding: float,
     writer_args: dict,
+    cleaner=None,
+    debug_dir: Optional[str] = None,
 ) -> None:
     for item in items:
         result = item['result']
@@ -229,6 +231,25 @@ def _merge_and_write(
                 prev_segment = segment
 
         result["segments"] = new_segments  # TODO: update word_segments as well
+
+        if debug_dir is not None:
+            write_precleaning_debug(audio_path, result, debug_dir)
+
+        if cleaner is not None:
+            # Cleaning edits segment text only; words/chars keep the original
+            # alignment tokens and timings.
+            cleaned_segments = []
+            for segment in new_segments:
+                text = cleaner.clean(segment["text"])
+                if is_removable(text):
+                    continue
+                segment["text"] = text
+                cleaned_segments.append(segment)
+            dropped = len(new_segments) - len(cleaned_segments)
+            if dropped:
+                logger.info(f"Text cleaning: dropped {dropped} interjection/noise subtitles")
+            result["segments"] = cleaned_segments
+
         writer(result, audio_path, writer_args)
 
 
@@ -295,6 +316,25 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         "max_line_count": cfg.max_line_count,
         "max_line_width": cfg.max_line_width,
     }
+
+    # Text cleaning runs on the final merged segments just before writing.
+    # Constructed eagerly so bad rule files fail before any model inference.
+    cleaner = None
+    if cfg.retime:
+        if not cfg.no_clean_text:
+            logger.info("Text cleaning skipped: --retime preserves subtitle text")
+    elif not cfg.no_clean_text:
+        from cantocaptions_ai.cantonese.cleaner import SubtitleCleaner
+        cleaner = SubtitleCleaner(
+            rules_dir=cfg.clean_rules_dir,
+            line_max_length=cfg.max_line_width or 21,
+            max_line_count=cfg.max_line_count,
+        )
+        if cfg.highlight_words:
+            warnings.warn(
+                "--highlight_words uses word timings that text cleaning does not update; "
+                "highlighted output may not match the cleaned text"
+            )
 
     if cfg.load_debug_dir:
         from pathlib import Path as _Path
@@ -525,6 +565,9 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             )
 
     # Write
-    _merge_and_write(items, writer, align_language, cfg.align_merge_distance, cfg.align_padding, writer_args)
+    _merge_and_write(
+        items, writer, align_language, cfg.align_merge_distance, cfg.align_padding, writer_args,
+        cleaner=cleaner, debug_dir=cfg.debug_dir,
+    )
 
     summary.print_summary(process_elapsed=time.perf_counter() - process_start)

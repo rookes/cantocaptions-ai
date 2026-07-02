@@ -336,8 +336,10 @@ dependencies = [
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'AMD64' and sys_platform == 'win32') or (python_full_version < '3.11' and sys_platform == 'darwin')" },
     { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux') or (python_full_version >= '3.11' and platform_machine == 'AMD64' and sys_platform == 'win32') or (python_full_version >= '3.11' and sys_platform == 'darwin')" },
     { name = "pyannote-audio", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
+    { name = "pycantonese", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
     { name = "qwen-asr", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
     { name = "rotary-embedding-torch", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
+    { name = "tomli", marker = "(python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux') or (python_full_version < '3.11' and platform_machine == 'AMD64' and sys_platform == 'win32') or (python_full_version < '3.11' and sys_platform == 'darwin')" },
     { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
     { name = "torch", version = "2.12.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torchaudio", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
@@ -409,8 +411,10 @@ requires-dist = [
     { name = "opencc", specifier = ">=1.0.0" },
     { name = "pandas", specifier = ">=2.2.3" },
     { name = "pyannote-audio", specifier = ">=4.0.0" },
+    { name = "pycantonese", specifier = ">=3.4.0" },
     { name = "qwen-asr", specifier = ">=0.0.6" },
     { name = "rotary-embedding-torch", specifier = ">=0.6.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.1" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.0.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine != 'AMD64' and platform_machine != 'x86_64' and sys_platform != 'darwin'", specifier = ">=2.0.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "(platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'win32') or (platform_machine == 'AMD64' and sys_platform != 'darwin' and sys_platform != 'win32') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux')", specifier = ">=2.0.0" },
@@ -3142,6 +3146,21 @@ wheels = [
 ]
 
 [[package]]
+name = "pycantonese"
+version = "5.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "rustling", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/09/09/32e8000e39eb9ff034e1d55a86536a14abab90f2f4df176129fd90c43c29/pycantonese-5.0.0.tar.gz", hash = "sha256:8655ba3cd891b528d6b070245abed55b20a08d673f1056fcf9afad0adbc47c1d", size = 39584891, upload-time = "2026-05-26T05:59:49.252Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/80/9b7163e41a460c7455026b7ff000ac8c75469ce8992a1f711bccf5759fbe/pycantonese-5.0.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:587387ffe61969d95a5ee5f3f47eb74712c50e76dbc00d578dfb59b45934e3f5", size = 42475866, upload-time = "2026-05-26T05:59:33.656Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/a9/cbc19623761136d7c8f7230d633bc4735acf685f12da78662f4c24206bbf/pycantonese-5.0.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:b33d794ea43c8bb7e18699e561fa51a0f48dfb5a033d569b99b733b6ffc30917", size = 42276871, upload-time = "2026-05-26T05:59:37.174Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/fe/ee179a7336935d71d1db34183008a5362457d657e59c7a4c63e20c0b7852/pycantonese-5.0.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4a010973683fb8d14313ef44cdf7a4ded1adbe1a1bc64c93d0f75e65f141dd1a", size = 42676646, upload-time = "2026-05-26T05:59:43.28Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/fd/c13baa1362c377552644f3558759fc4b87557a9d9e3f7a030b25b897bfe3/pycantonese-5.0.0-cp310-abi3-win_amd64.whl", hash = "sha256:8f7bdc1e9a37b5e164cd57f22aecae8532d4d0b74ff5b6f5e28480a657fa53f9", size = 42123344, upload-time = "2026-05-26T05:59:46.154Z" },
+]
+
+[[package]]
 name = "pycparser"
 version = "3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3504,6 +3523,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c7/3b/ebda527b56beb90cb7652cb1c7e4f91f48649fbcd8d2eb2fb6e77cd3329b/ruamel_yaml-0.19.1.tar.gz", hash = "sha256:53eb66cd27849eff968ebf8f0bf61f46cdac2da1d1f3576dd4ccee9b25c31993", size = 142709, upload-time = "2026-01-02T16:50:31.84Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b8/0c/51f6841f1d84f404f92463fc2b1ba0da357ca1e3db6b7fbda26956c3b82a/ruamel_yaml-0.19.1-py3-none-any.whl", hash = "sha256:27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93", size = 118102, upload-time = "2026-01-02T16:50:29.201Z" },
+]
+
+[[package]]
+name = "rustling"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/49/1c/1dfeec8ecc0ff0d70d2be4c34dee45078c4ee7706214320f49c13c8f24ab/rustling-0.8.0.tar.gz", hash = "sha256:04d769e50ff2c8b0bc5fb178f0a1dba578427b6a7d9027253366d1ac8922e1fd", size = 347788, upload-time = "2026-03-20T23:18:50.52Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/e5/8dc326d9392f075b67daedd8ef2798c07670c847e4eaff7a99c9b7be441c/rustling-0.8.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:61982a84e6fd86e7d4f9216ab1fecfa908e58234350e72d311c0203bee0e2b51", size = 2908881, upload-time = "2026-03-20T23:18:41.541Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/58/b9f98fa259c4fc6d207bf32b72903594e347c4902f62cc76eedad7d6ffea/rustling-0.8.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:242dd1ae5436c8dffcfac53a4ef53b3a414ba660525f166c568f5835d9519409", size = 2710893, upload-time = "2026-03-20T23:18:43.79Z" },
+    { url = "https://files.pythonhosted.org/packages/da/2b/751f023690043ac5c5f62b19506906651da9c27c1ce8afb6c760e23e70f4/rustling-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:321ef6768275c50bab28661d5d5c50747ccde33c138e3afa53281b5cb5ca628d", size = 3106500, upload-time = "2026-03-20T23:18:47.438Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/63/a683d35eea2f1bc1d0ad69902d15f22697a51473e1c3d11e14cfbc995648/rustling-0.8.0-cp310-abi3-win_amd64.whl", hash = "sha256:24b89b166e621b26d1c7a7a32e2ed31343112a482647af6128eb61e989c1b9a8", size = 2532713, upload-time = "2026-03-20T23:18:49.214Z" },
 ]
 
 [[package]]

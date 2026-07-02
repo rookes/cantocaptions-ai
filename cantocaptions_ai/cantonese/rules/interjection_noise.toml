@@ -1,0 +1,79 @@
+# Noise / grunt removal; may empty a subtitle, which is then dropped (legacy clean_interjections)
+# Rules are applied in order, top to bottom, one re.sub pass each.
+# Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+
+[[rules]]
+pattern = '嘘，'
+replace = ''
+
+[[rules]]
+pattern = '，啊，'
+replace = '，'
+
+[[rules]]
+pattern = '^[喇啊]，'
+replace = ''
+
+[[rules]]
+pattern = '[嘩嚿]啊'
+replace = ''
+
+[[rules]]
+pattern = '^[唔嘩嗯啊嗚咦誒哦哈嘿哇，…？]{1,}?$'
+replace = ''
+
+[[rules]]
+pattern = '^[吓吼][，…？]?$'
+replace = ''
+
+[[rules]]
+pattern = '唉，'
+replace = ''
+
+[[rules]]
+pattern = '哎，'
+replace = ''
+
+[[rules]]
+pattern = '哈$'
+replace = ''
+
+[[rules]]
+pattern = '(嘻){2,}'
+replace = ''
+
+[[rules]]
+pattern = '(唔){2,}'
+replace = ''
+
+[[rules]]
+pattern = '^唔？$'
+replace = '嗯？'
+
+[[rules]]
+pattern = '^唔$'
+replace = ''
+
+[[rules]]
+pattern = '^唔，'
+replace = ''
+
+[[rules]]
+pattern = '(嗯){2,}'
+replace = ''
+
+[[rules]]
+pattern = '(咦){2,}'
+replace = ''
+
+[[rules]]
+pattern = '咦[…？]'
+replace = ''
+
+[[rules]]
+pattern = '(呼){2,}'
+replace = ''
+
+[[rules]]
+pattern = '[嘩呼]…'
+replace = ''

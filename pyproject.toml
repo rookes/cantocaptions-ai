@@ -25,6 +25,8 @@ dependencies = [
     "beartype>=0.16.0",
     "rotary-embedding-torch>=0.6.0",
     "librosa>=0.10.0",
+    "pycantonese>=3.4.0",
+    "tomli>=2.0.1; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -61,7 +63,7 @@ build-backend = "setuptools.build_meta"
 packages = { find = { where = ["."], include = ["cantocaptions_ai*"] } }
 
 [tool.setuptools.package-data]
-cantocaptions_ai = ["cantonese/opencc/*", "assets/*"]
+cantocaptions_ai = ["cantonese/opencc/*", "cantonese/rules/*.toml", "assets/*"]
 
 # torchcodec (transitive dep of pyannote-audio >=4) has no wheels for Windows, macOS, or Linux aarch64.
 # Only Linux x86_64 has torchcodec wheels; everywhere else we override it away.

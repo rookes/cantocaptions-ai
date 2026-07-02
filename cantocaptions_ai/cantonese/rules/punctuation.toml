@@ -1,0 +1,86 @@
+# Punctuation and whitespace normalization (legacy clean_punctuation)
+# Rules are applied in order, top to bottom, one re.sub pass each.
+# Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+
+[[rules]]
+pattern = '[\n\t]+'
+replace = ' '
+comment = 'Replace all line breaks and tabs with a space (to be removed later)'
+
+[[rules]]
+pattern = '﹑'
+replace = "'"
+comment = 'restore normal apostrophe'
+
+[[rules]]
+pattern = '([a-zA-Z])-([a-zA-Z])'
+replace = '\1\2'
+comment = 'remove random hyphens'
+
+[[rules]]
+pattern = '(?<![a-zA-Z])\s+(?![a-zA-Z])'
+replace = ''
+comment = 'remove spaces when not next to Latin characters'
+
+[[rules]]
+pattern = '(?<=[\u4e00-\u9fff])\s+'
+replace = ''
+comment = 'remove spaces next to Chinese characters'
+
+[[rules]]
+pattern = '\s+(?=[\u4e00-\u9fff])'
+replace = ''
+
+[[rules]]
+pattern = '\s+'
+replace = ' '
+comment = 'reduce all spaces to single space'
+
+[[rules]]
+pattern = '％'
+replace = '%'
+comment = 'Netflix standard uses half-width percent sign'
+
+[[rules]]
+pattern = '\?'
+replace = '？'
+
+[[rules]]
+pattern = '\.\.\.'
+replace = '…'
+
+[[rules]]
+pattern = '… '
+replace = '…'
+
+[[rules]]
+pattern = '([^\d零一二兩两三四五六七八九十百千])[。.]([^\d零一二兩两三四五六七八九十百千])'
+replace = '\1，\2'
+
+[[rules]]
+pattern = '[。.]$'
+replace = ''
+
+[[rules]]
+pattern = '^[。.]'
+replace = ''
+
+[[rules]]
+pattern = '[!！]'
+replace = '，'
+
+[[rules]]
+pattern = ','
+replace = '，'
+
+[[rules]]
+pattern = '^，'
+replace = ''
+
+[[rules]]
+pattern = '，$'
+replace = ''
+
+[[rules]]
+pattern = '([，？…])[，？…]+'
+replace = '\1'
