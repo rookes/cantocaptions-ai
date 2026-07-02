@@ -24,7 +24,7 @@ uv sync
 ## Usage
 
 ```bash
-cantocaptions audio.wav
+uv run cantocaptions_ai audio.wav
 ```
 
 This produces `audio.srt` in the current directory. The first run downloads model weights automatically (~6 GB).
@@ -34,12 +34,13 @@ This produces `audio.srt` in the current directory. The first run downloads mode
 The VAD model (`pyannote/segmentation`) requires accepting its terms of use on HuggingFace. Pass your token once:
 
 ```bash
-cantocaptions audio.wav --hf_token hf_...
+uv run cantocaptions_ai audio.wav --hf_token hf_...
 ```
 
 ### Custom options
 
 * `-o [DIR_NAME]` - output directory for the SRT file
+* `--input_dir [DIR_NAME]` - run all 
 * `--vocal_isolation_method [OPTION]` - set to "none" for no vocal isolation, or "mbroformer" for full mbroformer vocal isolation
 * `--log_file [FILE_PATH]` - simplify console logging and output full logs to designated file
 * `--debug_dir [DIR_NAME]` - directory for intermediate processed data for debugging purposes
@@ -50,28 +51,20 @@ cantocaptions audio.wav --hf_token hf_...
 Install extras alongside the base package:
 
 ```bash
-uv sync --extra ensemble   # Whisper ensemble correction (faster-whisper)
-uv sync --extra llm        # LLM particle correction (bitsandbytes)
-uv sync --extra diarize    # Speaker diarization — Linux only (NeMo)
+uv sync --extra llm        # LLM corrections (bitsandbytes)
+uv sync --extra compile    # Experimental support for new Qwen transformers model
 uv sync --extra full       # All of the above
-```
-
-Enable at runtime:
-
-```bash
-cantocaptions audio.wav --ensemble_model whisper
-cantocaptions audio.wav --llm_correction
-cantocaptions audio.wav --diarize          # Linux only
 ```
 
 ## Planned Updates
 
 Current updates planned for the near future:
 
-* Add Cantonese standardization and cleaning scripts (adapted from [rookes/canto-subtitle-cleaner](https://github.com/rookes/canto-subtitle-cleaner))
-* Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
-* Add better multilingual recognition for Mandarin and English
-* Improve ensemble+LLM integration to allow for more consistent and error-free transcriptions
-* Complete diarization implementation to separate lines from different speakers
+- [x] Add Cantonese standardization and cleaning scripts (adapted from [rookes/canto-subtitle-cleaner](https://github.com/rookes/canto-subtitle-cleaner))
+- [x] Implement the "retime" feature to accurately run alignment on existing subtitles
+- [ ] Add an option to use Qwen LLM to do error-correction based on a reference standard Chinese subtitle file (in progress)
+- [ ] Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
+- [ ] Add better multilingual recognition for Mandarin and English
+- [ ] Complete diarization implementation to separate lines from different speakers
 * Add [SubER](https://github.com/apptek/SubER) metric calculation compatibility, and use its Levenshtein distance algorithm to parallelize ensemble subs
 * Add some subtitle processing helper utilities, such as an SRT retiming utility
