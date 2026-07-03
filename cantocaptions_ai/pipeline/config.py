@@ -45,6 +45,7 @@ class PipelineConfig:
 
     # Vocal isolation
     vocal_isolation_method: str = "mbroformer"
+    vocal_isolation_batch_size: int = 4
 
     # ASR options
     suppress_tokens: str = "-1"

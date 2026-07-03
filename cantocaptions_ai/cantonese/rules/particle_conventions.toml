@@ -251,6 +251,10 @@ pattern = '唔使([^，？]*?)喇'
 replace = '唔使\1啦'
 
 [[rules]]
+pattern = '噉好[呢喇]'
+replace = '噉好啦'
+
+[[rules]]
 pattern = '都話([^，？]*?)㗎喇'
 replace = '都話\1㗎啦'
 
@@ -413,6 +417,18 @@ replace = '乜\1㗎咩'
 [[rules]]
 pattern = '^[何啊]？$'
 replace = '吓？'
+
+[[rules]]
+pattern = '([喇啦呢㗎啊])，吓$'
+replace = '\1吓'
+
+[[rules]]
+pattern = '([吖呀])，吓$'
+replace = '啊吓'
+
+[[rules]]
+pattern = '([嘅])，吓$'
+replace = '㗎吓'
 
 [[rules]]
 pattern = '唔([係會])掛'

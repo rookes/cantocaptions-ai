@@ -10,6 +10,7 @@ from typing import List, Optional
 from cantocaptions_ai.pipeline.asr import QwenPipeline, _normalize_language, _ensure_model_downloaded
 from cantocaptions_ai.utils.audio import resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
+from cantocaptions_ai.utils.model_utils import partition_by_cache
 from cantocaptions_ai.cantonese.text import normalize_segment_text
 from cantocaptions_ai.utils.log_utils import get_logger
 
@@ -32,13 +33,62 @@ class QwenPipelineLegacy(QwenPipeline):
         self._model = model
         self._language = _normalize_language(language or "yue")
 
+    def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
+        """Transcribe all files in a single Qwen3ASRModel.transcribe call.
+
+        All to-compute files' segments are concatenated into one list; the model
+        backfills them across its internal max_inference_batch_size (so the last
+        batch of one file is packed with the next file's segments). Results are then
+        split back per file. Progress is coarse (the model call is opaque): the bar
+        jumps to full on completion.
+        """
+        logger.info("Performing transcription (legacy backend)...")
+        language = self._language
+        cached, to_compute = partition_by_cache(items, self.read_debug, load_debug_dir)
+
+        total_segs = sum(len(item['vad_segments']) for _, item in to_compute)
+        if progress_callback is not None:
+            progress_callback.set_total(total_segs, unit="seg")
+
+        computed = {}
+        if to_compute:
+            # Qwen3ASRModel.transcribe accepts List[(np.ndarray, sample_rate)];
+            # VAD segments are already 16 kHz mono float32 arrays.
+            audio_inputs = [
+                (seg['audio'], 16000) for _, item in to_compute for seg in item['vad_segments']
+            ]
+            transcriptions = self._model.transcribe(audio_inputs, language=language)
+
+            pos = 0
+            for idx, item in to_compute:
+                segs = item['vad_segments']
+                chunk = transcriptions[pos:pos + len(segs)]
+                pos += len(segs)
+                segments: List[SingleSegment] = [
+                    normalize_segment_text({'text': t.text, 'start': s['start'], 'end': s['end']})
+                    for s, t in zip(segs, chunk)
+                ]
+                result: TranscriptionResult = {"segments": segments, "language": language}
+                computed[idx] = result
+                if debug_dir is not None:
+                    self.write_debug(item['audio_path'], result, debug_dir)
+
+            if progress_callback is not None:
+                progress_callback.advance(total_segs)
+
+        result_items = []
+        for idx, item in enumerate(items):
+            result = cached[idx] if idx in cached else computed[idx]
+            result_items.append(self._pack(item, result))
+        return result_items
+
     def process(
         self,
         input: List[VadAudioSegment],
         *,
         progress_callback: ProgressCallback = None,
     ) -> TranscriptionResult:
-        logger.info("Performing transcription (legacy backend)...")
+        """Transcribe a single file's segments (library/single-file entry point)."""
         language = self._language
 
         # Qwen3ASRModel.transcribe accepts List[(np.ndarray, sample_rate)].
@@ -55,7 +105,8 @@ class QwenPipelineLegacy(QwenPipeline):
             }))
 
         if progress_callback is not None:
-            progress_callback(1.0)
+            progress_callback.set_total(len(input), unit="seg")
+            progress_callback.advance(len(input))
 
         return {"segments": segments, "language": language}
 
@@ -69,6 +120,7 @@ def load_model_legacy(
     download_root: Optional[str] = None,
     local_files_only: bool = False,
     batch_size: Optional[int] = None,
+    attn_implementation: Optional[str] = "sdpa",
     print_progress: bool = False,
     verbose: bool = False,
 ) -> QwenPipelineLegacy:
@@ -96,6 +148,7 @@ def load_model_legacy(
         device_map=resolve_device(device, device_index),
         local_files_only=local_files_only,
         cache_dir=download_root,
+        attn_implementation=attn_implementation
     )
 
     return QwenPipelineLegacy(model=hf_model, language=language)

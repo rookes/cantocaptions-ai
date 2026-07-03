@@ -138,7 +138,7 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
         reference_texts = input.get('reference_texts')
 
         if ensemble_texts:
-            corrected = self.correct_segments(segments, ensemble_texts=ensemble_texts, progress_callback=progress_callback)
+            corrected = self.correct_segments(segments, ensemble_texts=ensemble_texts)
         else:
             corrected = [seg.get('text', '') for seg in segments]
 
@@ -154,7 +154,6 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
         self,
         segments: List[SingleSegment],
         ensemble_texts: Optional[List[str]] = None,
-        progress_callback: ProgressCallback = None,
     ) -> List[str]:
         """Pass A: per-segment particle and error correction."""
         corrected = []
@@ -183,21 +182,16 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
             )
             corrected.append(self._sanitize_pass_a(response, primary))
 
-            if progress_callback is not None:
-                progress_callback((i + 1) / n)
-
         return corrected
 
     def correct_with_reference(
         self,
         segments: List[SingleSegment],
         reference_texts: List[str],
-        progress_callback: ProgressCallback = None,
     ) -> List[str]:
         """Pass REF: per-segment correction using a standard Chinese subtitle as reference."""
         system = _PASS_REF_SEMANTIC_SYSTEM if self._semantic_mode else _PASS_REF_SYSTEM
         corrected = []
-        n = len(segments)
         for i, seg in enumerate(segments):
             primary = seg.get('text', '')
             ref = reference_texts[i] if i < len(reference_texts) else ''
@@ -215,9 +209,6 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
                 if result != primary:
                     logger.debug(f"Reference correction [{i}]: {primary!r} → {result!r}")
                 corrected.append(result)
-
-            if progress_callback is not None:
-                progress_callback((i + 1) / n)
 
         return corrected
 

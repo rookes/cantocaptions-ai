@@ -1,8 +1,13 @@
-from typing import Callable, TypedDict, Optional, List, Tuple, Union
+from typing import TYPE_CHECKING, Callable, TypedDict, Optional, List, Tuple, Union
 
 import numpy as np
 
-ProgressCallback = Optional[Callable[[float], None]]
+if TYPE_CHECKING:
+    from cantocaptions_ai.utils.log_utils import ProgressReporter
+
+# A pipeline stage receives a ProgressReporter (set_total / advance) rather than a
+# bare float callback, so tqdm can render accurate throughput and ETA across all files.
+ProgressCallback = Optional["ProgressReporter"]
 
 
 def interpolate_nans(x, method: str = 'nearest'):

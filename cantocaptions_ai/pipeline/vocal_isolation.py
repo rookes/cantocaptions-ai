@@ -1,19 +1,17 @@
-import io
 import importlib.resources
-import sys
-import time
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torchaudio
 from omegaconf import OmegaConf, DictConfig
 from huggingface_hub import hf_hub_download
 
 from cantocaptions_ai.pipeline.mbroformer.model import MelBandRoformer
 from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
-from cantocaptions_ai.utils.model_utils import PipelineStage
+from cantocaptions_ai.utils.model_utils import PipelineStage, partition_by_cache, run_adaptive_batches
 from cantocaptions_ai.utils.debug import load_isolation_debug, write_isolation_debug
 from cantocaptions_ai.utils.log_utils import get_logger
 
@@ -38,91 +36,6 @@ def _get_windowing_array(window_size, fade_size, device):
     return window.to(device)
 
 
-def _demix_track(config, model, mix, device, first_chunk_time=None):
-    C = config.inference.chunk_size
-    N = config.inference.num_overlap
-    step = C // N
-    fade_size = C // 10
-    border = C - step
-
-    if mix.shape[1] > 2 * border and border > 0:
-        mix = nn.functional.pad(mix, (border, border), mode='reflect')
-
-    windowing_array = _get_windowing_array(C, fade_size, device)
-
-    with torch.cuda.amp.autocast():
-        with torch.no_grad():
-            if config.training.target_instrument is not None:
-                req_shape = (1,) + tuple(mix.shape)
-            else:
-                req_shape = (len(config.training.instruments),) + tuple(mix.shape)
-
-            mix = mix.to(device)
-            result = torch.zeros(req_shape, dtype=torch.float32).to(device)
-            counter = torch.zeros(req_shape, dtype=torch.float32).to(device)
-
-            i = 0
-            total_length = mix.shape[1]
-            num_chunks = (total_length + step - 1) // step
-
-            if first_chunk_time is None:
-                start_time = time.time()
-                first_chunk = True
-            else:
-                start_time = None
-                first_chunk = False
-
-            while i < total_length:
-                part = mix[:, i:i + C]
-                length = part.shape[-1]
-                if length < C:
-                    if length > C // 2 + 1:
-                        part = nn.functional.pad(input=part, pad=(0, C - length), mode='reflect')
-                    else:
-                        part = nn.functional.pad(input=part, pad=(0, C - length, 0, 0), mode='constant', value=0)
-
-                if first_chunk and i == 0:
-                    chunk_start_time = time.time()
-
-                x = model(part.unsqueeze(0))[0]
-
-                window = windowing_array.clone()
-                if i == 0:
-                    window[:fade_size] = 1
-                elif i + C >= total_length:
-                    window[-fade_size:] = 1
-
-                result[..., i:i + length] += x[..., :length] * window[..., :length]
-                counter[..., i:i + length] += window[..., :length]
-                i += step
-
-                if first_chunk and i == step:
-                    chunk_time = time.time() - chunk_start_time
-                    first_chunk_time = chunk_time
-                    estimated_total_time = chunk_time * num_chunks
-                    print(f"Estimated total processing time for this track: {estimated_total_time:.2f} seconds")
-                    first_chunk = False
-
-                if first_chunk_time is not None and i > step:
-                    chunks_processed = i // step
-                    time_remaining = first_chunk_time * (num_chunks - chunks_processed)
-                    sys.stdout.write(f"\rEstimated time remaining: {time_remaining:.2f} seconds")
-                    sys.stdout.flush()
-
-            print()
-            estimated_sources = result / counter
-            estimated_sources = estimated_sources.cpu().numpy()
-            np.nan_to_num(estimated_sources, copy=False, nan=0.0)
-
-            if mix.shape[1] > 2 * border and border > 0:
-                estimated_sources = estimated_sources[..., border:-border]
-
-    if config.training.target_instrument is None:
-        return {k: v for k, v in zip(config.training.instruments, estimated_sources)}, first_chunk_time
-    else:
-        return {k: v for k, v in zip([config.training.target_instrument], estimated_sources)}, first_chunk_time
-
-
 # ---------------------------------------------------------------------------
 # Processor classes
 # ---------------------------------------------------------------------------
@@ -143,93 +56,167 @@ class VocalIsolationProcessor(PipelineStage["List[VadAudioSegment]", "List[VadAu
     def _pack(item, result): return {'audio_path': item['audio_path'], 'vad_segments': result}
 
     def process(self, input: List[VadAudioSegment], *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
-        """Run isolation then validate that segment durations are consistent."""
-        logger.info("Performing vocal isolation...")
-        result = self._isolate(input, progress_callback=progress_callback)
-        for seg in result:
-            expected = seg["end"] - seg["start"]
-            actual = len(seg["audio"]) / SAMPLE_RATE
-            if abs(actual - expected) > _DURATION_TOLERANCE_S:
-                logger.warning(
-                    "Segment duration mismatch after vocal isolation: "
-                    f"timestamps span {expected:.3f}s but audio is {actual:.3f}s "
-                    f"(start={seg['start']:.3f}, end={seg['end']:.3f})"
-                )
-        return result
+        # Vocal isolation batches chunks across files, so it overrides run() rather
+        # than processing one file at a time via the base run()/process() path.
+        raise NotImplementedError("VocalIsolationProcessor drives work through run(), not process()")
 
-    def _isolate(self, segments: List[VadAudioSegment], progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
-        """Replace each segment's audio with its vocals-only audio. Subclasses must override."""
-        ...
+
+def _validate_segment_duration(start: float, end: float, audio: np.ndarray) -> None:
+    expected = end - start
+    actual = len(audio) / SAMPLE_RATE
+    if abs(actual - expected) > _DURATION_TOLERANCE_S:
+        logger.warning(
+            "Segment duration mismatch after vocal isolation: "
+            f"timestamps span {expected:.3f}s but audio is {actual:.3f}s "
+            f"(start={start:.3f}, end={end:.3f})"
+        )
 
 
 class MbRoformerProcessor(VocalIsolationProcessor):
-    """Vocal isolation processor backed by the Mel-Band RoFormer model."""
+    """Vocal isolation processor backed by the Mel-Band RoFormer model.
+
+    The model runs on fixed-size chunks of ``config.inference.chunk_size`` samples, so
+    the batch unit is the chunk (identical size → no padding). Chunks from every
+    to-compute segment across every file are packed into batches (cross-file backfill);
+    each segment reconstructs via overlap-add into its own CPU buffer and is finalized
+    (and its buffers freed) as soon as its last chunk completes.
+    """
 
     def __init__(
         self,
         model: torch.nn.Module,
         config: DictConfig,
         device: torch.device,
-        demix_track_fn,
+        batch_size: Optional[int] = None,
     ):
         self.model = model
         self.config = config
         self.device = device
         self.model_sample_rate: int = config.model.sample_rate
-        self._demix_track = demix_track_fn
+        self._batch_size = batch_size
+        self._C = config.inference.chunk_size
+        self._step = self._C // config.inference.num_overlap
+        self._fade = self._C // 10
+        self._border = self._C - self._step
 
-    def _isolate(self, segments: List[VadAudioSegment], progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
-        try:
-            import librosa
-        except ImportError:
-            raise ImportError(
-                "librosa is required for vocal isolation: pip install librosa"
-            )
-
+    def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
+        logger.info("Performing vocal isolation...")
         self.model.eval()
-        result = []
-        n = len(segments)
 
-        for idx, seg in enumerate(segments):
-            # Suppress demix_track's per-chunk stdout prints
-            _old_stdout = sys.stdout
-            sys.stdout = io.StringIO()
-            try:
-                isolated = self._isolate_segment(seg["audio"], librosa)
-            finally:
-                sys.stdout = _old_stdout
+        cached, to_compute = partition_by_cache(items, self.read_debug, load_debug_dir)
 
-            result.append({"start": seg["start"], "end": seg["end"], "audio": isolated})
-            if progress_callback is not None:
-                progress_callback((idx + 1) / n)
+        C, step, fade, border = self._C, self._step, self._fade, self._border
+        base_window = _get_windowing_array(C, fade, torch.device("cpu")).numpy()
 
-        return result
+        # Per-segment overlap-add state keyed by (item_idx, seg_idx); jobs reference it.
+        seg_state: Dict[Tuple[int, int], dict] = {}
+        # Per-item finalized audio: idx -> {'n': int, 'segs': {seg_idx: np.ndarray}, 'audio_path': str}
+        item_out: Dict[int, dict] = {}
+        jobs: List[Tuple[Tuple[int, int], int]] = []
 
-    def _isolate_segment(self, audio: np.ndarray, librosa) -> np.ndarray:
-        # Resample from project rate (16 kHz) to model's expected rate (44.1 kHz)
+        for idx, item in to_compute:
+            segs = item['vad_segments']
+            item_out[idx] = {'n': len(segs), 'segs': {}, 'audio_path': item['audio_path']}
+            for sdx, seg in enumerate(segs):
+                mixture, total_length, padded = self._prepare_mixture(seg['audio'])
+                key = (idx, sdx)
+                offsets = list(range(0, total_length, step))
+                seg_state[key] = {
+                    'mixture': mixture,
+                    'total_length': total_length,
+                    'padded': padded,
+                    'result': np.zeros((2, total_length), dtype=np.float32),
+                    'counter': np.zeros((2, total_length), dtype=np.float32),
+                    'remaining': len(offsets),
+                    'start': seg['start'],
+                    'end': seg['end'],
+                }
+                jobs.extend((key, off) for off in offsets)
+
+        if progress_callback is not None:
+            progress_callback.set_total(len(jobs), unit="chunk")
+
+        def infer_fn(batch):
+            parts = []
+            for key, off in batch:
+                part = seg_state[key]['mixture'][:, off:off + C]
+                plen = part.shape[-1]
+                if plen < C:
+                    if plen > C // 2 + 1:
+                        part = nn.functional.pad(part, (0, C - plen), mode='reflect')
+                    else:
+                        part = nn.functional.pad(part, (0, C - plen), mode='constant', value=0)
+                parts.append(part)
+            batch_t = torch.stack(parts, dim=0).to(self.device)
+            with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
+                with torch.no_grad():
+                    out = self.model(batch_t)  # (B, 2, C) for the single-stem vocals model
+            out = out.float().cpu().numpy()
+            for bi, (key, off) in enumerate(batch):
+                st = seg_state[key]
+                total_length = st['total_length']
+                length = min(C, total_length - off)
+                window = base_window.copy()
+                if off == 0:
+                    window[:fade] = 1.0
+                elif off + C >= total_length:
+                    window[-fade:] = 1.0
+                st['result'][:, off:off + length] += out[bi][:, :length] * window[:length]
+                st['counter'][:, off:off + length] += window[:length]
+                st['remaining'] -= 1
+                if st['remaining'] == 0:
+                    self._finalize_segment(key, st, item_out)
+                    del seg_state[key]
+
+        run_adaptive_batches(jobs, self._batch_size, infer_fn, reporter=progress_callback)
+
+        # Assemble per-item results and write debug for freshly computed items.
+        computed: Dict[int, List[VadAudioSegment]] = {}
+        for idx, meta in item_out.items():
+            ordered = [meta['segs'][s] for s in range(meta['n'])]
+            computed[idx] = ordered
+            if debug_dir is not None:
+                self.write_debug(meta['audio_path'], ordered, debug_dir)
+
+        result_items = []
+        for idx, item in enumerate(items):
+            segs_out = cached[idx] if idx in cached else computed[idx]
+            result_items.append(self._pack(item, segs_out))
+        return result_items
+
+    def _prepare_mixture(self, audio: np.ndarray):
+        """Resample a 16 kHz mono segment to the model rate, build the stereo mixture,
+        and apply the reflect border pad. Returns (mixture[2,L], total_length, padded).
+
+        Uses torchaudio (not librosa's default soxr_hq) to resample: soxr_hq pays a
+        ~3.7s one-time cold-start cost on its first call and is ~5x slower per call
+        thereafter than torchaudio.functional.resample.
+        """
+        audio_t = torch.from_numpy(audio)
         if SAMPLE_RATE != self.model_sample_rate:
-            audio_at_model_sr = librosa.resample(
-                audio, orig_sr=SAMPLE_RATE, target_sr=self.model_sample_rate
-            )
-        else:
-            audio_at_model_sr = audio
+            audio_t = torchaudio.functional.resample(audio_t, SAMPLE_RATE, self.model_sample_rate)
+        mixture = torch.stack([audio_t, audio_t], dim=0).float()
+        padded = False
+        if mixture.shape[1] > 2 * self._border and self._border > 0:
+            mixture = nn.functional.pad(mixture, (self._border, self._border), mode='reflect')
+            padded = True
+        return mixture, mixture.shape[1], padded
 
-        # Build stereo tensor (channels, samples) as expected by the model
-        stereo = np.stack([audio_at_model_sr, audio_at_model_sr], axis=0)
-        mixture = torch.tensor(stereo, dtype=torch.float32)
-
-        res, _ = self._demix_track(self.config, self.model, mixture, self.device, None)
-
-        vocals = res[self.config.training.target_instrument]  # shape: (2, samples)
-
-        # Average stereo channels to mono, then resample back to project rate
-        vocals_mono = vocals.mean(axis=0).astype(np.float32)
+    def _finalize_segment(self, key, st, item_out) -> None:
+        idx, sdx = key
+        estimated = st['result'] / st['counter']
+        np.nan_to_num(estimated, copy=False, nan=0.0)
+        if st['padded']:
+            estimated = estimated[:, self._border:-self._border]
+        vocals_mono = estimated.mean(axis=0).astype(np.float32)
         if SAMPLE_RATE != self.model_sample_rate:
-            vocals_mono = librosa.resample(
-                vocals_mono, orig_sr=self.model_sample_rate, target_sr=SAMPLE_RATE
-            )
-
-        return vocals_mono
+            vocals_mono = torchaudio.functional.resample(
+                torch.from_numpy(vocals_mono), self.model_sample_rate, SAMPLE_RATE
+            ).numpy()
+        _validate_segment_duration(st['start'], st['end'], vocals_mono)
+        item_out[idx]['segs'][sdx] = {'start': st['start'], 'end': st['end'], 'audio': vocals_mono}
+        # Free the heavy buffers now that this segment is done.
+        st['mixture'] = st['result'] = st['counter'] = None
 
 
 # ---------------------------------------------------------------------------
@@ -241,11 +228,13 @@ def load_vocal_isolation(
     device: str,
     device_index: int = 0,
     model_dir: Optional[str] = None,
+    batch_size: Optional[int] = None,
 ) -> VocalIsolationProcessor:
     """Load a vocal isolation model and return a processor.
 
     The checkpoint is downloaded from HuggingFace on first use and cached.
     model_dir, if given, overrides the default HuggingFace cache directory.
+    batch_size controls how many fixed-size chunks are run through the model at once.
     """
     if model_name != "mbroformer":
         raise ValueError(
@@ -285,5 +274,5 @@ def load_vocal_isolation(
         model=torch_model,
         config=config,
         device=torch_device,
-        demix_track_fn=_demix_track,
+        batch_size=batch_size,
     )

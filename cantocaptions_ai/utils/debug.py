@@ -15,7 +15,7 @@ logger = get_logger(__name__)
 
 
 def _stage_dir(audio_path: str, stage: str, debug_dir: str) -> str:
-    stem = Path(audio_path).stem
+    stem = Path(audio_path).stem.strip()
     path = os.path.join(debug_dir, stem, stage)
     os.makedirs(path, exist_ok=True)
     return path
@@ -91,7 +91,7 @@ def write_transcription_debug(audio_path: str, result: TranscriptionResult, debu
 
 def _debug_stage_exists(audio_path: str, stage: str, debug_dir: str) -> bool:
     """Return True if the expected marker file for a stage exists in the debug directory."""
-    stem = Path(audio_path).stem
+    stem = Path(audio_path).stem.strip()
     stage_dir = os.path.join(debug_dir, stem, stage)
     marker = {
         "transcription": "result.json",

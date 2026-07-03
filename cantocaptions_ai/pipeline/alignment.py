@@ -659,7 +659,6 @@ def align(
 
     # --- Preprocess transcript ---
     transcript = list(transcript)
-    total_segments = len(transcript)
     segment_data = _preprocess_transcript(transcript, model_lang, model_dictionary, print_progress)
 
     # --- Align each segment ---
@@ -698,7 +697,7 @@ def align(
         aligned_segments += subsegments
 
         if progress_callback is not None:
-            progress_callback((sdx + 1) / total_segments)
+            progress_callback.advance(1)
 
     # --- Collect word segments ---
     word_segments: List[SingleWordSegment] = [w for seg in aligned_segments for w in seg["words"]]

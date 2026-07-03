@@ -230,6 +230,7 @@ def load_model(
             device=device,
             device_index=device_index,
             compute_type=compute_type,
+            attn_implementation=attn_implementation,
             language=language,
             download_root=download_root,
             local_files_only=local_files_only,

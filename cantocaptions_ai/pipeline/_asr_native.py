@@ -16,6 +16,7 @@ from cantocaptions_ai.pipeline.asr import (
 )
 from cantocaptions_ai.utils.audio import resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
+from cantocaptions_ai.utils.model_utils import partition_by_cache, run_adaptive_batches
 from cantocaptions_ai.cantonese.text import normalize_segment_text
 from cantocaptions_ai.utils.log_utils import get_logger
 
@@ -113,97 +114,115 @@ class QwenPipelineNative(QwenPipeline):
         self.print_progress = print_progress
         self.verbose = verbose
 
+    def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
+        """Transcribe all files, batching VAD segments across file boundaries.
+
+        Segments from every to-compute file are flattened into one job stream, so
+        batches pack work from different files (no half-empty tail batch per file).
+        """
+        logger.info("Performing transcription (HF-native backend)...")
+        language = _normalize_language(self.preset_language or "yue")
+        cached, to_compute = partition_by_cache(items, self.read_debug, load_debug_dir)
+
+        # jobs are (item_idx, seg_idx); texts scattered back into per-item buffers.
+        jobs: List = []
+        buffers = {}  # idx -> {'segs': List[VadAudioSegment], 'texts': List[Optional[str]], 'audio_path': str}
+        for idx, item in to_compute:
+            segs = item['vad_segments']
+            buffers[idx] = {'segs': segs, 'texts': [None] * len(segs), 'audio_path': item['audio_path']}
+            jobs.extend((idx, sdx) for sdx in range(len(segs)))
+
+        if progress_callback is not None:
+            progress_callback.set_total(len(jobs), unit="seg")
+
+        def infer_fn(batch):
+            wavs = [buffers[idx]['segs'][sdx]['audio'] for idx, sdx in batch]
+            texts = self._infer_batch(wavs, language)
+            for (idx, sdx), text in zip(batch, texts):
+                buffers[idx]['texts'][sdx] = text
+
+        run_adaptive_batches(jobs, self._batch_size, infer_fn, reporter=progress_callback)
+
+        computed = {}
+        for idx, buf in buffers.items():
+            segments: List[SingleSegment] = [
+                normalize_segment_text({'text': text or '', 'start': seg['start'], 'end': seg['end']})
+                for seg, text in zip(buf['segs'], buf['texts'])
+            ]
+            result: TranscriptionResult = {"segments": segments, "language": language}
+            computed[idx] = result
+            if debug_dir is not None:
+                self.write_debug(buf['audio_path'], result, debug_dir)
+
+        result_items = []
+        for idx, item in enumerate(items):
+            result = cached[idx] if idx in cached else computed[idx]
+            result_items.append(self._pack(item, result))
+        return result_items
+
     def process(
         self,
         input: List[VadAudioSegment],
         *,
         progress_callback: ProgressCallback = None,
     ) -> TranscriptionResult:
-        logger.info("Performing transcription (HF-native backend)...")
-        result = self._transcribe(input, progress_callback=progress_callback)
-        return {**result, 'segments': [normalize_segment_text(seg) for seg in result['segments']]}
+        """Transcribe a single file's segments (library/single-file entry point)."""
+        language = _normalize_language(self.preset_language or "yue")
+        texts: List[Optional[str]] = [None] * len(input)
+        jobs = list(range(len(input)))
 
-    def _transcribe(
-        self,
-        vad_segments: List[VadAudioSegment],
-        language: Optional[str] = None,
-        progress_callback: ProgressCallback = None,
-    ) -> TranscriptionResult:
-        language = _normalize_language(language or self.preset_language or "yue")
+        if progress_callback is not None:
+            progress_callback.set_total(len(jobs), unit="seg")
 
-        effective_batch = self._batch_size
-        if not effective_batch or effective_batch < 1:
-            effective_batch = len(vad_segments)
+        def infer_fn(batch):
+            wavs = [input[i]['audio'] for i in batch]
+            for i, text in zip(batch, self._infer_batch(wavs, language)):
+                texts[i] = text
 
-        segments: List[SingleSegment] = []
-        total = len(vad_segments)
-        current_batch = effective_batch
-        oom_warned = False
-        i = 0
+        run_adaptive_batches(jobs, self._batch_size, infer_fn, reporter=progress_callback)
 
-        while i < total:
-            batch = vad_segments[i:i + current_batch]
-            wavs = [seg['audio'] for seg in batch]
-            prompts = [_build_text_prompt(self.processor, language) for _ in batch]
-
-            try:
-                inputs = self.processor(text=prompts, audio=wavs, return_tensors="pt", padding=True)
-                inputs = inputs.to(self.model.device).to(self.model.dtype)
-
-                if self.device.type == "cuda":
-                    _warn_vram(inputs, len(batch), self.model, self.max_new_tokens, self.device)
-
-                with torch.inference_mode():
-                    generated = self.model.generate(
-                        **inputs, max_new_tokens=self.max_new_tokens, do_sample=False
-                    )
-
-                # generate() returns a plain tensor by default; handle both for safety
-                sequences = generated if isinstance(generated, torch.Tensor) else generated.sequences
-                n_input = inputs["input_ids"].shape[1]
-                actual_new = sequences.shape[1] - n_input
-                logger.debug("[TOKENS] batch=%d, new_tokens=%d, max=%d", len(wavs), actual_new, self.max_new_tokens)
-
-                decoded = self.processor.batch_decode(
-                    sequences[:, n_input:],
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                )
-
-                del inputs, generated, wavs
-
-                for vad_seg, raw in zip(batch, decoded):
-                    logger.debug("[RAW] %s", raw)
-                    _, text = _parse_asr_output(raw, user_language=language)
-                    segments.append({
-                        'text': text,
-                        'start': vad_seg['start'],
-                        'end': vad_seg['end'],
-                    })
-
-                i += len(batch)
-                if progress_callback is not None:
-                    progress_callback(i / total)
-
-            except RuntimeError as e:
-                if "out of memory" not in str(e).lower():
-                    raise
-                torch.cuda.empty_cache()
-                if current_batch <= 1:
-                    raise RuntimeError(
-                        "CUDA out of memory even at batch_size=1. "
-                        "Try freeing VRAM or reducing --chunk_size."
-                    ) from e
-                current_batch = max(1, current_batch // 2)
-                if not oom_warned:
-                    logger.warning(
-                        "CUDA out of memory — retrying with batch_size=%d. "
-                        "Pass --batch_size %d to avoid this next time.",
-                        current_batch, current_batch,
-                    )
-                    oom_warned = True
-
+        segments: List[SingleSegment] = [
+            normalize_segment_text({'text': texts[i] or '', 'start': input[i]['start'], 'end': input[i]['end']})
+            for i in range(len(input))
+        ]
         return {"segments": segments, "language": language}
+
+    def _infer_batch(self, wavs: List, language: str) -> List[str]:
+        """Run one batch of audio arrays through the model, returning parsed texts.
+
+        Raises RuntimeError on CUDA OOM (caught and retried at a smaller batch size by
+        run_adaptive_batches); no shared state is mutated before the model call.
+        """
+        prompts = [_build_text_prompt(self.processor, language) for _ in wavs]
+        inputs = self.processor(text=prompts, audio=wavs, return_tensors="pt", padding=True)
+        inputs = inputs.to(self.model.device).to(self.model.dtype)
+
+        if self.device.type == "cuda":
+            _warn_vram(inputs, len(wavs), self.model, self.max_new_tokens, self.device)
+
+        with torch.inference_mode():
+            generated = self.model.generate(
+                **inputs, max_new_tokens=self.max_new_tokens, do_sample=False
+            )
+
+        # generate() returns a plain tensor by default; handle both for safety
+        sequences = generated if isinstance(generated, torch.Tensor) else generated.sequences
+        n_input = inputs["input_ids"].shape[1]
+        logger.debug("[TOKENS] batch=%d, new_tokens=%d, max=%d", len(wavs), sequences.shape[1] - n_input, self.max_new_tokens)
+
+        decoded = self.processor.batch_decode(
+            sequences[:, n_input:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        del inputs, generated
+
+        texts: List[str] = []
+        for raw in decoded:
+            logger.debug("[RAW] %s", raw)
+            _, text = _parse_asr_output(raw, user_language=language)
+            texts.append(text)
+        return texts
 
 
 def load_model_native(

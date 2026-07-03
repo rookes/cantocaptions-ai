@@ -133,6 +133,25 @@ class TranscriptionSummary:
         print(f"{eq}\n", file=sys.__stdout__)
 
 
+class ProgressReporter:
+    """Lightweight facade handed to pipeline stages so they can drive a stage's
+    progress bar without touching StageTimer internals.
+
+    A stage calls ``set_total(n, unit)`` once it knows how many work units it will
+    process (segments, chunks, files, …), then ``advance(k)`` as it completes them.
+    tqdm then renders accurate throughput (unit/s) and an ETA.
+    """
+
+    def __init__(self, timer: "StageTimer") -> None:
+        self._timer = timer
+
+    def set_total(self, total: int, unit: str = "it") -> None:
+        self._timer._start_determinate(total, unit)
+
+    def advance(self, n: int = 1) -> None:
+        self._timer._advance(n)
+
+
 class StageTimer:
     """Context manager that times a pipeline stage and drives a tqdm progress bar."""
 
@@ -143,6 +162,8 @@ class StageTimer:
         self._load_end: Optional[float] = None
         self._bar: "Optional[_TqdmBar]" = None
         self._determinate: bool = False
+        self._total: Optional[int] = None
+        self._reporter: "ProgressReporter" = ProgressReporter(self)
         self._spinner_stop: threading.Event = threading.Event()
         self._spinner_thread: Optional[threading.Thread] = None
 
@@ -183,8 +204,8 @@ class StageTimer:
             self._spinner_thread.join(timeout=0.5)
         if self._bar is not None:
             if self._determinate:
-                self._bar.n = 100
-                self._bar.last_print_n = 100
+                if self._total is not None and self._bar.n < self._total:
+                    self._bar.update(self._total - self._bar.n)
             else:
                 self._bar.set_description_str(f"{self._label}: Complete")
             self._bar.close()
@@ -201,30 +222,46 @@ class StageTimer:
         self._load_end = time.perf_counter()
 
     @property
-    def callback(self):
-        """A ProgressCallback (Callable[[float], None]) suitable for pipeline functions."""
-        return self._update
+    def reporter(self) -> "ProgressReporter":
+        """A ProgressReporter suitable for pipeline stages (set_total / advance)."""
+        return self._reporter
 
-    def _update(self, pct: float) -> None:
+    def _start_determinate(self, total: int, unit: str = "it") -> None:
+        """Swap the indeterminate spinner for a determinate bar of *total* units.
+
+        tqdm owns rate (unit/s) and ETA; we only feed it monotonic update() deltas.
+        """
+        if not self._summary.enabled:
+            return
+        self._spinner_stop.set()
+        if self._spinner_thread is not None:
+            self._spinner_thread.join(timeout=0.5)
+        # Close the previous bar with leave=False (never disable=True — see CLAUDE.md:
+        # disable=True skips _decr_instances() and leaks tqdm._instances).
+        if self._bar is not None:
+            self._bar.leave = False
+            self._bar.close()
+        from tqdm import tqdm
+        self._total = total if total and total > 0 else None
+        self._bar = tqdm(
+            total=self._total,
+            desc=self._label,
+            unit=unit,
+            leave=True,
+            file=sys.__stdout__,
+            dynamic_ncols=True,
+        )
+        self._determinate = True
+
+    def _advance(self, n: int = 1) -> None:
         if not self._summary.enabled:
             return
         if not self._determinate:
-            self._spinner_stop.set()
-            if self._spinner_thread is not None:
-                self._spinner_thread.join(timeout=0.5)
-            if self._bar is not None:
-                self._bar.leave = False
-                self._bar.close()
-            from tqdm import tqdm
-            self._bar = tqdm(
-                total=100,
-                desc=self._label,
-                unit="%",
-                leave=True,
-                file=sys.__stdout__,
-                dynamic_ncols=True,
-            )
-            self._determinate = True
+            # advance() before set_total() → fall back to an unbounded bar
+            self._start_determinate(0)
         if self._bar is not None:
-            self._bar.n = round(pct * 100, 2)
-            self._bar.refresh()
+            if self._total is not None:
+                n = min(n, self._total - self._bar.n)
+                if n <= 0:
+                    return
+            self._bar.update(n)

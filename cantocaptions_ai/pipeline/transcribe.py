@@ -56,6 +56,8 @@ def _run_alignment(
     progress_callback: ProgressCallback = None,
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.alignment import align
+    if progress_callback is not None:
+        progress_callback.set_total(sum(len(it['result']['segments']) for it in items), unit="seg")
     aligned_items = []
     for item in items:
         result = item['result']
@@ -116,6 +118,8 @@ def _run_diarization(
     if load_complete_callback:
         load_complete_callback()
 
+    if progress_callback is not None:
+        progress_callback.set_total(len(items), unit="file")
     diarized_items = []
     for item in items:
         diarize_result = diarize_model(
@@ -123,7 +127,6 @@ def _run_diarization(
             min_speakers=min_speakers,
             max_speakers=max_speakers,
             return_embeddings=return_speaker_embeddings,
-            progress_callback=progress_callback,
         )
         if return_speaker_embeddings:
             diarize_segments, speaker_embeddings = diarize_result
@@ -131,6 +134,8 @@ def _run_diarization(
             diarize_segments, speaker_embeddings = diarize_result, None
         result = assign_word_speakers(diarize_segments, item['result'], speaker_embeddings)
         diarized_items.append({'audio_path': item['audio_path'], 'result': result})
+        if progress_callback is not None:
+            progress_callback.advance(1)
     return diarized_items
 
 
@@ -147,6 +152,8 @@ def _run_speaker_verification(
     if load_complete_callback:
         load_complete_callback()
 
+    if progress_callback is not None:
+        progress_callback.set_total(len(items), unit="file")
     verified_items = []
     for item in items:
         audio = load_audio(item['audio_path'], audio_track=item.get('audio_track', 0))
@@ -154,8 +161,10 @@ def _run_speaker_verification(
             audio[int(seg["start"] * SAMPLE_RATE):int(seg["end"] * SAMPLE_RATE)]
             for seg in item['result']["segments"]
         ]
-        speaker_verification_model(transcript=item['result']["segments"], audio=audio_segments, progress_callback=progress_callback)
+        speaker_verification_model(transcript=item['result']["segments"], audio=audio_segments)
         verified_items.append(item)
+        if progress_callback is not None:
+            progress_callback.advance(1)
     return verified_items
 
 
@@ -338,10 +347,19 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
 
     if cfg.load_debug_dir:
         from pathlib import Path as _Path
-        for ap in audio_paths:
-            stem_dir = os.path.join(cfg.load_debug_dir, _Path(ap).stem)
-            if not os.path.isdir(stem_dir):
-                parser.error(f"No debug data found for '{ap}': directory '{stem_dir}' does not exist")
+        missing = [
+            ap for ap in audio_paths
+            if not os.path.isdir(os.path.join(cfg.load_debug_dir, _Path(ap).stem.strip()))
+        ]
+        if missing:
+            # Not fatal: files without cached data are simply (re)computed from scratch,
+            # which matters for --input_dir runs where only some files were cached before.
+            logger.warning(
+                "No debug data under '%s' for %d of %d file(s); they will be computed from "
+                "scratch: %s",
+                cfg.load_debug_dir, len(missing), len(audio_paths),
+                ", ".join(_Path(ap).name for ap in missing),
+            )
 
     need_asr = not cfg.retime and (
         not cfg.load_debug_dir or any(
@@ -388,13 +406,16 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 use_auth_token=cfg.hf_token,
             )
             stage.mark_inference_start()
-            items = vad_processor.run(stub_items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir)
+            items = vad_processor.run(stub_items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
             del vad_processor
         else:
             from cantocaptions_ai.pipeline.vad import VadProcessor
             items = VadProcessor.load_cache(stub_items, cfg.load_debug_dir)
 
     # Stage 2: Vocal Isolation (conditional)
+    vocal_isolation_active = (
+        bool(cfg.vocal_isolation_method) and cfg.vocal_isolation_method.lower() != "none"
+    )
     if need_vocal_isolation:
         with StageTimer("Vocal isolation", summary) as stage:
             from cantocaptions_ai.pipeline.vocal_isolation import load_vocal_isolation
@@ -402,10 +423,16 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 model_name=cfg.vocal_isolation_method,
                 device=cfg.device,
                 device_index=cfg.device_index,
+                batch_size=cfg.vocal_isolation_batch_size,
             )
             stage.mark_inference_start()
-            items = vocal_isolation_processor.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+            items = vocal_isolation_processor.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
             del vocal_isolation_processor
+    elif vocal_isolation_active and cfg.load_debug_dir:
+        # All files' isolated audio is cached: load it so downstream ASR sees the
+        # isolated (not raw) audio even if ASR itself is being recomputed.
+        from cantocaptions_ai.pipeline.vocal_isolation import MbRoformerProcessor
+        items = MbRoformerProcessor.load_cache(items, cfg.load_debug_dir)
 
     flush_vram()
 
@@ -426,7 +453,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     items, align_model, align_metadata, bert_processor, cfg.device,
                     cfg.align_padding, cfg.align_release, cfg.interpolate_method,
                     cfg.return_char_alignments, cfg.print_progress, cfg.batch_size,
-                    progress_callback=stage.callback,
+                    progress_callback=stage.reporter,
                 )
             else:
                 items = _extract_timestamps(items)
@@ -457,7 +484,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     verbose=cfg.verbose,
                 ) as model:
                     stage.mark_inference_start()
-                    items = model.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+                    items = model.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
         else:
             from cantocaptions_ai.pipeline.asr import QwenPipeline
             items = QwenPipeline.load_cache(items, cfg.load_debug_dir)
@@ -475,7 +502,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                         local_files_only=cfg.model_cache_only,
                     ) as ensemble:
                         stage.mark_inference_start()
-                        items = ensemble.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+                        items = ensemble.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
             else:
                 from cantocaptions_ai.pipeline.ensemble import FasterWhisperEnsemble
                 items = FasterWhisperEnsemble.load_cache(items, cfg.load_debug_dir)
@@ -514,7 +541,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                         attn_implementation=cfg.attn_implementation,
                     ) as corrector:
                         stage.mark_inference_start()
-                        items = corrector.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.callback)
+                        items = corrector.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
             else:
                 from cantocaptions_ai.pipeline.llm_correction import LLMCorrector
                 items = LLMCorrector.load_cache(items, cfg.load_debug_dir)
@@ -534,7 +561,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     items, align_model, align_metadata, bert_processor, cfg.device,
                     cfg.align_padding, cfg.align_release, cfg.interpolate_method,
                     cfg.return_char_alignments, cfg.print_progress, cfg.batch_size,
-                    progress_callback=stage.callback,
+                    progress_callback=stage.reporter,
                 )
             del align_model, bert_processor
             flush_vram()
@@ -551,7 +578,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             items = _run_diarization(
                 items, cfg.diarize_model, cfg.hf_token, cfg.device, cfg.model_dir,
                 cfg.min_speakers, cfg.max_speakers, cfg.speaker_embeddings,
-                progress_callback=stage.callback,
+                progress_callback=stage.reporter,
                 load_complete_callback=stage.mark_inference_start,
             )
 
@@ -560,7 +587,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         with StageTimer("Speaker verification", summary) as stage:
             items = _run_speaker_verification(
                 items, cfg.device, cfg.model_dir,
-                progress_callback=stage.callback,
+                progress_callback=stage.reporter,
                 load_complete_callback=stage.mark_inference_start,
             )
 

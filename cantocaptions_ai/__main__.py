@@ -75,10 +75,11 @@ def cli():
     vad_grp.add_argument("--vad_method", type=str, default="pyannote", choices=["pyannote"], help="VAD method to be used")
     vad_grp.add_argument("--vad_onset", type=float, default=0.500, help="Onset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected")
     vad_grp.add_argument("--vad_offset", type=float, default=0.363, help="Offset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected.")
-    vad_grp.add_argument("--chunk_size", type=int, default=25, help="Chunk size for merging VAD segments. Default is 30, reduce this if the chunk is too long.")
+    vad_grp.add_argument("--chunk_size", type=int, default=30, help="Chunk size for merging VAD segments. Default is 30, reduce this if the chunk is too long.")
 
     isol_grp = parser.add_argument_group("vocal isolation")
     isol_grp.add_argument("--vocal_isolation_method", type=str, default="mbroformer", choices=["none", "mbroformer"], help="vocal isolation method to be used")
+    isol_grp.add_argument("--vocal_isolation_batch_size", default=4, type=int, help="number of fixed-size audio chunks the vocal isolation model processes per batch; larger values give little/no speedup on this model and can regress sharply (benchmark before increasing)")
 
     asr_grp = parser.add_argument_group("asr options")
     asr_grp.add_argument("--suppress_tokens", type=str, default="-1", help="comma-separated list of token ids to suppress during sampling; '-1' will suppress most special characters except common punctuations")
@@ -102,8 +103,8 @@ def cli():
     align_grp.add_argument("--no_align", action='store_true', help="Do not perform phoneme alignment")
     align_grp.add_argument("--return_char_alignments", action='store_true', help="Return character-level alignments in the output json file")
     align_grp.add_argument("--align_padding", type=float, default=0.04, help="The minimum allowed timebetween subttitles.")
-    align_grp.add_argument("--align_release", type=float, default=0.45, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
-    align_grp.add_argument("--align_merge_distance", type=float, default=0.12, help="The maximum distance between utterances that allows them to be merged.")
+    align_grp.add_argument("--align_release", type=float, default=0.65, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
+    align_grp.add_argument("--align_merge_distance", type=float, default=0.08, help="The maximum distance between utterances that allows them to be merged.")
 
     subtitle_grp = parser.add_argument_group("subtitle formatting")
     subtitle_grp.add_argument("--max_line_width", type=optional_int, default=18, help="(not possible with --no_align) the maximum number of characters in a line before text cleaning breaks the line")

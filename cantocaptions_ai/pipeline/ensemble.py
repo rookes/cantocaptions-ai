@@ -39,8 +39,8 @@ class FasterWhisperEnsemble(PipelineStage["List[VadAudioSegment]", "List[str]"])
         if not input:
             return []
 
+        # Progress is reported per file by the base PipelineStage.run().
         texts = []
-        n = len(input)
         for i, seg in enumerate(input):
             try:
                 segments_iter, _ = self._model.transcribe(
@@ -54,8 +54,6 @@ class FasterWhisperEnsemble(PipelineStage["List[VadAudioSegment]", "List[str]"])
                 logger.warning(f"faster-whisper transcription failed on segment {i}: {e}")
                 text = ""
             texts.append(text)
-            if progress_callback is not None:
-                progress_callback((i + 1) / n)
 
         return texts
 
