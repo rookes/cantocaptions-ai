@@ -7,6 +7,7 @@ import math
 from typing import Iterable, Optional, Union, List, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 
 from cantocaptions_ai.utils.audio import SAMPLE_RATE, load_audio, log_mel_spectrogram, resolve_device
@@ -413,8 +414,6 @@ def _align_segment(
     spacing_char_id: int,
     t1: float,
     t2: float,
-    align_padding: float,
-    align_release: float,
     interpolate_method: str,
     return_char_alignments: bool,
 ) -> List[dict]:
@@ -500,7 +499,6 @@ def _align_segment(
         elif cdx == len(text) - 1 or text[cdx + 1] == " ":
             word_idx += 1
 
-    import pandas as pd
     char_segments_arr = pd.DataFrame(char_segments_arr)
     char_segments_arr["sentence-idx"] = None
     aligned_subsegments = []
@@ -517,11 +515,11 @@ def _align_segment(
         sentence_text = text[sstart:send + 1]
         sentence_start = curr_chars["start"].min()
         last_char = end_chars.iloc[-1]
-        sentence_end = (
-            round(last_char["start"] + align_release, 3)
-            if last_char["char"] in SPLIT_CHARS
-            else end_chars["end"].max()
-        )
+        sentence_end = end_chars["end"].max()
+        # Sentences ending on punctuation get their end time released (extended) later,
+        # in align(), once the position relative to *all* subsegments in the file
+        # (not just this transcript segment) is known — see release_from below.
+        release_from = last_char["start"] if last_char["char"] in SPLIT_CHARS else None
 
         sentence_words = []
         for word_idx in curr_chars["word-idx"].unique():
@@ -542,7 +540,13 @@ def _align_segment(
                 word_segment["score"] = word_score
             sentence_words.append(word_segment)
 
-        subsegment = {"text": sentence_text, "start": sentence_start, "end": sentence_end, "words": sentence_words}
+        subsegment = {
+            "text": sentence_text,
+            "start": sentence_start,
+            "end": sentence_end,
+            "words": sentence_words,
+            "release_from": release_from,
+        }
         if avg_logprob is not None:
             subsegment["avg_logprob"] = avg_logprob
         aligned_subsegments.append(subsegment)
@@ -559,12 +563,8 @@ def _align_segment(
     aligned_subsegments["start"] = interpolate_nans(aligned_subsegments["start"], method=interpolate_method)
     aligned_subsegments["end"] = interpolate_nans(aligned_subsegments["end"], method=interpolate_method)
 
-    # Pad segments and ensure non-overlapping timings
-    condition = aligned_subsegments["end"] > aligned_subsegments["start"].shift(-1) - align_padding
-    aligned_subsegments.loc[condition, "end"] = round(aligned_subsegments["start"].shift(-1) - align_padding, 3)
-
     # Concatenate sentences with same timestamps
-    agg_dict = {"text": " ".join, "words": "sum"}
+    agg_dict = {"text": " ".join, "words": "sum", "release_from": "first"}
     if model_lang in LANGUAGES_WITHOUT_SPACES:
         agg_dict["text"] = "".join
     if return_char_alignments:
@@ -729,13 +729,34 @@ def align(
         subsegments = _align_segment(
             segment, segment_data[sdx], emission,
             model_dictionary, model_lang, blank_id, spacing_char_id,
-            t1, t2, align_padding, align_release, interpolate_method, return_char_alignments,
+            t1, t2, interpolate_method, return_char_alignments,
         )
         aligned_segments += subsegments
 
         if progress_callback is not None:
             progress_callback.advance(1)
-    
+
+    # --- Release punctuation-terminated ends, then trim overlaps against the next
+    # subsegment's start. Done once over the whole file (not per transcript segment)
+    # so that a released end can't collide with the first subsegment of the next
+    # VAD segment, which _align_segment has no visibility into.
+    if aligned_segments:
+        starts = pd.Series([seg["start"] for seg in aligned_segments], dtype="float64")
+        ends = pd.Series([seg["end"] for seg in aligned_segments], dtype="float64")
+        release_froms = pd.Series(
+            [seg.pop("release_from", None) for seg in aligned_segments], dtype="float64"
+        )
+
+        release_mask = release_froms.notna()
+        ends[release_mask] = (release_froms[release_mask] + align_release).round(3)
+
+        next_starts = starts.shift(-1)
+        overlap = ends > next_starts - align_padding
+        ends[overlap] = (next_starts[overlap] - align_padding).round(3)
+
+        for seg, new_end in zip(aligned_segments, ends):
+            seg["end"] = float(new_end)
+
     # --- Collect word segments ---
     word_segments: List[SingleWordSegment] = [w for seg in aligned_segments for w in seg["words"]]
     return {"segments": aligned_segments, "word_segments": word_segments}
