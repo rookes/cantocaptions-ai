@@ -143,6 +143,10 @@ pattern = '不如([^，…？]*?)啊'
 replace = '不如\1吖'
 
 [[rules]]
+pattern = '呢個([\u4e00-\u9fff]{1,3})啊'
+replace = '呢個\1吖'
+
+[[rules]]
 pattern = '幫我([^，…？]*?)啊'
 replace = '幫我\1吖'
 
@@ -191,12 +195,12 @@ pattern = '㗎囖'
 replace = '㗎啦'
 
 [[rules]]
-pattern = '[喇啦]嗎'
-replace = '啦嘛'
+pattern = '冇事啦'
+replace = '冇事喇'
 
 [[rules]]
-pattern = '(?<![太備])好喇'
-replace = '好啦'
+pattern = '[喇啦]嗎'
+replace = '啦嘛'
 
 [[rules]]
 pattern = '你放心喇'
@@ -219,8 +223,8 @@ pattern = '(?<=[，！？])嚟喇'
 replace = '嚟啦'
 
 [[rules]]
-pattern = '算數[喇囖]'
-replace = '算數啦'
+pattern = '算([數係])[喇囖呢]'
+replace = '算\1啦'
 
 [[rules]]
 pattern = '梗係([^，？]*?)喇'
@@ -325,6 +329,10 @@ replace = '冇辦法啦'
 [[rules]]
 pattern = '等陣先喇'
 replace = '等陣先啊'
+
+[[rules]]
+pattern = '等陣喇'
+replace = '等陣啊'
 
 [[rules]]
 pattern = '住囖'

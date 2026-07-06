@@ -10,7 +10,7 @@ license = "GPL-3.0-only"
 
 dependencies = [
     "transformers>=4.57.6",
-    "qwen-asr>=0.0.6",
+    "accelerate>=1.0.0",
     "numpy>=2.1.0",
     "pandas>=2.2.3",
     "pyannote-audio>=4.0.0",
@@ -33,19 +33,30 @@ dependencies = [
 ensemble = ["faster-whisper>=1.0.0"]
 llm = ["bitsandbytes>=0.43.0"]
 diarize = ["nemo_toolkit[asr]; sys_platform == 'linux'", "matplotlib"]
-compile = [
+# Recommended ASR backend: native Qwen3-ASR support (AutoModelForMultimodalLM),
+# officially shipped in transformers>=5.13.0. Triton backs the (now-working)
+# torch.compile speedup on CUDA. Mutually exclusive with the `legacy` extra —
+# qwen-asr 0.0.6 hard-pins transformers==4.57.6, which conflicts with this pin.
+transformers_qwen = [
+    "transformers>=5.13.0",
     "triton; sys_platform == 'linux'",
     "triton-windows<3.7; sys_platform == 'win32'",
 ]
+# Legacy ASR backend: the qwen_asr PyPI package, pinned to transformers==4.57.6.
+# Mutually exclusive with `transformers_qwen` (see above). Opt-in only, for cases
+# that need the old backend specifically.
+legacy = ["qwen-asr>=0.0.6"]
 flash-attn = [
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 xet = ["hf-xet"]
+# Everything except `legacy`, which conflicts with transformers_qwen's transformers pin.
 full = [
     "faster-whisper>=1.0.0",
     "bitsandbytes>=0.43.0",
     "nemo_toolkit[asr]; sys_platform == 'linux'",
     "matplotlib",
+    "transformers>=5.13.0",
     "triton; sys_platform == 'linux'",
     "triton-windows<3.7; sys_platform == 'win32'",
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -75,10 +86,21 @@ environments = [
 ]
 override-dependencies = [
     "torchcodec>=0.6.0; sys_platform != 'linux' or platform_machine != 'x86_64'",
-    # qwen-asr 0.0.6 hard-pins transformers==4.57.6.  Pin here too so uv doesn't
-    # resolve to a newer PyPI release.  Remove once qwen-asr is updated or
-    # transformers ships an official release with qwen3_asr built in.
-    "transformers==4.57.6",
+]
+# uv resolves one universal lock covering every extra combination by default.
+# `legacy` (transformers==4.57.6, via qwen-asr) and `transformers_qwen`/`full`
+# (transformers>=5.13.0) pin incompatible transformers versions, so they must be
+# declared as conflicting extras — otherwise `uv lock`/`uv sync` fails outright
+# trying to satisfy both pins in one resolution, even if you never request both.
+conflicts = [
+    [
+        { extra = "legacy" },
+        { extra = "transformers_qwen" },
+    ],
+    [
+        { extra = "legacy" },
+        { extra = "full" },
+    ],
 ]
 
 [tool.uv.sources]

@@ -501,7 +501,7 @@ pattern = '黑人爭'
 replace = '乞人憎'
 
 [[rules]]
-pattern = '[冇無]([\u4e00-\u9fff])[冇無]([\u4e00-\u9fff])'
+pattern = '[冇無]([\u4e00-\u9fff])[冇無]([^\1，、！？：…])'
 replace = '無\1無\2'
 
 [[rules]]
@@ -511,3 +511,19 @@ replace = '准唔准'
 [[rules]]
 pattern = '唔準(?!備)'
 replace = '唔准'
+
+[[rules]]
+pattern = '炒價姐'
+replace = '錯覺啫'
+
+[[rules]]
+pattern = '瞓眼覺'
+replace = '瞓晏覺'
+
+[[rules]]
+pattern = '透裝'
+replace = '套裝'
+
+[[rules]]
+pattern = '企頂'
+replace = '企定'

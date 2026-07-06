@@ -3,6 +3,10 @@
 # Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
 
 [[rules]]
+pattern = '咁樣'
+replace = '噉樣'
+
+[[rules]]
 pattern = '咁(好[喇啦])'
 replace = '噉\1'
 
@@ -27,7 +31,7 @@ pattern = '(?<![譯原])著(?![述名作])'
 replace = '着'
 
 [[rules]]
-pattern = '(?<![空])翻(?![身閲轉譯一二兩三四五六七八九十百千萬數])'
+pattern = '(?<![空])翻(?![身閲譯一二兩三四五六七八九十百千萬數])'
 replace = '返'
 
 [[rules]]
@@ -89,3 +93,11 @@ replace = '傾\1偈'
 [[rules]]
 pattern = '日圓'
 replace = '円'
+
+[[rules]]
+pattern = '借口'
+replace = '藉口'
+
+[[rules]]
+pattern = '尋日'
+replace = '噚日'

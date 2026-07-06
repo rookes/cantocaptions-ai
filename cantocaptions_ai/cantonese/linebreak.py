@@ -18,8 +18,8 @@ _RE_LEADING_TRIM = re.compile(r'^[，\s]+', re.MULTILINE)
 _RE_TRAILING_TRIM = re.compile(r'[，\s]+$', re.MULTILINE)
 
 
-def linebreak(text: str, line_max_length: int = 21) -> str:
-    """Split text into two lines if it is longer than ``line_max_length - 3``."""
+def linebreak(text: str, line_max_length: int = 21, line_break_threshold: int = 1) -> str:
+    """Split text into two lines if it is longer than ``line_max_length - 1``."""
     if '\n' in text:
         # Rule files are user-editable, so a replacement could introduce a newline;
         # never break an already-broken line further.
@@ -27,13 +27,13 @@ def linebreak(text: str, line_max_length: int = 21) -> str:
 
     length = len(text)
 
-    if length <= line_max_length - 3:
+    if length <= line_max_length:
         return text
 
     # We always want two lines. Restrict first line shorter for aesthetic reasons.
     firstline_min_length = max(length // 4, 4)
     firstline_max_length = min(length // 2, line_max_length - 1)
-    firstline_extended_length = min(length // 4 * 3, line_max_length - 3)
+    firstline_extended_length = min(length // 4 * 3, line_max_length)
 
     # If possible, split after delimiting punctuation in the first half of the line
     for i in range(firstline_max_length, firstline_min_length - 1, -1):

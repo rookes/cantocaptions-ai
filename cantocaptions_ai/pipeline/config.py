@@ -16,9 +16,10 @@ class PipelineConfig:
     device_index: int = 0
     compute_type: str = "default"
     attn_implementation: str = "sdpa"
-    batch_size: int = 16
+    batch_size: int = 18
     threads: int = 0
     hf_token: Optional[str] = None
+    compile: bool = False
 
     # Model loading
     model: str = "Qwen3-ASR"
@@ -45,7 +46,7 @@ class PipelineConfig:
 
     # Vocal isolation
     vocal_isolation_method: str = "mbroformer"
-    vocal_isolation_batch_size: int = 4
+    vocal_isolation_batch_size: int = 1
 
     # ASR options
     suppress_tokens: str = "-1"

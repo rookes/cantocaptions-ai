@@ -202,16 +202,119 @@ def flush_vram() -> None:
 
 
 def vram_stats(device=None) -> Optional[Dict[str, float]]:
-    """Return a snapshot of current VRAM usage, or None when CUDA is unavailable."""
+    """Return a snapshot of current VRAM usage, or None when CUDA is unavailable.
+
+    ``free_mb``/``total_mb`` come from ``torch.cuda.mem_get_info()``, which reports
+    real device-wide free memory (other processes included) — not
+    ``total_memory - memory_reserved()``, which only reflects this process's own
+    PyTorch caching-allocator reservation and is blind to VRAM held by other programs.
+    """
     if not torch.cuda.is_available():
         return None
     idx = device if device is not None else 0
     allocated = torch.cuda.memory_allocated(idx)
     reserved  = torch.cuda.memory_reserved(idx)
-    total     = torch.cuda.get_device_properties(idx).total_memory
+    with torch.cuda.device(idx):
+        free, total = torch.cuda.mem_get_info()
     return {
         'allocated_mb': allocated / 1e6,
         'reserved_mb':  reserved  / 1e6,
-        'free_mb':      (total - reserved) / 1e6,
+        'free_mb':      free  / 1e6,
         'total_mb':     total / 1e6,
     }
+
+
+def check_vram_headroom(
+    stage: str,
+    device,
+    estimated_mb: float,
+    remediation: str,
+    threshold: float = 0.85,
+) -> Optional[Dict[str, float]]:
+    """Log estimated VRAM usage for *stage* against real device-wide headroom.
+
+    Always logs the comparison (useful for diagnosing slow/stalled runs even when
+    headroom is fine); warns with *remediation* — a stage-specific one-line CLI
+    suggestion — when ``estimated_mb`` exceeds ``threshold`` fraction of free VRAM.
+    Returns the ``vram_stats()`` snapshot so callers that also want to log it don't
+    need to query it a second time.
+    """
+    stats = vram_stats(device)
+    if stats is None:
+        return None
+    pct = estimated_mb / stats['total_mb'] * 100
+    logger.info(
+        "%s VRAM estimate: %.0f MB (%.0f%% of %.0f MB total, %.0f MB free)",
+        stage, estimated_mb, pct, stats['total_mb'], stats['free_mb'],
+    )
+    if estimated_mb > stats['free_mb'] * threshold:
+        logger.warning(
+            "%s may exceed available VRAM headroom (estimated %.0f MB vs %.0f MB free). "
+            "Slowdown or an out-of-memory failure is likely. %s",
+            stage, estimated_mb, stats['free_mb'], remediation,
+        )
+    return stats
+
+
+def guard_model_load(stage: str, remediation: str, load_fn: Callable[[], _ModelT]) -> _ModelT:
+    """Run a model-loading callable; on CUDA OOM, re-raise with an actionable message.
+
+    Model loading (``.to(device)``/``from_pretrained`` moving weights to GPU) isn't
+    batchable like inference, so unlike run_adaptive_batches this doesn't retry —
+    it only turns an opaque CUDA OOM traceback into a clear, stage-specific one.
+    """
+    try:
+        return load_fn()
+    except RuntimeError as e:
+        if "out of memory" not in str(e).lower():
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise RuntimeError(
+            f"CUDA out of memory while loading the {stage} model. {remediation}"
+        ) from e
+
+
+def ensure_hf_model_downloaded(repo_id: str, cache_dir=None, local_files_only: bool = False) -> None:
+    """Download a full HF Hub repo snapshot to the local cache if not already present.
+
+    Logs before/after the download so a first-run fetch (which can take a while and
+    would otherwise produce no visible signal until it completes) doesn't look like a
+    hang. Uses huggingface_hub.snapshot_download, which skips files already cached.
+    """
+    if local_files_only:
+        return
+    from huggingface_hub import snapshot_download, try_to_load_from_cache
+
+    probe = try_to_load_from_cache(repo_id, "config.json", cache_dir=cache_dir)
+    if probe is not None:
+        return
+
+    try:
+        import hf_xet  # noqa: F401
+        xet_hint = ""
+    except ImportError:
+        xet_hint = " (tip: pip install hf_xet for faster downloads)"
+
+    logger.info("Downloading %r from HuggingFace Hub%s", repo_id, xet_hint)
+    snapshot_download(repo_id, cache_dir=cache_dir)
+    logger.info("Download complete: %r", repo_id)
+
+
+def ensure_hf_file_downloaded(repo_id: str, filename: str, cache_dir=None, local_files_only: bool = False) -> None:
+    """Download a single file from an HF Hub repo to the local cache if not present.
+
+    Same before/after logging as ensure_hf_model_downloaded, for repos where only one
+    file (e.g. a checkpoint) is needed rather than a full snapshot.
+    """
+    if local_files_only:
+        return
+    from huggingface_hub import hf_hub_download, try_to_load_from_cache
+
+    probe = try_to_load_from_cache(repo_id, filename, cache_dir=cache_dir)
+    if probe is not None:
+        return
+
+    logger.info("Downloading %r from HuggingFace Hub", f"{repo_id}/{filename}")
+    hf_hub_download(repo_id=repo_id, filename=filename, cache_dir=cache_dir)
+    logger.info("Download complete: %r", f"{repo_id}/{filename}")

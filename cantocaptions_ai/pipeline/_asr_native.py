@@ -1,22 +1,23 @@
-"""HF-native ASR backend: uses AutoModelForSpeechSeq2Seq with git-main transformers.
+"""Native ASR backend: uses AutoModelForMultimodalLM, transformers' official Qwen3-ASR support.
 
-Loaded lazily by asr.load_model() when native qwen3_asr support is detected.
-Requires `uv sync --extra compile` (installs git-main transformers + triton).
+Loaded lazily by asr.load_model() when native qwen3_asr support is detected
+(transformers>=5.13.0, installed via `uv sync --extra transformers_qwen`).
 """
 from typing import List, Optional, Union
 
+import numpy as np
 import torch
 
-from cantocaptions_ai.pipeline.asr import (
-    QwenPipeline,
-    _normalize_language,
-    _build_text_prompt,
-    _ensure_model_downloaded,
-    _parse_asr_output,
-)
+from cantocaptions_ai.pipeline.asr import QwenPipeline, _normalize_language
 from cantocaptions_ai.utils.audio import resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
-from cantocaptions_ai.utils.model_utils import partition_by_cache, run_adaptive_batches
+from cantocaptions_ai.utils.model_utils import (
+    partition_by_cache,
+    run_adaptive_batches,
+    check_vram_headroom,
+    ensure_hf_model_downloaded,
+    guard_model_load,
+)
 from cantocaptions_ai.cantonese.text import normalize_segment_text
 from cantocaptions_ai.utils.log_utils import get_logger
 
@@ -28,33 +29,52 @@ _MODEL_IDS = {
 }
 
 
-def _apply_compile(model) -> None:
-    # torch.compile is not viable for Qwen3-ASR-hf as implemented in transformers:
-    #
-    # model.model.language_model (Qwen3 decoder): RoPE inv_freq computation
-    #   (inv_freq = 1 / theta ** ...) triggers pow_by_natural with a [-1,-1]
-    #   exponent range in the symbolic shape system, crashing the trace.
-    #
-    # model.model.audio_tower: get_audio_cu_seqlens() uses max().item() to extract
-    #   a Python int, iterates over a tensor in a Python for-loop, and builds a
-    #   Python list from tensor arithmetic.  These are structural graph breaks that
-    #   cause dynamo to retrace on every call, making inference 30x slower.
-    #
-    # The compile extra's value is git-main transformers (native qwen3_asr backend),
-    # not torch.compile.  Triton is kept in the extra for future use.
-    pass
+def _compile_and_warmup(model, processor, language: str, batch_size: Optional[int]) -> None:
+    """Compile model.forward and run a short warmup so the first real batch isn't the one paying the compile cost.
 
+    Opt-in only (--compile) — benchmarked in scripts/bench_asr_compile.py against this
+    workload's actual shape variance (VAD segments are essentially unique-length) and found
+    to be a net loss in every configuration tried:
+      - Default (graph break allowed): get_audio_cu_seqlens() in the audio tower does
+        `.max().item()` + a Python loop over tensor-derived lengths, which dynamo can't trace.
+        Each new (batch_size, audio_length) shape burns up to `recompile_limit` (8) full
+        compile attempts (~20-30s each) before giving up and falling back to eager for that
+        code location — tens of seconds wasted per distinct shape, for at most a ~2x speedup
+        on the rare batch that repeats an exact prior shape before the budget trips.
+      - dynamic=True: made the first-compile cost dramatically worse (137-408s), not better.
+      - Padding every segment to a fixed shape (chunk_size worth of samples) does eliminate
+        the recompiles and gives a real, stable steady-state speedup once compiled — but only
+        pays off once the workload is already VRAM-healthy; at a starved batch_size, eager
+        itself was 10-50x slower (near-OOM allocator overhead unrelated to compile), which
+        made compile look better than it is. At a batch_size with real headroom, eager alone
+        is already fast and stable, and compile's edge shrinks to ~25-40% against a ~30s+
+        per-process tax.
+      - That per-process tax cannot be cached away: neither torch.compiler.save_cache_artifacts/
+        load_cache_artifacts (torch's "Mega-Cache", meant for cross-machine cache portability)
+        nor the default on-disk Inductor cache avoid it — the dominant cost is TorchDynamo's
+        own bytecode tracing/graph-break handling for this model, which happens once per fresh
+        Python process regardless of what's cached on disk, not the kernel compilation itself.
+
+    Uses a small batch of silent audio at roughly the configured batch size — torch.compile
+    specializes to the shapes it first sees, so warming up near the real batch size avoids an
+    extra recompilation on the first genuine inference call.
+    """
+    model.forward = torch.compile(model.forward)
+    warmup_batch = max(1, min(batch_size or 4, 8))
+    silence = [np.zeros(3 * 16000, dtype=np.float32) for _ in range(warmup_batch)]
+    inputs = processor.apply_transcription_request(audio=silence, language=language)
+    inputs = inputs.to(model.device, model.dtype)
+    with torch.inference_mode():
+        for _ in range(3):
+            model.generate(**inputs, max_new_tokens=8, do_sample=False)
 
 
 def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device) -> None:
-    props = torch.cuda.get_device_properties(device)
-    total_vram = props.total_memory
-    free_vram = total_vram - torch.cuda.memory_allocated(device)
     dtype_bytes = next(model.parameters()).element_size()
     seq_len = inputs["input_ids"].shape[1]
     input_bytes = sum(t.numel() * t.element_size() for t in inputs.values() if isinstance(t, torch.Tensor))
     try:
-        text_cfg = model.config.thinker_config.text_config
+        text_cfg = model.config.text_config
         kv_bytes = (
             batch_size * (seq_len + max_new_tokens)
             * text_cfg.num_hidden_layers * 2
@@ -64,27 +84,18 @@ def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device) -> N
     except AttributeError:
         kv_bytes = 0
     estimated = input_bytes + kv_bytes
-    pct = estimated / total_vram * 100
-    logger.info(
-        "VRAM estimate — batch_size=%d, seq_len=%d: inputs=%.0f MB, kv_cache=%.0f MB, "
-        "total_estimated=%.0f MB (%.0f%% of %.0f MB), free=%.0f MB",
-        batch_size, seq_len,
-        input_bytes / 1e6, kv_bytes / 1e6,
-        estimated / 1e6, pct, total_vram / 1e6,
-        free_vram / 1e6,
+    check_vram_headroom(
+        f"ASR batch (batch_size={batch_size}, seq_len={seq_len})",
+        device,
+        estimated / 1e6,
+        "consider reducing --batch_size or using --compute_type int8",
     )
-    if estimated > free_vram * 0.85:
-        logger.warning(
-            "Estimated VRAM for this batch (%.0f MB) may exceed available headroom (%.0f MB free). "
-            "Slowdown or failure is likely — consider reducing --batch_size.",
-            estimated / 1e6, free_vram / 1e6,
-        )
 
 
 class QwenPipelineNative(QwenPipeline):
-    """HF-native backend: uses AutoModelForSpeechSeq2Seq (Qwen3ASRForConditionalGeneration).
+    """Native backend: uses AutoModelForMultimodalLM (Qwen3ASRForConditionalGeneration).
 
-    Loads Qwen/Qwen3-ASR-1.7B-hf or -0.6B-hf from git-main transformers.
+    Loads Qwen/Qwen3-ASR-1.7B-hf or -0.6B-hf via transformers' official qwen3_asr support.
     """
 
     def __init__(
@@ -120,7 +131,7 @@ class QwenPipelineNative(QwenPipeline):
         Segments from every to-compute file are flattened into one job stream, so
         batches pack work from different files (no half-empty tail batch per file).
         """
-        logger.info("Performing transcription (HF-native backend)...")
+        logger.info("Performing transcription (native backend)...")
         language = _normalize_language(self.preset_language or "yue")
         cached, to_compute = partition_by_cache(items, self.read_debug, load_debug_dir)
 
@@ -193,9 +204,8 @@ class QwenPipelineNative(QwenPipeline):
         Raises RuntimeError on CUDA OOM (caught and retried at a smaller batch size by
         run_adaptive_batches); no shared state is mutated before the model call.
         """
-        prompts = [_build_text_prompt(self.processor, language) for _ in wavs]
-        inputs = self.processor(text=prompts, audio=wavs, return_tensors="pt", padding=True)
-        inputs = inputs.to(self.model.device).to(self.model.dtype)
+        inputs = self.processor.apply_transcription_request(audio=wavs, language=language)
+        inputs = inputs.to(self.model.device, self.model.dtype)
 
         if self.device.type == "cuda":
             _warn_vram(inputs, len(wavs), self.model, self.max_new_tokens, self.device)
@@ -210,18 +220,19 @@ class QwenPipelineNative(QwenPipeline):
         n_input = inputs["input_ids"].shape[1]
         logger.debug("[TOKENS] batch=%d, new_tokens=%d, max=%d", len(wavs), sequences.shape[1] - n_input, self.max_new_tokens)
 
-        decoded = self.processor.batch_decode(
+        # Qwen3ASRProcessor.decode(return_format="transcription_only") strips the
+        # "language <LANG><asr_text>" prefix and applies the same repetition-collapsing
+        # dehallucination pass the original qwen_asr package used — no extra
+        # post-processing needed here.
+        texts = self.processor.decode(
             sequences[:, n_input:],
-            skip_special_tokens=True,
+            return_format="transcription_only",
             clean_up_tokenization_spaces=False,
         )
         del inputs, generated
 
-        texts: List[str] = []
-        for raw in decoded:
+        for raw in texts:
             logger.debug("[RAW] %s", raw)
-            _, text = _parse_asr_output(raw, user_language=language)
-            texts.append(text)
         return texts
 
 
@@ -236,18 +247,18 @@ def load_model_native(
     download_root: Optional[str] = None,
     local_files_only: bool = False,
     batch_size: Optional[int] = None,
+    compile_enabled: bool = False,
     print_progress: bool = False,
     verbose: bool = False,
 ) -> QwenPipelineNative:
-    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+    from transformers import AutoModelForMultimodalLM, AutoProcessor
 
     model_id = _MODEL_IDS.get(model_name, model_name)
 
-    if not local_files_only:
-        try:
-            _ensure_model_downloaded(model_id, cache_dir=download_root)
-        except Exception as e:
-            logger.warning("Could not download %r: %s — using cached version if available.", model_id, e)
+    try:
+        ensure_hf_model_downloaded(model_id, cache_dir=download_root, local_files_only=local_files_only)
+    except Exception as e:
+        logger.warning("Could not download %r: %s — using cached version if available.", model_id, e)
 
     if compute_type == "default":
         compute_type = "float16" if device == "cuda" else "float32"
@@ -256,18 +267,22 @@ def load_model_native(
     device_map = resolve_device(device, device_index)
     pipeline_device = device_index if device == "cuda" else device
 
-    logger.info("Loading ASR model %r (HF-native backend, attn=%s)", model_id, attn_implementation)
+    logger.info("Loading ASR model %r (native backend, attn=%s)", model_id, attn_implementation)
 
     hf_model = model
     if hf_model is None:
-        hf_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_id,
-            dtype=compute_type,
-            device_map=device_map,
-            attn_implementation=attn_implementation,
-            local_files_only=local_files_only,
-            cache_dir=download_root,
-        ).eval()
+        hf_model = guard_model_load(
+            "ASR",
+            "consider --compute_type int8 or a lower --batch_size",
+            lambda: AutoModelForMultimodalLM.from_pretrained(
+                model_id,
+                dtype=compute_type,
+                device_map=device_map,
+                attn_implementation=attn_implementation,
+                local_files_only=local_files_only,
+                cache_dir=download_root,
+            ).eval(),
+        )
 
     processor = AutoProcessor.from_pretrained(
         model_id,
@@ -275,13 +290,24 @@ def load_model_native(
         cache_dir=download_root,
     )
 
+    if device == "cuda" and compile_enabled:
+        try:
+            _compile_and_warmup(hf_model, processor, _normalize_language(language or "yue"), batch_size)
+            logger.info("torch.compile enabled for ASR model")
+        except Exception as e:
+            logger.warning(
+                "torch.compile failed (%s); falling back to eager mode. "
+                "Install the transformers_qwen extra for triton support.",
+                e,
+            )
+
     return QwenPipelineNative(
         model=hf_model,
         processor=processor,
         device=pipeline_device,
         language=language,
         batch_size=batch_size,
-        max_new_tokens=256,
+        max_new_tokens=200,
         print_progress=print_progress,
         verbose=verbose,
     )

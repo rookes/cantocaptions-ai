@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from cantocaptions_ai.utils.schema import ProgressCallback, SingleSegment, TranscriptionResult
-from cantocaptions_ai.utils.model_utils import PipelineStage
+from cantocaptions_ai.utils.model_utils import PipelineStage, ensure_hf_model_downloaded, guard_model_load
 from cantocaptions_ai.utils.debug import load_llm_correction_debug, write_llm_correction_debug
 from cantocaptions_ai.utils.log_utils import get_logger
 
@@ -359,7 +359,16 @@ def load_llm(
     else:
         load_kwargs["torch_dtype"] = torch.float16
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+    try:
+        ensure_hf_model_downloaded(model_path, cache_dir=None, local_files_only=local_files_only)
+    except Exception as e:
+        logger.warning("Could not download %r: %s — using cached version if available.", model_path, e)
+
+    model = guard_model_load(
+        "LLM correction",
+        "consider --llm_model with fewer parameters, or disable --llm_correction",
+        lambda: AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs),
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=local_files_only)
 
     if torch.cuda.is_available():

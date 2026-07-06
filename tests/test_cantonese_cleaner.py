@@ -157,6 +157,7 @@ class TestChineseNumbers(unittest.TestCase):
     def test_small_numbers_not_converted(self):
         self.assertEqual(convert_chinese_numbers("三個"), "三個")
         self.assertEqual(convert_chinese_numbers("十"), "十")
+        self.assertEqual(convert_chinese_numbers("五號"), "五號")
 
     def test_dates(self):
         self.assertEqual(convert_chinese_numbers("十一月二十三號"), "11月23號")

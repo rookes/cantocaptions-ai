@@ -25,8 +25,18 @@ from cantocaptions_ai.cantonese.text import SPLIT_CHARS, get_particle_candidates
 
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.output import LANGUAGES_WITHOUT_SPACES
+from cantocaptions_ai.utils.model_utils import (
+    check_vram_headroom,
+    ensure_hf_model_downloaded,
+    guard_model_load,
+)
 
 logger = get_logger(__name__)
+
+# Rough fp32 params + activation footprint for wav2vec2-BERT-cantonese; used only for
+# the preflight VRAM-headroom warning, not an exact bound.
+_ALIGN_MODEL_VRAM_ESTIMATE_MB = 1200
+_ALIGN_REMEDIATION = "pass --no_align to skip alignment, or free VRAM used by other processes/stages"
 
 DEFAULT_ALIGN_MODELS_TORCH = {
     "en": "WAV2VEC2_ASR_BASE_960H",
@@ -588,7 +598,11 @@ def load_align_model(language_code: str, device: str, device_index: int = 0, mod
     if model_name in torchaudio.pipelines.__all__:
         pipeline_type = "torchaudio"
         bundle = torchaudio.pipelines.__dict__[model_name]
-        align_model = bundle.get_model(dl_kwargs={"model_dir": model_dir}).to(device)
+        check_vram_headroom("Alignment model load", device, _ALIGN_MODEL_VRAM_ESTIMATE_MB, _ALIGN_REMEDIATION)
+        align_model = guard_model_load(
+            "alignment", _ALIGN_REMEDIATION,
+            lambda: bundle.get_model(dl_kwargs={"model_dir": model_dir}).to(device),
+        )
         labels = bundle.get_labels()
         align_dictionary = {c.lower(): i for i, c in enumerate(labels)}
     else:
@@ -597,6 +611,10 @@ def load_align_model(language_code: str, device: str, device_index: int = 0, mod
         ProcessorClass = Wav2Vec2BertProcessor if is_bert else Wav2Vec2Processor
         ModelClass = Wav2Vec2BertForCTC if is_bert else Wav2Vec2ForCTC
         model_flavor = "wav2vec2-BERT" if is_bert else "wav2vec2.0"
+        try:
+            ensure_hf_model_downloaded(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
+        except Exception as e:
+            logger.warning("Could not download %r: %s — using cached version if available.", model_name, e)
         try:
             processor = ProcessorClass.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
             align_model = ModelClass.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
@@ -607,11 +625,29 @@ def load_align_model(language_code: str, device: str, device_index: int = 0, mod
                 f'(https://huggingface.co/models) or torchaudio (https://pytorch.org/audio/stable/pipelines.html#id14)'
             )
         pipeline_type = "huggingface"
-        align_model = align_model.to(device)
+        check_vram_headroom("Alignment model load", device, _ALIGN_MODEL_VRAM_ESTIMATE_MB, _ALIGN_REMEDIATION)
+        align_model = guard_model_load("alignment", _ALIGN_REMEDIATION, lambda: align_model.to(device))
         align_dictionary = {char.lower(): code for char, code in processor.tokenizer.get_vocab().items()}
 
     align_metadata = {"language": language_code, "dictionary": align_dictionary, "type": pipeline_type}
     return align_model, align_metadata
+
+
+def load_bert_processor(model_dir=None, model_cache_only: bool = False):
+    """Load the Wav2Vec2-BERT processor used for particle disambiguation during alignment.
+
+    Shared by both the --retime and normal alignment paths in transcribe.py, which
+    otherwise each held their own unlogged, cache_dir/local_files_only-blind
+    from_pretrained call for the same repo.
+    """
+    from transformers import Wav2Vec2BertProcessor
+
+    repo_id = "alvanlii/wav2vec2-BERT-cantonese"
+    try:
+        ensure_hf_model_downloaded(repo_id, cache_dir=model_dir, local_files_only=model_cache_only)
+    except Exception as e:
+        logger.warning("Could not download %r: %s — using cached version if available.", repo_id, e)
+    return Wav2Vec2BertProcessor.from_pretrained(repo_id, cache_dir=model_dir, local_files_only=model_cache_only)
 
 
 def align(
@@ -663,6 +699,7 @@ def align(
 
     # --- Align each segment ---
     aligned_segments: List[SingleAlignedSegment] = []
+
     for sdx, segment in enumerate(transcript):
         t1 = segment["start"]
         t2 = segment["end"]
@@ -698,7 +735,7 @@ def align(
 
         if progress_callback is not None:
             progress_callback.advance(1)
-
+    
     # --- Collect word segments ---
     word_segments: List[SingleWordSegment] = [w for seg in aligned_segments for w in seg["words"]]
     return {"segments": aligned_segments, "word_segments": word_segments}

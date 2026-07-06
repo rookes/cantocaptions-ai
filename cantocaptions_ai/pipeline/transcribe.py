@@ -14,6 +14,7 @@ from cantocaptions_ai.utils.log_utils import StageTimer, TranscriptionSummary, g
 from cantocaptions_ai.utils.model_utils import model_scope, flush_vram, vram_stats
 from cantocaptions_ai.cantonese.text import is_mergeable, is_removable
 from cantocaptions_ai.utils.debug import _debug_stage_exists, write_precleaning_debug
+from cantocaptions_ai.pipeline.vad import VadProcessor
 
 logger = get_logger(__name__)
 
@@ -270,6 +271,13 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         parser: argparse.ArgumentParser object.
     """
     from cantocaptions_ai.pipeline.config import PipelineConfig
+    from huggingface_hub.utils.tqdm import disable_progress_bars
+
+    # HF Hub's own tqdm download bars race StageTimer's spinner over the same
+    # terminal line (both are \r-driven redraw loops); silencing them means our
+    # explicit "Downloading %r..." log lines are the only download-progress signal,
+    # so a slow first-run download never looks like a stalled/hung stage.
+    disable_progress_bars()
 
     audio_paths = args.pop("audio")
     cfg = PipelineConfig.from_args(args)
@@ -395,7 +403,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     with StageTimer("VAD", summary) as stage:
         stub_items = [{'audio_path': p, 'audio_track': _select_audio_track(p)} for p in audio_paths]
         if need_vad:
-            from cantocaptions_ai.pipeline.vad import load_vad, VadProcessor
+            from cantocaptions_ai.pipeline.vad import load_vad
             vad_processor = load_vad(
                 vad_method=cfg.vad_method,
                 device=cfg.device,
@@ -409,7 +417,6 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             items = vad_processor.run(stub_items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
             del vad_processor
         else:
-            from cantocaptions_ai.pipeline.vad import VadProcessor
             items = VadProcessor.load_cache(stub_items, cfg.load_debug_dir)
 
     # Stage 2: Vocal Isolation (conditional)
@@ -439,9 +446,8 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     if cfg.retime:
         # Retime mode: skip ASR entirely; use the alignment model for both search and fine alignment.
         with StageTimer("Subtitle retiming + alignment", summary) as stage:
-            from transformers import Wav2Vec2BertProcessor
-            from cantocaptions_ai.pipeline.alignment import load_align_model
-            bert_processor = Wav2Vec2BertProcessor.from_pretrained("alvanlii/wav2vec2-BERT-cantonese")
+            from cantocaptions_ai.pipeline.alignment import load_align_model, load_bert_processor
+            bert_processor = load_bert_processor(cfg.model_dir, cfg.model_cache_only)
             align_model, align_metadata = load_align_model(
                 align_language, cfg.device, cfg.device_index,
                 model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
@@ -480,6 +486,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     threads=qwen_threads,
                     use_auth_token=cfg.hf_token,
                     batch_size=cfg.batch_size,
+                    compile_enabled=cfg.compile,
                     print_progress=cfg.print_progress,
                     verbose=cfg.verbose,
                 ) as model:
@@ -549,9 +556,8 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         # Stage 4: Alignment
         if not cfg.no_align:
             with StageTimer("Alignment", summary) as stage:
-                from transformers import Wav2Vec2BertProcessor
-                from cantocaptions_ai.pipeline.alignment import load_align_model
-                bert_processor = Wav2Vec2BertProcessor.from_pretrained("alvanlii/wav2vec2-BERT-cantonese")
+                from cantocaptions_ai.pipeline.alignment import load_align_model, load_bert_processor
+                bert_processor = load_bert_processor(cfg.model_dir, cfg.model_cache_only)
                 align_model, align_metadata = load_align_model(
                     align_language, cfg.device, cfg.device_index,
                     model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,

@@ -16,10 +16,10 @@ An end-to-end speech pipeline for generating high-quality, timed written Cantone
 ```bash
 git clone https://github.com/rookes/cantocaptions-ai
 cd cantocaptions-ai
-uv sync
+uv sync --extra transformers_qwen
 ```
 
-`uv sync` installs all dependencies into an isolated virtual environment and pins exact versions. Torch is pulled from the PyTorch CUDA 12.8 index on Linux and Windows; the CPU build is used on macOS.
+This installs all dependencies plus the recommended ASR backend into an isolated virtual environment and pins exact versions. Torch is pulled from the PyTorch CUDA 12.8 index on Linux and Windows; the CPU build is used on macOS. Bare `uv sync` does **not** install a working ASR backend — see [Optional features](#optional-features) below for the extras you need to choose from.
 
 ## Usage
 
@@ -48,12 +48,15 @@ uv run cantocaptions_ai audio.wav --hf_token hf_...
 
 ## Optional features
 
-Install extras alongside the base package:
+Bare `uv sync` installs neither ASR backend — pick one explicitly:
 
 ```bash
-uv sync --extra llm        # LLM corrections (bitsandbytes)
-uv sync --extra compile    # Experimental support for new Qwen transformers model
-uv sync --extra full       # All of the above
+uv sync --extra transformers_qwen   # ASR via official transformers Qwen3-ASR support (recommended)
+uv sync --extra legacy              # ASR via the older qwen_asr package; mutually exclusive with transformers_qwen
+uv sync --extra ensemble            # faster-whisper ensemble
+uv sync --extra llm                 # LLM corrections (bitsandbytes)
+uv sync --extra diarize             # speaker diarization (Linux only)
+uv sync --extra full                # transformers_qwen + all of the above except legacy
 ```
 
 ## Planned Updates

@@ -69,7 +69,12 @@ def select_cantonese_track(streams: List[dict]) -> int:
     return 0
 
 
-def load_audio(file: str, sr: int = SAMPLE_RATE, audio_track: int = 0) -> np.ndarray:
+def load_audio(file: str, 
+               sr: int = SAMPLE_RATE, 
+               audio_track: int = 0, 
+               audio_start: Optional[float] = None, 
+               audio_end: Optional[float] = None
+               ) -> np.ndarray:
     """
     Open an audio file and read as mono waveform, resampling as necessary
 
@@ -77,6 +82,15 @@ def load_audio(file: str, sr: int = SAMPLE_RATE, audio_track: int = 0) -> np.nda
     ----------
     file: str
         The audio file to open
+
+    sr: int
+        The sample rate to resample the audio if necessary
+
+    audio_track: int
+        The index of the audio track, if there are multiple
+
+    audio_start: float
+        The amount of audio to cut from the beginning
 
     sr: int
         The sample rate to resample the audio if necessary

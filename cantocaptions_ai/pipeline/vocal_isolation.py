@@ -11,7 +11,14 @@ from huggingface_hub import hf_hub_download
 from cantocaptions_ai.pipeline.mbroformer.model import MelBandRoformer
 from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
-from cantocaptions_ai.utils.model_utils import PipelineStage, partition_by_cache, run_adaptive_batches
+from cantocaptions_ai.utils.model_utils import (
+    PipelineStage,
+    partition_by_cache,
+    run_adaptive_batches,
+    check_vram_headroom,
+    ensure_hf_file_downloaded,
+    guard_model_load,
+)
 from cantocaptions_ai.utils.debug import load_isolation_debug, write_isolation_debug
 from cantocaptions_ai.utils.log_utils import get_logger
 
@@ -19,6 +26,11 @@ logger = get_logger(__name__)
 
 _HF_REPO_ID = "KimberleyJSN/melbandroformer"
 _HF_FILENAME = "MelBandRoformer.ckpt"
+
+# Rough fp32 params + activation footprint for MelBandRoformer; used only for the
+# preflight VRAM-headroom warning, not an exact bound.
+_VOCAL_ISOLATION_VRAM_ESTIMATE_MB = 1200
+_VOCAL_ISOLATION_REMEDIATION = "pass --vocal_isolation_method none to skip vocal isolation"
 
 _DURATION_TOLERANCE_S = 0.005  # seconds
 
@@ -258,6 +270,10 @@ def load_vocal_isolation(
 
     # Download checkpoint from HuggingFace (cached after first download)
     logger.info("Loading vocal isolation model (MelBandRoformer)...")
+    try:
+        ensure_hf_file_downloaded(_HF_REPO_ID, _HF_FILENAME, cache_dir=model_dir)
+    except Exception as e:
+        logger.warning("Could not download %r: %s — using cached version if available.", _HF_FILENAME, e)
     checkpoint_path = hf_hub_download(
         repo_id=_HF_REPO_ID,
         filename=_HF_FILENAME,
@@ -268,7 +284,14 @@ def load_vocal_isolation(
     )
 
     torch_device = torch.device(resolve_device(device, device_index))
-    torch_model = torch_model.to(torch_device)
+    check_vram_headroom(
+        "Vocal isolation model load", torch_device,
+        _VOCAL_ISOLATION_VRAM_ESTIMATE_MB, _VOCAL_ISOLATION_REMEDIATION,
+    )
+    torch_model = guard_model_load(
+        "vocal isolation", _VOCAL_ISOLATION_REMEDIATION,
+        lambda: torch_model.to(torch_device),
+    )
 
     return MbRoformerProcessor(
         model=torch_model,

@@ -1,16 +1,18 @@
-"""Legacy ASR backend: uses qwen_asr.Qwen3ASRModel with transformers 4.57.6.
+"""Legacy ASR backend: uses qwen_asr.Qwen3ASRModel with transformers==4.57.6.
 
 Loaded lazily by asr.load_model() when native qwen3_asr support is not detected
-in the installed transformers.  Do NOT import this module at the top of any file
-that may run under git-main transformers — the qwen_asr package uses a decorator
-calling convention that changed between 4.57.6 and git-main.
+in the installed transformers. Installed via the `legacy` extra, which is
+mutually exclusive with `transformers_qwen` (see pyproject.toml) — the two pin
+incompatible transformers versions. Do NOT import this module at the top of any
+file that may run under a newer transformers — the qwen_asr package's decorator
+calling convention is specific to 4.57.6.
 """
 from typing import List, Optional
 
-from cantocaptions_ai.pipeline.asr import QwenPipeline, _normalize_language, _ensure_model_downloaded
+from cantocaptions_ai.pipeline.asr import QwenPipeline, _normalize_language
 from cantocaptions_ai.utils.audio import resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
-from cantocaptions_ai.utils.model_utils import partition_by_cache
+from cantocaptions_ai.utils.model_utils import partition_by_cache, ensure_hf_model_downloaded
 from cantocaptions_ai.cantonese.text import normalize_segment_text
 from cantocaptions_ai.utils.log_utils import get_logger
 
@@ -128,11 +130,10 @@ def load_model_legacy(
 
     model_id = _MODEL_IDS.get(model_name, model_name)
 
-    if not local_files_only:
-        try:
-            _ensure_model_downloaded(model_id, cache_dir=download_root)
-        except Exception as e:
-            logger.warning("Could not download %r: %s — using cached version if available.", model_id, e)
+    try:
+        ensure_hf_model_downloaded(model_id, cache_dir=download_root, local_files_only=local_files_only)
+    except Exception as e:
+        logger.warning("Could not download %r: %s — using cached version if available.", model_id, e)
 
     if compute_type == "default":
         compute_type = "float16" if device == "cuda" else "float32"

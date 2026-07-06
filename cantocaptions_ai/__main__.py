@@ -44,18 +44,19 @@ def cli():
     parser.add_argument("--python-version", "-P", action="version", version=f"Python {platform.python_version()} ({platform.python_implementation()})", help="Show python version information and exit")
 
     model_grp = parser.add_argument_group("model")
-    model_grp.add_argument("--model", default="Qwen3-ASR", help="name of the model to use")
+    model_grp.add_argument("--model", default="Qwen3-ASR", choices=["Qwen3-ASR", "Qwen3-ASR-0.6B"], help="name of the model to use" "Qwen3-ASR")
     model_grp.add_argument("--model_cache_only", type=str2bool, default=False, help="If True, will not attempt to download models, instead using cached models from --model_dir")
     model_grp.add_argument("--model_dir", type=str, default=None, help="the path to save model files; uses ~/.cache/whisper by default")
 
     inference_grp = parser.add_argument_group("inference")
     inference_grp.add_argument("--device", default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"), help="device type to use for PyTorch inference (e.g. cpu, cuda, mps)")
     inference_grp.add_argument("--device_index", default=0, type=int, help="device index to use for inference")
-    inference_grp.add_argument("--batch_size", default=24, type=int, help="the preferred batch size for inference")
+    inference_grp.add_argument("--batch_size", default=10, type=int, help="the preferred batch size for inference")
     inference_grp.add_argument("--compute_type", default="default", type=str, choices=["default", "float16", "float32", "int8"], help="compute type for computation; 'default' uses float16 on GPU, float32 on CPU")
     inference_grp.add_argument("--attn_implementation", default="flash_attention_2", type=str, choices=["sdpa", "flash_attention_2", "eager"], help="attention implementation for transformer models; 'flash_attention_2' requires flash-attn to be installed")
     inference_grp.add_argument("--threads", type=optional_int, default=0, help="number of threads used by torch for CPU inference; supercedes MKL_NUM_THREADS/OMP_NUM_THREADS")
     inference_grp.add_argument("--hf_token", type=str, default=None, help="Hugging Face Access Token to access PyAnnote gated models")
+    inference_grp.add_argument("--compile", action="store_true", default=False, help="enable torch.compile for the native ASR backend (opt-in; benchmarked to be a net loss by default for this pipeline's variable-length VAD segments — see scripts/bench_asr_compile.py)")
 
     output_grp = parser.add_argument_group("output")
     output_grp.add_argument("--output_dir", "-o", type=str, default=".", help="directory to save the outputs")
@@ -103,7 +104,7 @@ def cli():
     align_grp.add_argument("--no_align", action='store_true', help="Do not perform phoneme alignment")
     align_grp.add_argument("--return_char_alignments", action='store_true', help="Return character-level alignments in the output json file")
     align_grp.add_argument("--align_padding", type=float, default=0.04, help="The minimum allowed timebetween subttitles.")
-    align_grp.add_argument("--align_release", type=float, default=0.65, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
+    align_grp.add_argument("--align_release", type=float, default=0.75, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
     align_grp.add_argument("--align_merge_distance", type=float, default=0.08, help="The maximum distance between utterances that allows them to be merged.")
 
     subtitle_grp = parser.add_argument_group("subtitle formatting")
