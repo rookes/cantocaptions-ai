@@ -243,6 +243,7 @@ def load_vocal_isolation(
     model_dir: Optional[str] = None,
     batch_size: Optional[int] = None,
     compute_type: str = "float32",
+    vram_checks: bool = True,
 ) -> VocalIsolationProcessor:
     """Load a vocal isolation model and return a processor.
 
@@ -294,6 +295,7 @@ def load_vocal_isolation(
     check_vram_headroom(
         "Vocal isolation model load", torch_device,
         _VOCAL_ISOLATION_VRAM_ESTIMATE_MB, _VOCAL_ISOLATION_REMEDIATION,
+        vram_checks=vram_checks,
     )
     torch_model = guard_model_load(
         "vocal isolation", _VOCAL_ISOLATION_REMEDIATION,

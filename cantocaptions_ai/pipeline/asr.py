@@ -91,6 +91,7 @@ def load_model(
     compile_enabled: bool = False,
     print_progress: bool = False,
     verbose: bool = False,
+    vram_checks: bool = True,
 ) -> QwenPipeline:
     """Load a Qwen3-ASR model, auto-selecting the backend based on the installed transformers.
 
@@ -123,6 +124,7 @@ def load_model(
             compile_enabled=compile_enabled,
             print_progress=print_progress,
             verbose=verbose,
+            vram_checks=vram_checks,
         )
     else:
         logger.info(

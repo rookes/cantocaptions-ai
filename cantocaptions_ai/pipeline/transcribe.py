@@ -55,6 +55,7 @@ def _run_alignment(
     print_progress: bool,
     batch_size: int,
     progress_callback: ProgressCallback = None,
+    vram_checks: bool = True,
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.alignment import align
     if progress_callback is not None:
@@ -78,6 +79,7 @@ def _run_alignment(
                 print_progress=print_progress,
                 batch_size=batch_size,
                 progress_callback=progress_callback,
+                vram_checks=vram_checks,
             )
             aligned_result['language'] = result['language']
         else:
@@ -179,6 +181,7 @@ def _run_retime(
     score_threshold: float = -5.0,
     search_window: float = 120.0,
     batch_size: int = 4,
+    vram_checks: bool = True,
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.retime import load_subtitle_file, retime_subtitles
     logger.info(f"Loading subtitles from: {retime_path}")
@@ -197,6 +200,7 @@ def _run_retime(
             score_threshold=score_threshold,
             search_window=search_window,
             batch_size=batch_size,
+            vram_checks=vram_checks,
         )
         result = {"segments": coarse_segments, "language": align_metadata["language"]}
         result_items.append({**item, "result": result})
@@ -434,6 +438,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 device_index=cfg.device_index,
                 batch_size=cfg.vocal_isolation_batch_size,
                 compute_type=cfg.vocal_isolation_compute_type,
+                vram_checks=cfg.vram_checks,
             )
             stage.mark_inference_start()
             items = vocal_isolation_processor.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
@@ -455,11 +460,13 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 align_language, cfg.device, cfg.device_index,
                 model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
                 compute_type=cfg.align_compute_type,
+                vram_checks=cfg.vram_checks,
             )
             stage.mark_inference_start()
             items = _run_retime(
                 items, cfg.retime, align_model, align_metadata, bert_processor, cfg.device,
                 batch_size=cfg.align_batch_size,
+                vram_checks=cfg.vram_checks,
             )
             if not cfg.no_align:
                 items = _run_alignment(
@@ -467,6 +474,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     cfg.align_padding, cfg.align_release, cfg.interpolate_method,
                     cfg.return_char_alignments, cfg.print_progress, cfg.align_batch_size,
                     progress_callback=stage.reporter,
+                    vram_checks=cfg.vram_checks,
                 )
             else:
                 items = _extract_timestamps(items)
@@ -496,6 +504,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     compile_enabled=cfg.compile,
                     print_progress=cfg.print_progress,
                     verbose=cfg.verbose,
+                    vram_checks=cfg.vram_checks,
                 ) as model:
                     stage.mark_inference_start()
                     items = model.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
@@ -537,13 +546,14 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
 
             if need_llm:
                 from cantocaptions_ai.pipeline.llm_correction import load_llm
-                stats = vram_stats()
-                if stats:
-                    logger.info(
-                        f"VRAM before LLM load: allocated={stats['allocated_mb']:.0f} MB, "
-                        f"reserved={stats['reserved_mb']:.0f} MB, "
-                        f"free={stats['free_mb']:.0f} MB / {stats['total_mb']:.0f} MB"
-                    )
+                if cfg.vram_checks:
+                    stats = vram_stats()
+                    if stats:
+                        logger.info(
+                            f"VRAM before LLM load: allocated={stats['allocated_mb']:.0f} MB, "
+                            f"reserved={stats['reserved_mb']:.0f} MB, "
+                            f"free={stats['free_mb']:.0f} MB / {stats['total_mb']:.0f} MB"
+                        )
                 with StageTimer("LLM correction", summary) as stage:
                     with model_scope(
                         load_llm,
@@ -553,6 +563,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                         local_files_only=cfg.model_cache_only,
                         semantic_mode=cfg.reference_correction_semantic,
                         attn_implementation=cfg.attn_implementation,
+                        vram_checks=cfg.vram_checks,
                     ) as corrector:
                         stage.mark_inference_start()
                         items = corrector.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
@@ -569,6 +580,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     align_language, cfg.device, cfg.device_index,
                     model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
                     compute_type=cfg.align_compute_type,
+                    vram_checks=cfg.vram_checks,
                 )
                 stage.mark_inference_start()
                 items = _run_alignment(
@@ -576,6 +588,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     cfg.align_padding, cfg.align_release, cfg.interpolate_method,
                     cfg.return_char_alignments, cfg.print_progress, cfg.align_batch_size,
                     progress_callback=stage.reporter,
+                    vram_checks=cfg.vram_checks,
                 )
             del align_model, bert_processor
             flush_vram()

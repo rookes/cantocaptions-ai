@@ -168,7 +168,7 @@ class StageTimer:
         self._spinner_thread: Optional[threading.Thread] = None
 
     def __enter__(self) -> "StageTimer":
-        if torch.cuda.is_available():
+        if self._summary.enabled and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         if not self._summary.enabled:
             self._start = time.perf_counter()
@@ -198,7 +198,11 @@ class StageTimer:
 
     def __exit__(self, *_: object) -> None:
         end = time.perf_counter()
-        vram_peak_mb = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else None
+        vram_peak_mb = (
+            torch.cuda.max_memory_allocated() / 1e6
+            if self._summary.enabled and torch.cuda.is_available()
+            else None
+        )
         self._spinner_stop.set()
         if self._spinner_thread is not None:
             self._spinner_thread.join(timeout=0.5)

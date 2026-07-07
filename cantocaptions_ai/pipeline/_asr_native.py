@@ -69,7 +69,7 @@ def _compile_and_warmup(model, processor, language: str, batch_size: Optional[in
             model.generate(**inputs, max_new_tokens=8, do_sample=False)
 
 
-def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device) -> None:
+def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device, vram_checks: bool = True) -> None:
     dtype_bytes = next(model.parameters()).element_size()
     seq_len = inputs["input_ids"].shape[1]
     input_bytes = sum(t.numel() * t.element_size() for t in inputs.values() if isinstance(t, torch.Tensor))
@@ -89,6 +89,7 @@ def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device) -> N
         device,
         estimated / 1e6,
         "consider reducing --batch_size or using --asr_compute_type int8",
+        vram_checks=vram_checks,
     )
 
 
@@ -108,6 +109,7 @@ class QwenPipelineNative(QwenPipeline):
         max_new_tokens: int = 256,
         print_progress: bool = False,
         verbose: bool = False,
+        vram_checks: bool = True,
     ):
         self.model = model
         self.processor = processor
@@ -124,6 +126,7 @@ class QwenPipelineNative(QwenPipeline):
         self.max_new_tokens = max_new_tokens
         self.print_progress = print_progress
         self.verbose = verbose
+        self.vram_checks = vram_checks
 
     def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
         """Transcribe all files, batching VAD segments across file boundaries.
@@ -208,7 +211,7 @@ class QwenPipelineNative(QwenPipeline):
         inputs = inputs.to(self.model.device, self.model.dtype)
 
         if self.device.type == "cuda":
-            _warn_vram(inputs, len(wavs), self.model, self.max_new_tokens, self.device)
+            _warn_vram(inputs, len(wavs), self.model, self.max_new_tokens, self.device, vram_checks=self.vram_checks)
 
         with torch.inference_mode():
             generated = self.model.generate(
@@ -250,6 +253,7 @@ def load_model_native(
     compile_enabled: bool = False,
     print_progress: bool = False,
     verbose: bool = False,
+    vram_checks: bool = True,
 ) -> QwenPipelineNative:
     from transformers import AutoModelForMultimodalLM, AutoProcessor
 
@@ -310,4 +314,5 @@ def load_model_native(
         max_new_tokens=200,
         print_progress=print_progress,
         verbose=verbose,
+        vram_checks=vram_checks,
     )

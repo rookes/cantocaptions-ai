@@ -331,6 +331,7 @@ def load_llm(
     local_files_only: bool = False,
     semantic_mode: bool = False,
     attn_implementation: str = "sdpa",
+    vram_checks: bool = True,
 ) -> LLMCorrector:
     """Load a causal LM for transcript correction.
 
@@ -371,7 +372,7 @@ def load_llm(
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=local_files_only)
 
-    if torch.cuda.is_available():
+    if vram_checks and torch.cuda.is_available():
         from cantocaptions_ai.utils.model_utils import vram_stats
         stats = vram_stats()
         if stats:

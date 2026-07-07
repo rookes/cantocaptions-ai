@@ -83,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     output_grp.add_argument("--log_level", type=str, default=argparse.SUPPRESS, choices=["debug", "info", "warning", "error", "critical"], help="logging level (overrides --verbose if set)")
     output_grp.add_argument("--log_file", type=str, default=argparse.SUPPRESS, help="redirect third-party stdout/stderr to this file; cantocaptions_ai log messages are written to both terminal and file")
     output_grp.add_argument("--print_progress", type=str2bool, default=argparse.SUPPRESS, help="if True, display stage progress bars and a timing summary; also enables per-batch progress in transcribe() and align() methods")
+    output_grp.add_argument("--vram_checks", type=str2bool, default=argparse.SUPPRESS, help="if True, proactively estimate and log per-stage/per-batch VRAM headroom before running it (queries torch.cuda.mem_get_info each call); set False for zero per-batch overhead when turnaround time matters more than OOM safety margins")
     output_grp.add_argument("--debug_dir", type=str, default=argparse.SUPPRESS, help="if set, write intermediate stage data (audio segments and JSON manifests) to this directory for debugging and replay")
     output_grp.add_argument("--load_debug_dir", type=str, default=argparse.SUPPRESS, help="load intermediate stage data from a previous --debug_dir run; completed stages are skipped and their results are loaded instead")
 

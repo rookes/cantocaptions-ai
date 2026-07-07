@@ -262,6 +262,7 @@ def check_vram_headroom(
     estimated_mb: float,
     remediation: str,
     threshold: float = 0.85,
+    vram_checks: bool = True,
 ) -> Optional[Dict[str, float]]:
     """Log estimated VRAM usage for *stage* against real device-wide headroom.
 
@@ -270,7 +271,13 @@ def check_vram_headroom(
     suggestion — when ``estimated_mb`` exceeds ``threshold`` fraction of free VRAM.
     Returns the ``vram_stats()`` snapshot so callers that also want to log it don't
     need to query it a second time.
+
+    ``vram_checks=False`` (``--vram_checks False``) skips the ``vram_stats()`` call
+    (and thus its ``torch.cuda.mem_get_info()`` driver round-trip) entirely, for
+    zero-overhead runs where turnaround time matters more than OOM safety margins.
     """
+    if not vram_checks:
+        return None
     stats = vram_stats(device)
     if stats is None:
         return None

@@ -67,6 +67,7 @@ def retime_subtitles(
     score_threshold: float = -5.0,
     search_window: float = 120.0,
     batch_size: int = 4,
+    vram_checks: bool = True,
 ) -> List[SingleSegment]:
     """Search the audio for each subtitle line and update its timing.
 
@@ -108,7 +109,7 @@ def retime_subtitles(
 
     logger.info("Computing VAD emissions for retime search...")
     vad_emissions = compute_vad_emissions(
-        vad_segments, align_model, model_type, bert_processor, device, batch_size
+        vad_segments, align_model, model_type, bert_processor, device, batch_size, vram_checks=vram_checks
     )
 
     current_offset: float = 0.0
