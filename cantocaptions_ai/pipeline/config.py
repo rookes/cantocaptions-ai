@@ -1,5 +1,19 @@
-from dataclasses import dataclass, fields
-from typing import Optional
+from dataclasses import dataclass, field, fields, MISSING
+from typing import Any, Dict, Optional
+
+
+def _detect_default_device() -> str:
+    """Best available torch device: cuda > mps > cpu.
+
+    A function (not a static default) since the right value depends on the
+    machine PipelineConfig is constructed on.
+    """
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 @dataclass
@@ -7,16 +21,20 @@ class PipelineConfig:
     """Configuration for the cantocaptions-ai pipeline.
 
     Can be constructed directly for library use or built from CLI args via
-    ``PipelineConfig.from_args(vars(parsed_args))``.
+    ``PipelineConfig.from_args(vars(parsed_args))``. Field defaults here are
+    the single source of truth for the pipeline's baseline behavior: the CLI
+    (``cantocaptions_ai/__main__.py``) carries no defaults of its own — it
+    reads them from ``PipelineConfig.defaults()`` for ``--help`` display and
+    for the config-file/preset layering in ``pipeline/cli_config.py``.
     """
 
     # Core inference
     language: str = "yue"
-    device: str = "cpu"
+    device: str = field(default_factory=_detect_default_device)
     device_index: int = 0
-    compute_type: str = "default"
+    asr_compute_type: str = "default"
     attn_implementation: str = "sdpa"
-    batch_size: int = 18
+    batch_size: int = 15
     threads: int = 0
     hf_token: Optional[str] = None
     compile: bool = False
@@ -46,7 +64,8 @@ class PipelineConfig:
 
     # Vocal isolation
     vocal_isolation_method: str = "mbroformer"
-    vocal_isolation_batch_size: int = 1
+    vocal_isolation_batch_size: int = 4
+    vocal_isolation_compute_type: str = "float32"
 
     # ASR options
     suppress_tokens: str = "-1"
@@ -68,8 +87,10 @@ class PipelineConfig:
     no_align: bool = False
     return_char_alignments: bool = False
     align_padding: float = 0.04
-    align_release: float = 0.45
-    align_merge_distance: float = 0.12
+    align_release: float = 0.64
+    align_merge_distance: float = 0.08
+    align_batch_size: int = 4
+    align_compute_type: str = "float32"
 
     # Subtitle formatting
     max_line_width: Optional[int] = 18
@@ -108,3 +129,22 @@ class PipelineConfig:
         """
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in args.items() if k in known})
+
+    @classmethod
+    def defaults(cls) -> Dict[str, Any]:
+        """Every field's baseline default, resolving default_factory fields
+        (currently only ``device``).
+
+        The one place ``--help`` text, config/default.cfg auto-generation,
+        and the base layer of the CLI's config-file/preset merge all read
+        their baseline values from.
+        """
+        out: Dict[str, Any] = {}
+        for f in fields(cls):
+            if f.default is not MISSING:
+                out[f.name] = f.default
+            elif f.default_factory is not MISSING:  # type: ignore[misc]
+                out[f.name] = f.default_factory()
+            else:
+                raise TypeError(f"PipelineConfig.{f.name} has no default")
+        return out

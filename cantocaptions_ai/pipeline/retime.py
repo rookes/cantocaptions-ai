@@ -66,6 +66,7 @@ def retime_subtitles(
     device: str,
     score_threshold: float = -5.0,
     search_window: float = 120.0,
+    batch_size: int = 4,
 ) -> List[SingleSegment]:
     """Search the audio for each subtitle line and update its timing.
 
@@ -87,6 +88,7 @@ def retime_subtitles(
         device: Torch device string.
         score_threshold: Minimum average CTC score to accept a VAD match.
         search_window: Seconds to scan forward from the expected subtitle position.
+        batch_size: VAD segments per batch when computing emissions.
 
     Returns:
         List of SingleSegments with updated start/end = matched VAD segment bounds,
@@ -106,7 +108,7 @@ def retime_subtitles(
 
     logger.info("Computing VAD emissions for retime search...")
     vad_emissions = compute_vad_emissions(
-        vad_segments, align_model, model_type, bert_processor, device
+        vad_segments, align_model, model_type, bert_processor, device, batch_size
     )
 
     current_offset: float = 0.0

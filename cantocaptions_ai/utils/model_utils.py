@@ -14,6 +14,23 @@ OutputT = TypeVar("OutputT")
 _ModelT = TypeVar("_ModelT")
 
 
+def resolve_torch_compute_dtype(compute_type: str, device: str, stage: str) -> torch.dtype:
+    """Map a "float32"/"float16" compute_type option to a torch dtype.
+
+    float16 falls back to float32 off CUDA (half precision is unsupported/unreliable
+    for CPU ops these models rely on, e.g. FFT in vocal isolation).
+    """
+    if compute_type == "float16":
+        if not device.startswith("cuda"):
+            logger.warning(
+                "%s compute_type=float16 requires a CUDA device; falling back to float32 on %s.",
+                stage, device,
+            )
+            return torch.float32
+        return torch.float16
+    return torch.float32
+
+
 def _load_or_compute(audio_path, load_debug_dir, debug_dir, load_fn, write_fn, compute_fn):
     """Load a stage result from the debug cache, or compute and optionally save it."""
     if load_debug_dir:
@@ -201,15 +218,30 @@ def flush_vram() -> None:
         torch.cuda.empty_cache()
 
 
+def _is_cuda_device(device) -> bool:
+    """True if *device* refers to a CUDA device (None/int default to the current one)."""
+    if device is None or isinstance(device, int):
+        return True
+    if isinstance(device, torch.device):
+        return device.type == "cuda"
+    return str(device).startswith("cuda")
+
+
 def vram_stats(device=None) -> Optional[Dict[str, float]]:
-    """Return a snapshot of current VRAM usage, or None when CUDA is unavailable.
+    """Return a snapshot of current VRAM usage, or None when unavailable/not applicable.
 
     ``free_mb``/``total_mb`` come from ``torch.cuda.mem_get_info()``, which reports
     real device-wide free memory (other processes included) — not
     ``total_memory - memory_reserved()``, which only reflects this process's own
     PyTorch caching-allocator reservation and is blind to VRAM held by other programs.
+
+    Returns None for a non-CUDA *device* (e.g. "cpu", "mps") even when CUDA happens
+    to be available elsewhere on the machine — callers pass through whatever device
+    string the pipeline is actually configured to use (which may be "cpu" on a
+    CUDA-capable box, e.g. via --device cpu), and torch.cuda.mem_get_info()/
+    memory_allocated() raise if handed a non-CUDA device string.
     """
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not _is_cuda_device(device):
         return None
     idx = device if device is not None else 0
     allocated = torch.cuda.memory_allocated(idx)

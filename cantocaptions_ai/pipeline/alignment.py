@@ -4,6 +4,7 @@ C. Max Bain
 """
 from dataclasses import dataclass
 import math
+import time
 from typing import Iterable, Optional, Union, List, Tuple
 
 import numpy as np
@@ -30,6 +31,8 @@ from cantocaptions_ai.utils.model_utils import (
     check_vram_headroom,
     ensure_hf_model_downloaded,
     guard_model_load,
+    resolve_torch_compute_dtype,
+    run_adaptive_batches,
 )
 
 logger = get_logger(__name__)
@@ -236,15 +239,16 @@ def _run_model_inference(
     lengths=None,
 ) -> torch.Tensor:
     """Single forward pass returning log-softmax emissions."""
+    model_dtype = next(model.parameters()).dtype
     with torch.inference_mode():
         if model_type == "torchaudio":
-            emissions, _ = model(audio.to(device), lengths=lengths)
+            emissions, _ = model(audio.to(device, dtype=model_dtype), lengths=lengths)
         elif model_type == "huggingface":
             if bert_processor is not None:
                 features = bert_processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-                emissions = model(features["input_features"].to(device)).logits
+                emissions = model(features["input_features"].to(device, dtype=model_dtype)).logits
             else:
-                emissions = model(audio.to(device)).logits
+                emissions = model(audio.to(device, dtype=model_dtype)).logits
         else:
             raise NotImplementedError(f"Align model of type {model_type} not supported.")
         return torch.log_softmax(emissions, dim=-1)
@@ -337,14 +341,19 @@ def _find_vad_segment_idx(vad_segments: List[VadAudioSegment], t: float) -> Opti
     return None
 
 
-def _compute_vad_emissions(
+def _compute_vad_emissions_sequential(
     vad_segments: List[VadAudioSegment],
     model: torch.nn.Module,
     model_type: str,
     bert_processor,
     device: str,
 ) -> List[Tuple[torch.Tensor, float]]:
-    """Run inference on each full VAD segment. Returns (log_softmax_emission, frame_rate) per segment."""
+    """Run inference on each VAD segment one at a time.
+
+    Fallback used for model types this pipeline doesn't actually exercise in
+    practice (torchaudio bundles, or a plain HF wav2vec2 model with no BERT
+    feature-extractor) — see _compute_vad_emissions_batched for the real path.
+    """
     results = []
     for vad_seg in vad_segments:
         seg_audio = vad_seg["audio"]
@@ -361,9 +370,117 @@ def _compute_vad_emissions(
     return results
 
 
-def compute_vad_emissions(vad_segments, model, model_type, bert_processor, device):
+def _warn_alignment_vram(input_features: torch.Tensor, model: torch.nn.Module, device: str) -> None:
+    """Estimate one batch's peak VRAM use from its actual (padded) shape and log it
+    against real headroom — mirrors _asr_native.py's _warn_vram, but for a
+    bidirectional CTC encoder with no KV-cache instead of autoregressive generation.
+
+    Rough proxy, not an exact bound: the padded input tensor itself, plus one
+    conformer layer's transient self-attention score matrix (batch * heads *
+    frames^2) and FFN intermediate activation (batch * frames * intermediate) —
+    the dominant terms, since inference_mode lets earlier layers' activations be
+    freed as later layers run, so peak memory tracks roughly one layer's working
+    set rather than the sum across all layers.
+    """
+    dtype_bytes = input_features.element_size()
+    batch, max_frames = input_features.shape[0], input_features.shape[1]
+    input_bytes = input_features.numel() * dtype_bytes
+    try:
+        cfg = model.config
+        attn_bytes = batch * cfg.num_attention_heads * max_frames * max_frames * dtype_bytes
+        ffn_bytes = batch * max_frames * cfg.intermediate_size * dtype_bytes
+        activation_bytes = attn_bytes + ffn_bytes
+    except AttributeError:
+        activation_bytes = 0
+    check_vram_headroom(
+        f"Alignment batch (batch_size={batch}, max_frames={max_frames})",
+        device,
+        (input_bytes + activation_bytes) / 1e6,
+        "consider reducing --align_batch_size or --chunk_size",
+    )
+
+
+def _compute_vad_emissions_batched(
+    vad_segments: List[VadAudioSegment],
+    model: torch.nn.Module,
+    bert_processor,
+    device: str,
+    batch_size: int,
+) -> List[Tuple[torch.Tensor, float]]:
+    """Batch VAD segments through the HF Wav2Vec2-BERT model via run_adaptive_batches.
+
+    bert_processor's feature extractor pads each batch to its own longest segment
+    and returns an attention_mask; this model has add_adapter=False, so the mask's
+    per-row valid length maps 1:1 onto the CTC emission's frame dimension with no
+    extra downsampling to account for — used directly to trim each item's emission
+    back to its real (unpadded) length before it's stored.
+
+    Jobs are processed longest-segment-first (not VAD order): VAD segments range
+    from sub-second to the full --chunk_size (default 30s), and self-attention's
+    O(frames^2) memory scaling means one long segment sharing a batch with several
+    short ones pads all of them up to the long one's length — spiking peak VRAM
+    well above what the batch_size alone suggests. Sorting by length groups
+    similar-duration segments together instead, so no batch pads far past its own
+    natural size.
+    """
+    results: List[Optional[Tuple[torch.Tensor, float]]] = [None] * len(vad_segments)
+    jobs = sorted(range(len(vad_segments)), key=lambda i: len(vad_segments[i]["audio"]))
+
+    model_dtype = next(model.parameters()).dtype
+
+    def infer_fn(batch: List[int]) -> None:
+        wavs = [vad_segments[i]["audio"] for i in batch]
+        with torch.inference_mode():
+            features = bert_processor(
+                wavs, sampling_rate=SAMPLE_RATE, return_tensors="pt", return_attention_mask=True,
+            )
+            input_features = features["input_features"].to(device, dtype=model_dtype)
+            attention_mask = features["attention_mask"].to(device)
+            _warn_alignment_vram(input_features, model, device)
+            emissions = torch.log_softmax(
+                model(input_features, attention_mask=attention_mask).logits, dim=-1
+            )
+        valid_lens = features["attention_mask"].sum(dim=-1)
+        for row, i in enumerate(batch):
+            real_len = int(valid_lens[row].item())
+            emission = emissions[row, :real_len, :].cpu().detach()
+            vad_duration = vad_segments[i]["end"] - vad_segments[i]["start"]
+            frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
+            results[i] = (emission, frame_rate)
+
+    run_adaptive_batches(jobs, batch_size, infer_fn)
+    return results
+
+
+def _compute_vad_emissions(
+    vad_segments: List[VadAudioSegment],
+    model: torch.nn.Module,
+    model_type: str,
+    bert_processor,
+    device: str,
+    batch_size: int = 4,
+) -> List[Tuple[torch.Tensor, float]]:
+    """Run inference on each full VAD segment. Returns (log_softmax_emission, frame_rate) per segment.
+
+    Logs before/after regardless of which path runs below, so a slow pass (a file
+    with many/long VAD segments) is visibly explained rather than looking like a
+    hang — this ran with no progress feedback at all before batching was added.
+    """
+    if not vad_segments:
+        return []
+    start = time.perf_counter()
+    logger.info("Computing alignment emissions for %d VAD segments...", len(vad_segments))
+    if model_type == "huggingface" and bert_processor is not None:
+        results = _compute_vad_emissions_batched(vad_segments, model, bert_processor, device, batch_size)
+    else:
+        results = _compute_vad_emissions_sequential(vad_segments, model, model_type, bert_processor, device)
+    logger.info("Alignment emissions computed in %.1fs", time.perf_counter() - start)
+    return results
+
+
+def compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size: int = 4):
     """Public wrapper around _compute_vad_emissions for use by the retime pipeline."""
-    return _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device)
+    return _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size)
 
 
 def _get_emission_for_segment(
@@ -578,7 +695,18 @@ def _align_segment(
 
 # --- Public functions ---
 
-def load_align_model(language_code: str, device: str, device_index: int = 0, model_name: Optional[str] = None, model_dir=None, model_cache_only: bool = False):
+def load_align_model(
+    language_code: str, device: str, device_index: int = 0, model_name: Optional[str] = None,
+    model_dir=None, model_cache_only: bool = False, compute_type: str = "float32",
+):
+    """Load the phoneme-alignment model.
+
+    compute_type="float16" halves weight VRAM but the model is otherwise loaded and
+    invoked exactly like float32 (no autocast) — inputs are cast to match in
+    _run_model_inference/_compute_vad_emissions_batched, and this is deliberately
+    opt-in with float32 as the default since it can measurably affect forced-alignment
+    accuracy.
+    """
     if model_name is None:
         if language_code in DEFAULT_ALIGN_MODELS_TORCH:
             model_name = DEFAULT_ALIGN_MODELS_TORCH[language_code]
@@ -593,6 +721,7 @@ def load_align_model(language_code: str, device: str, device_index: int = 0, mod
             raise ValueError(f"No default align-model for language: {language_code}")
 
     device = resolve_device(device, device_index)
+    dtype = resolve_torch_compute_dtype(compute_type, device, "align")
 
     import torchaudio
     if model_name in torchaudio.pipelines.__all__:
@@ -601,7 +730,7 @@ def load_align_model(language_code: str, device: str, device_index: int = 0, mod
         check_vram_headroom("Alignment model load", device, _ALIGN_MODEL_VRAM_ESTIMATE_MB, _ALIGN_REMEDIATION)
         align_model = guard_model_load(
             "alignment", _ALIGN_REMEDIATION,
-            lambda: bundle.get_model(dl_kwargs={"model_dir": model_dir}).to(device),
+            lambda: bundle.get_model(dl_kwargs={"model_dir": model_dir}).to(device, dtype=dtype),
         )
         labels = bundle.get_labels()
         align_dictionary = {c.lower(): i for i, c in enumerate(labels)}
@@ -626,7 +755,7 @@ def load_align_model(language_code: str, device: str, device_index: int = 0, mod
             )
         pipeline_type = "huggingface"
         check_vram_headroom("Alignment model load", device, _ALIGN_MODEL_VRAM_ESTIMATE_MB, _ALIGN_REMEDIATION)
-        align_model = guard_model_load("alignment", _ALIGN_REMEDIATION, lambda: align_model.to(device))
+        align_model = guard_model_load("alignment", _ALIGN_REMEDIATION, lambda: align_model.to(device, dtype=dtype))
         align_dictionary = {char.lower(): code for char, code in processor.tokenizer.get_vocab().items()}
 
     align_metadata = {"language": language_code, "dictionary": align_dictionary, "type": pipeline_type}
@@ -688,7 +817,7 @@ def align(
     spacing_char_id = blank_id # model_dictionary['！']
 
     vad_seg_emissions = (
-        _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device)
+        _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size)
         if vad_segments is not None
         else None
     )

@@ -234,3 +234,8 @@ temp/
 *.wav
 *.mp4
 test/
+
+# Local per-machine CLI defaults (auto-generated on first run). Named
+# presets under config/ (e.g. config/cpu.cfg) are intentionally NOT
+# ignored -- only the personal default.cfg is.
+/config/default.cfg

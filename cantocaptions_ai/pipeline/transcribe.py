@@ -178,6 +178,7 @@ def _run_retime(
     device: str,
     score_threshold: float = -5.0,
     search_window: float = 120.0,
+    batch_size: int = 4,
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.retime import load_subtitle_file, retime_subtitles
     logger.info(f"Loading subtitles from: {retime_path}")
@@ -195,6 +196,7 @@ def _run_retime(
             device,
             score_threshold=score_threshold,
             search_window=search_window,
+            batch_size=batch_size,
         )
         result = {"segments": coarse_segments, "language": align_metadata["language"]}
         result_items.append({**item, "result": result})
@@ -431,6 +433,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 device=cfg.device,
                 device_index=cfg.device_index,
                 batch_size=cfg.vocal_isolation_batch_size,
+                compute_type=cfg.vocal_isolation_compute_type,
             )
             stage.mark_inference_start()
             items = vocal_isolation_processor.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
@@ -451,14 +454,18 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             align_model, align_metadata = load_align_model(
                 align_language, cfg.device, cfg.device_index,
                 model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
+                compute_type=cfg.align_compute_type,
             )
             stage.mark_inference_start()
-            items = _run_retime(items, cfg.retime, align_model, align_metadata, bert_processor, cfg.device)
+            items = _run_retime(
+                items, cfg.retime, align_model, align_metadata, bert_processor, cfg.device,
+                batch_size=cfg.align_batch_size,
+            )
             if not cfg.no_align:
                 items = _run_alignment(
                     items, align_model, align_metadata, bert_processor, cfg.device,
                     cfg.align_padding, cfg.align_release, cfg.interpolate_method,
-                    cfg.return_char_alignments, cfg.print_progress, cfg.batch_size,
+                    cfg.return_char_alignments, cfg.print_progress, cfg.align_batch_size,
                     progress_callback=stage.reporter,
                 )
             else:
@@ -476,7 +483,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     device=cfg.device,
                     device_index=cfg.device_index,
                     download_root=cfg.model_dir,
-                    compute_type=cfg.compute_type,
+                    compute_type=cfg.asr_compute_type,
                     attn_implementation=cfg.attn_implementation,
                     language=cfg.language,
                     asr_options=asr_options,
@@ -561,12 +568,13 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 align_model, align_metadata = load_align_model(
                     align_language, cfg.device, cfg.device_index,
                     model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
+                    compute_type=cfg.align_compute_type,
                 )
                 stage.mark_inference_start()
                 items = _run_alignment(
                     items, align_model, align_metadata, bert_processor, cfg.device,
                     cfg.align_padding, cfg.align_release, cfg.interpolate_method,
-                    cfg.return_char_alignments, cfg.print_progress, cfg.batch_size,
+                    cfg.return_char_alignments, cfg.print_progress, cfg.align_batch_size,
                     progress_callback=stage.reporter,
                 )
             del align_model, bert_processor

@@ -88,7 +88,7 @@ def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device) -> N
         f"ASR batch (batch_size={batch_size}, seq_len={seq_len})",
         device,
         estimated / 1e6,
-        "consider reducing --batch_size or using --compute_type int8",
+        "consider reducing --batch_size or using --asr_compute_type int8",
     )
 
 
@@ -273,7 +273,7 @@ def load_model_native(
     if hf_model is None:
         hf_model = guard_model_load(
             "ASR",
-            "consider --compute_type int8 or a lower --batch_size",
+            "consider --asr_compute_type int8 or a lower --batch_size",
             lambda: AutoModelForMultimodalLM.from_pretrained(
                 model_id,
                 dtype=compute_type,

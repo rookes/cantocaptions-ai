@@ -18,6 +18,7 @@ from cantocaptions_ai.utils.model_utils import (
     check_vram_headroom,
     ensure_hf_file_downloaded,
     guard_model_load,
+    resolve_torch_compute_dtype,
 )
 from cantocaptions_ai.utils.debug import load_isolation_debug, write_isolation_debug
 from cantocaptions_ai.utils.log_utils import get_logger
@@ -241,12 +242,16 @@ def load_vocal_isolation(
     device_index: int = 0,
     model_dir: Optional[str] = None,
     batch_size: Optional[int] = None,
+    compute_type: str = "float32",
 ) -> VocalIsolationProcessor:
     """Load a vocal isolation model and return a processor.
 
     The checkpoint is downloaded from HuggingFace on first use and cached.
     model_dir, if given, overrides the default HuggingFace cache directory.
     batch_size controls how many fixed-size chunks are run through the model at once.
+    compute_type="float16" halves the model's weight VRAM footprint; inference still
+    runs under the existing autocast (see infer_fn) so activations/STFT stay numerically
+    safe regardless of the stored weight dtype.
     """
     if model_name != "mbroformer":
         raise ValueError(
@@ -283,14 +288,16 @@ def load_vocal_isolation(
         torch.load(checkpoint_path, map_location=torch.device("cpu"))
     )
 
-    torch_device = torch.device(resolve_device(device, device_index))
+    resolved_device = resolve_device(device, device_index)
+    torch_device = torch.device(resolved_device)
+    dtype = resolve_torch_compute_dtype(compute_type, resolved_device, "vocal_isolation")
     check_vram_headroom(
         "Vocal isolation model load", torch_device,
         _VOCAL_ISOLATION_VRAM_ESTIMATE_MB, _VOCAL_ISOLATION_REMEDIATION,
     )
     torch_model = guard_model_load(
         "vocal isolation", _VOCAL_ISOLATION_REMEDIATION,
-        lambda: torch_model.to(torch_device),
+        lambda: torch_model.to(torch_device, dtype=dtype),
     )
 
     return MbRoformerProcessor(
