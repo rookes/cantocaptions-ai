@@ -48,11 +48,13 @@ class _FakeModel:
 
     def __init__(self, fail_first_call=False):
         self.calls = 0
+        self.batch_max_frames = []
         self._fail_first_call = fail_first_call
         self._has_failed = False
 
     def __call__(self, input_features, attention_mask=None):
         self.calls += 1
+        self.batch_max_frames.append(input_features.shape[1])
         if self._fail_first_call and not self._has_failed:
             self._has_failed = True
             raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
@@ -84,6 +86,24 @@ class TestComputeVadEmissionsBatched(unittest.TestCase):
                 emission.shape[0], expected_len,
                 f"segment {i}: expected {expected_len} frames (unpadded), got {emission.shape[0]}",
             )
+
+    def test_batches_processed_longest_first(self):
+        # Guards against the ascending-sort bug: processing shortest-first meant
+        # every batch that needed a new largest-yet shape forced a fresh, ever-larger
+        # CUDA allocation (old smaller cached blocks can't be reused for it), so
+        # reserved VRAM climbed monotonically over the stage instead of being bounded
+        # by the single largest batch allocated up front.
+        lengths = [3, 20, 7, 15, 2, 10, 5]
+        segments = _make_segments(lengths)
+        model = _FakeModel()
+
+        _compute_vad_emissions_batched(segments, model, _fake_bert_processor, "cpu", batch_size=1)
+
+        self.assertEqual(
+            model.batch_max_frames, sorted(model.batch_max_frames, reverse=True),
+            "batches should be processed in non-increasing max-frame order (longest first)",
+        )
+        self.assertEqual(model.batch_max_frames[0], max(lengths))
 
     def test_batch_size_larger_than_segment_count(self):
         lengths = [4, 9]

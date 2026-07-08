@@ -28,11 +28,11 @@ from cantocaptions_ai.cantonese.text import SPLIT_CHARS, get_particle_candidates
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.output import LANGUAGES_WITHOUT_SPACES
 from cantocaptions_ai.utils.model_utils import (
+    BatchExecutor,
     check_vram_headroom,
     ensure_hf_model_downloaded,
     guard_model_load,
     resolve_torch_compute_dtype,
-    run_adaptive_batches,
 )
 
 logger = get_logger(__name__)
@@ -370,10 +370,12 @@ def _compute_vad_emissions_sequential(
     return results
 
 
-def _warn_alignment_vram(input_features: torch.Tensor, model: torch.nn.Module, device: str, vram_checks: bool = True) -> None:
+def _warn_alignment_vram(input_features: torch.Tensor, model: torch.nn.Module, device: str) -> None:
     """Estimate one batch's peak VRAM use from its actual (padded) shape and log it
     against real headroom — mirrors _asr_native.py's _warn_vram, but for a
     bidirectional CTC encoder with no KV-cache instead of autoregressive generation.
+    The caller guards on ``vram_checks`` so this (including the estimate math) is
+    skipped entirely when checks are off.
 
     Rough proxy, not an exact bound: the padded input tensor itself, plus one
     conformer layer's transient self-attention score matrix (batch * heads *
@@ -397,7 +399,6 @@ def _warn_alignment_vram(input_features: torch.Tensor, model: torch.nn.Module, d
         device,
         (input_bytes + activation_bytes) / 1e6,
         "consider reducing --align_batch_size or --chunk_size",
-        vram_checks=vram_checks,
     )
 
 
@@ -409,7 +410,7 @@ def _compute_vad_emissions_batched(
     batch_size: int,
     vram_checks: bool = True,
 ) -> List[Tuple[torch.Tensor, float]]:
-    """Batch VAD segments through the HF Wav2Vec2-BERT model via run_adaptive_batches.
+    """Batch VAD segments through the HF Wav2Vec2-BERT model via BatchExecutor.
 
     bert_processor's feature extractor pads each batch to its own longest segment
     and returns an attention_mask; this model has add_adapter=False, so the mask's
@@ -417,16 +418,25 @@ def _compute_vad_emissions_batched(
     extra downsampling to account for — used directly to trim each item's emission
     back to its real (unpadded) length before it's stored.
 
-    Jobs are processed longest-segment-first (not VAD order): VAD segments range
-    from sub-second to the full --chunk_size (default 30s), and self-attention's
-    O(frames^2) memory scaling means one long segment sharing a batch with several
-    short ones pads all of them up to the long one's length — spiking peak VRAM
-    well above what the batch_size alone suggests. Sorting by length groups
-    similar-duration segments together instead, so no batch pads far past its own
-    natural size.
+    Jobs are processed longest-segment-first (not VAD order) via BatchExecutor's
+    order_key, for two reasons: VAD segments range from sub-second to the full
+    --chunk_size (default 30s), and self-attention's O(frames^2) memory scaling
+    means one long segment sharing a batch with several short ones pads all of them
+    up to the long one's length — spiking peak VRAM well above what the batch_size
+    alone suggests. Sorting by length groups similar-duration segments together
+    instead, so no batch pads far past its own natural size. Processing longest-first
+    also matters for the CUDA caching allocator: if batches were processed
+    shortest-first, every batch that needs a new largest-yet shape would force a
+    fresh, ever-larger cudaMalloc (old smaller cached blocks can't be reused for it
+    and are never freed back to the driver mid-stage), so reserved VRAM would climb
+    monotonically over the course of the stage even though each batch's actual usage
+    stays small — until the device runs out and the driver falls back to slow memory
+    paging. Starting with the largest batch makes the allocator's one big allocation
+    happen up front, and every smaller batch after that reuses/splits the same
+    cached block.
     """
     results: List[Optional[Tuple[torch.Tensor, float]]] = [None] * len(vad_segments)
-    jobs = sorted(range(len(vad_segments)), key=lambda i: len(vad_segments[i]["audio"]))
+    jobs = list(range(len(vad_segments)))
 
     model_dtype = next(model.parameters()).dtype
 
@@ -438,7 +448,8 @@ def _compute_vad_emissions_batched(
             )
             input_features = features["input_features"].to(device, dtype=model_dtype)
             attention_mask = features["attention_mask"].to(device)
-            _warn_alignment_vram(input_features, model, device, vram_checks=vram_checks)
+            if vram_checks:
+                _warn_alignment_vram(input_features, model, device)
             emissions = torch.log_softmax(
                 model(input_features, attention_mask=attention_mask).logits, dim=-1
             )
@@ -450,7 +461,9 @@ def _compute_vad_emissions_batched(
             frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
             results[i] = (emission, frame_rate)
 
-    run_adaptive_batches(jobs, batch_size, infer_fn)
+    BatchExecutor(
+        batch_size, order_key=lambda i: len(vad_segments[i]["audio"]),
+    ).run(jobs, infer_fn)
     return results
 
 

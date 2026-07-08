@@ -50,6 +50,7 @@ class PipelineConfig:
     verbose: bool = True
     print_progress: bool = True
     vram_checks: bool = True
+    vram_headroom_mb: int = 512
     debug_dir: Optional[str] = None
     load_debug_dir: Optional[str] = None
 

@@ -505,6 +505,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     print_progress=cfg.print_progress,
                     verbose=cfg.verbose,
                     vram_checks=cfg.vram_checks,
+                    vram_headroom_mb=cfg.vram_headroom_mb,
                 ) as model:
                     stage.mark_inference_start()
                     items = model.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)

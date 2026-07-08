@@ -6,6 +6,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     from tqdm import tqdm as _TqdmBar
@@ -19,7 +20,6 @@ class TqdmLoggingHandler(logging.StreamHandler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            from tqdm import tqdm
             tqdm.write(self.format(record), file=self.stream)
             self.flush()
         except Exception:
@@ -173,7 +173,7 @@ class StageTimer:
         if not self._summary.enabled:
             self._start = time.perf_counter()
             return self
-        from tqdm import tqdm
+        
         self._start = time.perf_counter()
         self._spinner_stop.clear()
         self._bar = tqdm(
@@ -240,12 +240,12 @@ class StageTimer:
         self._spinner_stop.set()
         if self._spinner_thread is not None:
             self._spinner_thread.join(timeout=0.5)
-        # Close the previous bar with leave=False (never disable=True — see CLAUDE.md:
+        # Close the previous bar with leave=False (never disable=True:
         # disable=True skips _decr_instances() and leaks tqdm._instances).
         if self._bar is not None:
             self._bar.leave = False
             self._bar.close()
-        from tqdm import tqdm
+
         self._total = total if total and total > 0 else None
         self._bar = tqdm(
             total=self._total,

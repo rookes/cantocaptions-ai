@@ -13,8 +13,8 @@ from cantocaptions_ai.utils.audio import resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
 from cantocaptions_ai.utils.model_utils import (
     partition_by_cache,
-    run_adaptive_batches,
-    check_vram_headroom,
+    BatchExecutor,
+    MemoryPolicy,
     ensure_hf_model_downloaded,
     guard_model_load,
 )
@@ -69,7 +69,12 @@ def _compile_and_warmup(model, processor, language: str, batch_size: Optional[in
             model.generate(**inputs, max_new_tokens=8, do_sample=False)
 
 
-def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device, vram_checks: bool = True) -> None:
+def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device, policy: MemoryPolicy) -> None:
+    """Estimate one batch's peak VRAM (input tensors + generation KV-cache high-water)
+    and log it against real headroom via *policy*. Callers guard on ``policy.enabled``
+    so this whole function — including the estimate math below — is skipped when VRAM
+    checks are off (measurably faster on the hot path; see the diagnosis findings).
+    """
     dtype_bytes = next(model.parameters()).element_size()
     seq_len = inputs["input_ids"].shape[1]
     input_bytes = sum(t.numel() * t.element_size() for t in inputs.values() if isinstance(t, torch.Tensor))
@@ -84,12 +89,11 @@ def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device, vram
     except AttributeError:
         kv_bytes = 0
     estimated = input_bytes + kv_bytes
-    check_vram_headroom(
+    policy.warn(
         f"ASR batch (batch_size={batch_size}, seq_len={seq_len})",
         device,
         estimated / 1e6,
         "consider reducing --batch_size or using --asr_compute_type int8",
-        vram_checks=vram_checks,
     )
 
 
@@ -127,6 +131,7 @@ class QwenPipelineNative(QwenPipeline):
         self.print_progress = print_progress
         self.verbose = verbose
         self.vram_checks = vram_checks
+        self.policy = MemoryPolicy(vram_checks)
 
     def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
         """Transcribe all files, batching VAD segments across file boundaries.
@@ -155,7 +160,14 @@ class QwenPipelineNative(QwenPipeline):
             for (idx, sdx), text in zip(batch, texts):
                 buffers[idx]['texts'][sdx] = text
 
-        run_adaptive_batches(jobs, self._batch_size, infer_fn, reporter=progress_callback)
+        # Longest-first: front-loads the largest KV-cache allocation so the allocator's
+        # reserved pool is claimed once up front rather than ratcheting up over the run
+        # (bench_asr_native.py --sort desc confirmed the win). Texts scatter back by
+        # index, so output order is unaffected.
+        BatchExecutor(
+            self._batch_size,
+            order_key=lambda job: len(buffers[job[0]]['segs'][job[1]]['audio']),
+        ).run(jobs, infer_fn, reporter=progress_callback)
 
         computed = {}
         for idx, buf in buffers.items():
@@ -193,7 +205,10 @@ class QwenPipelineNative(QwenPipeline):
             for i, text in zip(batch, self._infer_batch(wavs, language)):
                 texts[i] = text
 
-        run_adaptive_batches(jobs, self._batch_size, infer_fn, reporter=progress_callback)
+        BatchExecutor(
+            self._batch_size,
+            order_key=lambda i: len(input[i]['audio']),
+        ).run(jobs, infer_fn, reporter=progress_callback)
 
         segments: List[SingleSegment] = [
             normalize_segment_text({'text': texts[i] or '', 'start': input[i]['start'], 'end': input[i]['end']})
@@ -205,13 +220,13 @@ class QwenPipelineNative(QwenPipeline):
         """Run one batch of audio arrays through the model, returning parsed texts.
 
         Raises RuntimeError on CUDA OOM (caught and retried at a smaller batch size by
-        run_adaptive_batches); no shared state is mutated before the model call.
+        BatchExecutor); no shared state is mutated before the model call.
         """
         inputs = self.processor.apply_transcription_request(audio=wavs, language=language)
         inputs = inputs.to(self.model.device, self.model.dtype)
 
-        if self.device.type == "cuda":
-            _warn_vram(inputs, len(wavs), self.model, self.max_new_tokens, self.device, vram_checks=self.vram_checks)
+        if self.device.type == "cuda" and self.policy.enabled:
+            _warn_vram(inputs, len(wavs), self.model, self.max_new_tokens, self.device, self.policy)
 
         with torch.inference_mode():
             generated = self.model.generate(
@@ -254,6 +269,7 @@ def load_model_native(
     print_progress: bool = False,
     verbose: bool = False,
     vram_checks: bool = True,
+    vram_headroom_mb: int = 512,
 ) -> QwenPipelineNative:
     from transformers import AutoModelForMultimodalLM, AutoProcessor
 
@@ -293,6 +309,12 @@ def load_model_native(
         local_files_only=local_files_only,
         cache_dir=download_root,
     )
+
+    # Cap the allocator now that the weights are resident, so the reading reflects
+    # true post-load free VRAM. Keeps generation's growing KV-cache from silently
+    # paging into host RAM; a near-OOM instead raises and the BatchExecutor halves.
+    if device == "cuda":
+        MemoryPolicy(vram_checks, vram_headroom_mb).cap_after_load(device_index)
 
     if device == "cuda" and compile_enabled:
         try:

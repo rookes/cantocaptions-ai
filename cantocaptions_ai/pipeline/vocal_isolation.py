@@ -14,7 +14,7 @@ from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
 from cantocaptions_ai.utils.model_utils import (
     PipelineStage,
     partition_by_cache,
-    run_adaptive_batches,
+    BatchExecutor,
     check_vram_headroom,
     ensure_hf_file_downloaded,
     guard_model_load,
@@ -34,6 +34,18 @@ _VOCAL_ISOLATION_VRAM_ESTIMATE_MB = 1200
 _VOCAL_ISOLATION_REMEDIATION = "pass --vocal_isolation_method none to skip vocal isolation"
 
 _DURATION_TOLERANCE_S = 0.005  # seconds
+
+# Caps how many segments' worth of overlap-add buffers (mixture/result/counter,
+# each a (2, total_length) float32 array) can be concurrently alive in
+# MbRoformerProcessor.run(). The primary windowing unit is "one file" (see
+# _iter_windows); this cap only kicks in defensively for a single file with more
+# segments than this — VAD's max_duration bounds individual segment length
+# (via --chunk_size) but nothing bounds how many segments one very long file can
+# produce. At ~40MB/segment for a typical ~30s segment (see the RAM-exhaustion
+# investigation this guards against), 128 segments is ~5GB worst case —
+# comfortably under typical machine RAM and far above a normal ~50 segs/file, so
+# it essentially never triggers in normal operation.
+_MAX_SEGMENTS_PER_WINDOW = 128
 
 
 # ---------------------------------------------------------------------------
@@ -89,10 +101,15 @@ class MbRoformerProcessor(VocalIsolationProcessor):
     """Vocal isolation processor backed by the Mel-Band RoFormer model.
 
     The model runs on fixed-size chunks of ``config.inference.chunk_size`` samples, so
-    the batch unit is the chunk (identical size → no padding). Chunks from every
-    to-compute segment across every file are packed into batches (cross-file backfill);
-    each segment reconstructs via overlap-add into its own CPU buffer and is finalized
-    (and its buffers freed) as soon as its last chunk completes.
+    the batch unit is the chunk (identical size → no padding). Segments are processed
+    one file at a time (see ``_iter_windows``, sub-chunked defensively at
+    ``_MAX_SEGMENTS_PER_WINDOW`` for a pathologically long single file): each window's
+    segments get their overlap-add scratch buffers (mixture/result/counter) built,
+    batched through the model, and freed via ``_finalize_segment`` before the next
+    window starts — bounding peak host RAM to one window's segments instead of the
+    entire dataset. This trades away batching chunks across file boundaries (at most
+    ``batch_size - 1`` chunks go under-full in each file's last batch) in exchange for
+    that bound.
     """
 
     def __init__(
@@ -121,16 +138,31 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         C, step, fade, border = self._C, self._step, self._fade, self._border
         base_window = _get_windowing_array(C, fade, torch.device("cpu")).numpy()
 
-        # Per-segment overlap-add state keyed by (item_idx, seg_idx); jobs reference it.
-        seg_state: Dict[Tuple[int, int], dict] = {}
         # Per-item finalized audio: idx -> {'n': int, 'segs': {seg_idx: np.ndarray}, 'audio_path': str}
-        item_out: Dict[int, dict] = {}
-        jobs: List[Tuple[Tuple[int, int], int]] = []
+        # Bookkeeping only (no audio buffers) — safe to build for every to-compute item
+        # up front regardless of dataset size; segments are filled in incrementally by
+        # _finalize_segment as each window below completes.
+        item_out: Dict[int, dict] = {
+            idx: {'n': len(item['vad_segments']), 'segs': {}, 'audio_path': item['audio_path']}
+            for idx, item in to_compute
+        }
 
-        for idx, item in to_compute:
-            segs = item['vad_segments']
-            item_out[idx] = {'n': len(segs), 'segs': {}, 'audio_path': item['audio_path']}
-            for sdx, seg in enumerate(segs):
+        if progress_callback is not None:
+            # Cheap approximate total (no resampling/allocation) so progress stays a
+            # single continuous bar across every window below instead of resetting
+            # once per file (StageTimer._start_determinate closes/replaces the bar on
+            # every call, so set_total must only be called once, up front).
+            total_jobs = sum(
+                self._estimate_num_offsets(seg)
+                for _, item in to_compute
+                for seg in item['vad_segments']
+            )
+            progress_callback.set_total(total_jobs, unit="chunk")
+
+        for window in self._iter_windows(to_compute):
+            seg_state: Dict[Tuple[int, int], dict] = {}
+            jobs: List[Tuple[Tuple[int, int], int]] = []
+            for idx, sdx, seg in window:
                 mixture, total_length, padded = self._prepare_mixture(seg['audio'])
                 key = (idx, sdx)
                 offsets = list(range(0, total_length, step))
@@ -146,42 +178,41 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                 }
                 jobs.extend((key, off) for off in offsets)
 
-        if progress_callback is not None:
-            progress_callback.set_total(len(jobs), unit="chunk")
+            def infer_fn(batch, seg_state=seg_state):
+                parts = []
+                for key, off in batch:
+                    part = seg_state[key]['mixture'][:, off:off + C]
+                    plen = part.shape[-1]
+                    if plen < C:
+                        if plen > C // 2 + 1:
+                            part = nn.functional.pad(part, (0, C - plen), mode='reflect')
+                        else:
+                            part = nn.functional.pad(part, (0, C - plen), mode='constant', value=0)
+                    parts.append(part)
+                batch_t = torch.stack(parts, dim=0).to(self.device)
+                with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
+                    with torch.no_grad():
+                        out = self.model(batch_t)  # (B, 2, C) for the single-stem vocals model
+                out = out.float().cpu().numpy()
+                for bi, (key, off) in enumerate(batch):
+                    st = seg_state[key]
+                    total_length = st['total_length']
+                    length = min(C, total_length - off)
+                    window_arr = base_window.copy()
+                    if off == 0:
+                        window_arr[:fade] = 1.0
+                    elif off + C >= total_length:
+                        window_arr[-fade:] = 1.0
+                    st['result'][:, off:off + length] += out[bi][:, :length] * window_arr[:length]
+                    st['counter'][:, off:off + length] += window_arr[:length]
+                    st['remaining'] -= 1
+                    if st['remaining'] == 0:
+                        self._finalize_segment(key, st, item_out)
+                        del seg_state[key]
 
-        def infer_fn(batch):
-            parts = []
-            for key, off in batch:
-                part = seg_state[key]['mixture'][:, off:off + C]
-                plen = part.shape[-1]
-                if plen < C:
-                    if plen > C // 2 + 1:
-                        part = nn.functional.pad(part, (0, C - plen), mode='reflect')
-                    else:
-                        part = nn.functional.pad(part, (0, C - plen), mode='constant', value=0)
-                parts.append(part)
-            batch_t = torch.stack(parts, dim=0).to(self.device)
-            with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
-                with torch.no_grad():
-                    out = self.model(batch_t)  # (B, 2, C) for the single-stem vocals model
-            out = out.float().cpu().numpy()
-            for bi, (key, off) in enumerate(batch):
-                st = seg_state[key]
-                total_length = st['total_length']
-                length = min(C, total_length - off)
-                window = base_window.copy()
-                if off == 0:
-                    window[:fade] = 1.0
-                elif off + C >= total_length:
-                    window[-fade:] = 1.0
-                st['result'][:, off:off + length] += out[bi][:, :length] * window[:length]
-                st['counter'][:, off:off + length] += window[:length]
-                st['remaining'] -= 1
-                if st['remaining'] == 0:
-                    self._finalize_segment(key, st, item_out)
-                    del seg_state[key]
-
-        run_adaptive_batches(jobs, self._batch_size, infer_fn, reporter=progress_callback)
+            # No order_key: chunks are all the fixed model chunk_size, so batches never
+            # pad and GPU shapes don't grow — input order is fine (see docs/memory_batching_decoupling.md).
+            BatchExecutor(self._batch_size).run(jobs, infer_fn, reporter=progress_callback)
 
         # Assemble per-item results and write debug for freshly computed items.
         computed: Dict[int, List[VadAudioSegment]] = {}
@@ -196,6 +227,34 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             segs_out = cached[idx] if idx in cached else computed[idx]
             result_items.append(self._pack(item, segs_out))
         return result_items
+
+    @staticmethod
+    def _iter_windows(to_compute):
+        """Yield windows of (item_idx, seg_idx, seg) triples, each window sized to
+        bound how many segments' overlap-add buffers run() holds concurrently.
+
+        One file per window, normally; sub-chunked at _MAX_SEGMENTS_PER_WINDOW if a
+        single file alone exceeds it. This is what bounds run()'s peak memory
+        independent of total dataset size — see _MAX_SEGMENTS_PER_WINDOW's docstring.
+        """
+        for idx, item in to_compute:
+            segs = item['vad_segments']
+            for start in range(0, len(segs), _MAX_SEGMENTS_PER_WINDOW):
+                chunk = segs[start:start + _MAX_SEGMENTS_PER_WINDOW]
+                yield [(idx, start + offset, seg) for offset, seg in enumerate(chunk)]
+
+    def _estimate_num_offsets(self, seg) -> int:
+        """Cheap approximate chunk count for a segment, for the progress bar's total
+        only — mirrors _prepare_mixture's resample+pad arithmetic without actually
+        resampling or allocating buffers. May be off by about one chunk vs. the real
+        count (torchaudio's exact resampled length can differ slightly from a naive
+        round()); harmless since only the progress bar consumes this, never buffer
+        sizing (which always uses _prepare_mixture's real, exact total_length).
+        """
+        approx_len = round(len(seg['audio']) * self.model_sample_rate / SAMPLE_RATE)
+        if approx_len > 2 * self._border and self._border > 0:
+            approx_len += 2 * self._border
+        return len(range(0, approx_len, self._step)) if approx_len > 0 else 0
 
     def _prepare_mixture(self, audio: np.ndarray):
         """Resample a 16 kHz mono segment to the model rate, build the stereo mixture,
