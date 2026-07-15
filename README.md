@@ -27,7 +27,14 @@ cd cantocaptions-ai
 uv sync --extra transformers_qwen
 ```
 
-This installs all dependencies plus the recommended ASR backend into an isolated virtual environment and pins exact versions. Torch is pulled from the PyTorch CUDA 12.8 index on Linux and Windows; the CPU build is used on macOS. Bare `uv sync` does **not** install a working ASR backend — see [Optional features](#optional-features) below for the extras you need to choose from.
+This installs all dependencies plus the recommended ASR backend into an isolated virtual environment and pins exact versions. Torch is pulled from the PyTorch CUDA 12.8 index on Linux and Windows; the CPU build is used on macOS. 
+
+Note that bare `uv sync` does **not** install a working ASR backend. You need to pick one explicitly:
+
+```bash
+uv sync --extra transformers_qwen   # ASR via official transformers Qwen3-ASR support (recommended)
+uv sync --extra legacy              # ASR via the older qwen_asr package; mutually exclusive with transformers_qwen
+```
 
 ## Usage
 
@@ -35,11 +42,11 @@ This installs all dependencies plus the recommended ASR backend into an isolated
 uv run cantocaptions_ai audio.wav
 ```
 
-This produces `audio.srt` in the current directory. The first run downloads model weights automatically (~6 GB).
+This produces `audio.srt` in the current directory. Note that the first run will take a while, as it downloads model weights automatically (~6 GB).
 
 ### HuggingFace access token
 
-The VAD model (`pyannote/segmentation`) requires accepting its terms of use on HuggingFace. Pass your token once:
+The VAD model (`pyannote/segmentation`) may require accepting its terms of use on HuggingFace. Pass your token once if necessary:
 
 ```bash
 uv run cantocaptions_ai audio.wav --hf_token hf_...
@@ -47,23 +54,15 @@ uv run cantocaptions_ai audio.wav --hf_token hf_...
 
 ### Custom options
 
-You can update default command line arguments by editing the file `config/default.cfg`. Additionally, you can run using any config file's arguments by using its filename with the `--cfg` option (e.g. `--cfg cpu` to use the `config/cpu.cfg` configuration). Note that if no default config file exists, one will be created on first run.
+You can update default command line arguments by editing the file `config/default.cfg`. Additionally, you can run using any config file's arguments by using its filename with the `--cfg` option (e.g. `--cfg cpu` to use the configuration in `config/cpu.cfg`).
 
+* `--help` - show command line arguments and syntax
 * `-o [DIR_NAME]` - output directory for the SRT file
 * `--input_dir [DIR_NAME]` - run all 
 * `--vocal_isolation_method [OPTION]` - set to "none" for no vocal isolation, or "mbroformer" for full mbroformer vocal isolation
 * `--log_file [FILE_PATH]` - simplify console logging and output full logs to designated file
 * `--debug_dir [DIR_NAME]` - directory for intermediate processed data for debugging purposes
 * `--load_debug_dir [DIR_NAME]` - load previously generated `--debug_dir` data from this directory to skip processing steps (such as VAD, vocal isolation, and transcription)
-
-## Optional features
-
-Bare `uv sync` installs neither ASR backend — pick one explicitly:
-
-```bash
-uv sync --extra transformers_qwen   # ASR via official transformers Qwen3-ASR support (recommended)
-uv sync --extra legacy              # ASR via the older qwen_asr package; mutually exclusive with transformers_qwen
-```
 
 ## Planned Updates
 
