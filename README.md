@@ -53,10 +53,6 @@ Bare `uv sync` installs neither ASR backend — pick one explicitly:
 ```bash
 uv sync --extra transformers_qwen   # ASR via official transformers Qwen3-ASR support (recommended)
 uv sync --extra legacy              # ASR via the older qwen_asr package; mutually exclusive with transformers_qwen
-uv sync --extra ensemble            # faster-whisper ensemble
-uv sync --extra llm                 # LLM corrections (bitsandbytes)
-uv sync --extra diarize             # speaker diarization (Linux only)
-uv sync --extra full                # transformers_qwen + all of the above except legacy
 ```
 
 ## Planned Updates
