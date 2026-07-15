@@ -1,8 +1,14 @@
 # cantocaptions-ai
 
-An end-to-end speech pipeline for generating high-quality, timed written Cantonese (粵文) subtitles. Currently designed to run locally on consumer hardware.
+An end-to-end speech pipeline for generating high-quality, timed written Cantonese (粵文) subtitles. 
 
-*This repository is currently in an early stage of development, and some modules may not yet be fully functional.*
+*This repository is currently in an early stage of development. Please be patient as new features are rolled out.*
+
+## How it Works
+
+This project is modeled after the WhisperX ASR library, and shares some of the same [basic architecture](https://raw.githubusercontent.com/m-bain/whisperX/refs/heads/main/figures/pipeline.png). However, `cantocaptions_ai` uses Alibaba Cloud's [Qwen3-ASR models](https://github.com/QwenLM/Qwen3-ASR) for the transcription step, alvanlii's [wav2vec2-BERT-Cantonese model](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese) for the alignment step, and adds a wide array of subtitling improvements designed specifically for written Cantonese.
+
+This library is currently designed to run locally on consumer hardware. I may implement some optional LLM API usage in the future, but for now the goal is to provide users with fully open access to generate their own Cantonese subtitles.
 
 ## Prerequisites
 
@@ -61,6 +67,7 @@ Current updates planned for the near future:
 
 - [x] Add Cantonese standardization and cleaning scripts (adapted from [rookes/canto-subtitle-cleaner](https://github.com/rookes/canto-subtitle-cleaner))
 - [x] Add [SubER](https://github.com/apptek/SubER) metric calculation compatibility, and use its Levenshtein distance algorithm to parallelize ensemble subs
+- [ ] Add more performant options for vocal isolation
 - [ ] Implement the "retime" feature to accurately run alignment on existing subtitles (IN PROGRESS)
 - [ ] Add an option to use Qwen LLM to do error-correction based on a reference standard Chinese subtitle file (IN PROGRESS)
 - [ ] Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
