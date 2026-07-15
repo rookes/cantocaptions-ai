@@ -6,7 +6,9 @@ An end-to-end speech pipeline for generating high-quality, timed written Cantone
 
 ## How it Works
 
-This project is modeled after the WhisperX ASR library, and shares some of the same [basic architecture](https://raw.githubusercontent.com/m-bain/whisperX/refs/heads/main/figures/pipeline.png). However, `cantocaptions_ai` uses Alibaba Cloud's [Qwen3-ASR models](https://github.com/QwenLM/Qwen3-ASR) for the transcription step, alvanlii's [wav2vec2-BERT-Cantonese model](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese) for the alignment step, and adds a wide array of subtitling improvements designed specifically for written Cantonese.
+You can use this tool via command line to generate a subtitle file (default format: SRT) for a given Cantonese audio/video file.
+
+This project is modeled after the [WhisperX ASR library](https://github.com/m-bain/whisperx), and shares some of the same [basic architecture](https://raw.githubusercontent.com/m-bain/whisperX/refs/heads/main/figures/pipeline.png). However, `cantocaptions_ai` uses Alibaba Cloud's [Qwen3-ASR models](https://github.com/QwenLM/Qwen3-ASR) for the transcription step, alvanlii's [wav2vec2-BERT-Cantonese model](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese) for the alignment step, and adds a wide array of subtitling improvements designed specifically for written Cantonese.
 
 This library is currently designed to run locally on consumer hardware. I may implement some optional LLM API usage in the future, but for now the goal is to provide users with fully open access to generate their own Cantonese subtitles.
 
@@ -44,6 +46,8 @@ uv run cantocaptions_ai audio.wav --hf_token hf_...
 ```
 
 ### Custom options
+
+You can update default command line arguments by editing the file `config/default.cfg`. Additionally, you can run using any config file's arguments by using its filename with the `--cfg` option (e.g. `--cfg cpu` to use the `config/cpu.cfg` configuration). Note that if no default config file exists, one will be created on first run.
 
 * `-o [DIR_NAME]` - output directory for the SRT file
 * `--input_dir [DIR_NAME]` - run all 
