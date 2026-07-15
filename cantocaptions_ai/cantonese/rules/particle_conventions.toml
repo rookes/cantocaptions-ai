@@ -159,7 +159,7 @@ pattern = '啊下'
 replace = '啊吓'
 
 [[rules]]
-pattern = '囉'
+pattern = '囉(?![嗦囌氣音攣柚唆里哩噼囉曼])'
 replace = '囖'
 
 [[rules]]
@@ -327,11 +327,11 @@ pattern = '冇辦法喇'
 replace = '冇辦法啦'
 
 [[rules]]
-pattern = '等陣先喇'
+pattern = '等陣先[喇呀]'
 replace = '等陣先啊'
 
 [[rules]]
-pattern = '等陣喇'
+pattern = '等陣[喇呀]'
 replace = '等陣啊'
 
 [[rules]]
@@ -341,6 +341,10 @@ replace = '住啦'
 [[rules]]
 pattern = '隨你囖'
 replace = '隨你啦'
+
+[[rules]]
+pattern = '我(明[白]?)[啦囖]'
+replace = '我\1喇'
 
 [[rules]]
 pattern = '^噉嘅$'
@@ -355,14 +359,6 @@ pattern = '係噉樣啊(?=$)'
 replace = '係噉樣呀？'
 
 [[rules]]
-pattern = '係噉啊，'
-replace = '係噉呀？'
-
-[[rules]]
-pattern = '係噉啊(?=$)'
-replace = '係噉呀？'
-
-[[rules]]
 pattern = '又係嘅'
 replace = '又係𠸏'
 
@@ -371,8 +367,8 @@ pattern = '咩原來'
 replace = '乜原來'
 
 [[rules]]
-pattern = '原來([^，？$]*?)㗎'
-replace = '原來\1嘎'
+pattern = '原來([^，？$]*?)㗎？'
+replace = '原來\1嘎？'
 
 [[rules]]
 pattern = '喇？'
@@ -389,6 +385,10 @@ replace = '𠻺哩'
 [[rules]]
 pattern = '啊，你$'
 replace = '𠻺哩？'
+
+[[rules]]
+pattern = '呢啊？'
+replace = '呢吓？'
 
 [[rules]]
 pattern = '啦喎'
@@ -421,6 +421,10 @@ replace = '乜原來'
 [[rules]]
 pattern = '^咩([^，？$]*?)㗎咩'
 replace = '乜\1㗎咩'
+
+[[rules]]
+pattern = '[噉咁]咩？'
+replace = '㗎咩？'
 
 [[rules]]
 pattern = '^[何啊]？$'
@@ -479,17 +483,13 @@ pattern = '就得啦'
 replace = '就得喇'
 
 [[rules]]
+pattern = '就好啦'
+replace = '就好喇'
+
+[[rules]]
 pattern = '係啦'
 replace = '係喇'
 
 [[rules]]
-pattern = '飲吓'
-replace = '飲下'
-
-[[rules]]
-pattern = '咪得咯'
-replace = '咪得囖'
-
-[[rules]]
-pattern = '^咪([^，？]*?)咯'
+pattern = '^咪([^，？]*?)[咯啦]'
 replace = '咪\1囖'

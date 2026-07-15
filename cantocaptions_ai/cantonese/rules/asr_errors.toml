@@ -65,10 +65,6 @@ pattern = '喺喺'
 replace = '係喺'
 
 [[rules]]
-pattern = '係係'
-replace = '係喺'
-
-[[rules]]
 pattern = '喺邊到'
 replace = '喺邊度'
 
@@ -527,3 +523,15 @@ replace = '套裝'
 [[rules]]
 pattern = '企頂'
 replace = '企定'
+
+[[rules]]
+pattern = '無理乎'
+replace = '冇你符'
+
+[[rules]]
+pattern = '老網'
+replace = '魯莽'
+
+[[rules]]
+pattern = '碎星'
+replace = '彗星'

@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from cantocaptions_ai.cantonese.acronyms import format_acronyms
 from cantocaptions_ai.cantonese.cleaner import SubtitleCleaner
 from cantocaptions_ai.cantonese.numbers import convert_chinese_numbers
 from cantocaptions_ai.cantonese.questions import is_question, split_segments
@@ -129,6 +130,41 @@ class TestParseFunctions(unittest.TestCase):
         # Legacy code raised IndexError on a 1-char question segment starting 乜
         cleaner = _cleaner()
         cleaner.clean("乜？")
+
+
+# ---------------------------------------------------------------------------
+# acronyms.py
+# ---------------------------------------------------------------------------
+
+class TestFormatAcronyms(unittest.TestCase):
+
+    def test_collapses_internal_dots_and_whitespace(self):
+        self.assertEqual(format_acronyms("AB C.D .  E"), "ABCDE")
+
+    def test_newline_treated_as_whitespace(self):
+        self.assertEqual(format_acronyms("A\nB"), "AB")
+
+    def test_single_capital_untouched(self):
+        self.assertEqual(format_acronyms("我話A好"), "我話A好")
+
+    def test_comma_breaks_acronym_apart(self):
+        self.assertEqual(format_acronyms("A,B"), "A,B")
+
+    def test_chinese_punctuation_breaks_acronym_apart(self):
+        self.assertEqual(format_acronyms("A，B"), "A，B")
+
+    def test_capital_touching_lowercase_excluded(self):
+        self.assertEqual(format_acronyms("我話B Bsitter好可愛"), "我話B Bsitter好可愛")
+
+    def test_capital_separated_by_space_from_lowercase_included(self):
+        self.assertEqual(format_acronyms("我話B B sitter好可愛"), "我話BB sitter好可愛")
+
+    def test_sentence_end_marker_preserved(self):
+        self.assertEqual(format_acronyms("我話A P P. BB話冇錯"), "我話APP. BB話冇錯")
+
+    def test_leading_lowercase_adjacency(self):
+        self.assertEqual(format_acronyms("mrABC"), "mrABC")
+        self.assertEqual(format_acronyms("hi AB"), "hi AB")
 
 
 # ---------------------------------------------------------------------------

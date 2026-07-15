@@ -2,10 +2,14 @@
 #
 #   type = "rules"    applies the ordered regex rules in `file` (same directory)
 #   type = "builtin"  runs a coded step from SubtitleCleaner.BUILTIN_STEPS:
-#                     question_particles, chinese_numbers, linebreak, trim
+#                     acronyms, question_particles, chinese_numbers, linebreak, trim
 #
 # This order mirrors the legacy canto_subtitle_cleaner clean_subtitle() chain and
 # is load-bearing: rules assume the transformations of every step before them.
+
+[[steps]]
+type = "builtin"
+name = "acronyms"
 
 [[steps]]
 type = "rules"

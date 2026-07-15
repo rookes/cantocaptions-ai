@@ -17,6 +17,7 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
+from cantocaptions_ai.cantonese.acronyms import format_acronyms
 from cantocaptions_ai.cantonese.linebreak import linebreak, trim
 from cantocaptions_ai.cantonese.numbers import convert_chinese_numbers
 from cantocaptions_ai.cantonese.questions import clean_question_particles
@@ -32,6 +33,7 @@ class SubtitleCleaner:
     """Applies the configured cleaning steps to a single subtitle line at a time."""
 
     BUILTIN_STEPS = {
+        "acronyms": format_acronyms,
         "question_particles": clean_question_particles,
         "chinese_numbers": convert_chinese_numbers,
         "trim": trim,

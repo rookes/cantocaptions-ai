@@ -11,8 +11,8 @@ pattern = '咁(好[喇啦])'
 replace = '噉\1'
 
 [[rules]]
-pattern = '噉([\u4e00-\u9fff][\u4e00-\u9fff])嘅'
-replace = '咁\1嘅'
+pattern = '咁([都又]?[係得])'
+replace = '噉\1'
 
 [[rules]]
 pattern = '噉(認真|緊張|困難|容易|百厭)'
@@ -25,6 +25,10 @@ replace = '\1咁'
 [[rules]]
 pattern = '噉上下'
 replace = '咁上下'
+
+[[rules]]
+pattern = '不停咁'
+replace = '不停噉'
 
 [[rules]]
 pattern = '(?<![譯原])著(?![述名作])'
@@ -57,6 +61,10 @@ replace = '下'
 [[rules]]
 pattern = '(?<!，)之不過(?!，)'
 replace = '之不過，'
+
+[[rules]]
+pattern = '過分'
+replace = '過份'
 
 [[rules]]
 pattern = '[姐唧啫]係'
