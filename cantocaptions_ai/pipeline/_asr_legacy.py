@@ -13,11 +13,14 @@ from cantocaptions_ai.pipeline.asr import QwenPipeline, _normalize_language
 from cantocaptions_ai.utils.audio import resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
 from cantocaptions_ai.utils.model_utils import partition_by_cache, ensure_hf_model_downloaded
-from cantocaptions_ai.cantonese.text import normalize_segment_text
+from cantocaptions_ai.cantonese.text import DEFAULT_NORMALIZATION, TextNormalization, normalize_segment_text
+from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
 
+# Legacy uses the non-`-hf` repos; the model *id* stays backend-specific here, while
+# post-ASR text normalization is resolved from the shared model profile in load_model_legacy.
 _MODEL_IDS = {
     "Qwen3-ASR":      "Qwen/Qwen3-ASR-1.7B",
     "Qwen3-ASR-0.6B": "Qwen/Qwen3-ASR-0.6B",
@@ -31,9 +34,10 @@ class QwenPipelineLegacy(QwenPipeline):
     process() passes all VAD segments in a single call.
     """
 
-    def __init__(self, model, language: str = "yue"):
+    def __init__(self, model, language: str = "yue", normalization: TextNormalization = DEFAULT_NORMALIZATION):
         self._model = model
         self._language = _normalize_language(language or "yue")
+        self.normalization = normalization
 
     def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
         """Transcribe all files in a single Qwen3ASRModel.transcribe call.
@@ -67,7 +71,7 @@ class QwenPipelineLegacy(QwenPipeline):
                 chunk = transcriptions[pos:pos + len(segs)]
                 pos += len(segs)
                 segments: List[SingleSegment] = [
-                    normalize_segment_text({'text': t.text, 'start': s['start'], 'end': s['end']})
+                    normalize_segment_text({'text': t.text, 'start': s['start'], 'end': s['end']}, self.normalization)
                     for s, t in zip(segs, chunk)
                 ]
                 result: TranscriptionResult = {"segments": segments, "language": language}
@@ -104,7 +108,7 @@ class QwenPipelineLegacy(QwenPipeline):
                 'text': t.text,
                 'start': vad_seg['start'],
                 'end': vad_seg['end'],
-            }))
+            }, self.normalization))
 
         if progress_callback is not None:
             progress_callback.set_total(len(input), unit="seg")
@@ -128,6 +132,7 @@ def load_model_legacy(
 ) -> QwenPipelineLegacy:
     from qwen_asr import Qwen3ASRModel
 
+    profile = get_model_profile(model_name)
     model_id = _MODEL_IDS.get(model_name, model_name)
 
     try:
@@ -152,4 +157,4 @@ def load_model_legacy(
         attn_implementation=attn_implementation
     )
 
-    return QwenPipelineLegacy(model=hf_model, language=language)
+    return QwenPipelineLegacy(model=hf_model, language=language, normalization=profile.normalization)

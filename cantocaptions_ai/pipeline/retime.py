@@ -5,7 +5,7 @@ from typing import List
 
 import torch
 
-from cantocaptions_ai.cantonese.text import SPLIT_CHARS
+from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION
 from cantocaptions_ai.pipeline.alignment import (
     _preprocess_segment,
     compute_vad_emissions,
@@ -50,8 +50,9 @@ def _text_to_tokens(text: str, model_lang: str, model_dictionary: dict, blank_id
     spacing token (blank_id), unknown chars are dropped.
     """
     seg_data = _preprocess_segment(text, model_lang, model_dictionary)
+    split_chars = DEFAULT_PUNCTUATION.split_chars
     tokens = [
-        model_dictionary[c] if c not in SPLIT_CHARS else blank_id
+        model_dictionary[c] if c not in split_chars else blank_id
         for c in seg_data["clean_char"]
     ]
     return tokens

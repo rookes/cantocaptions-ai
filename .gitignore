@@ -227,12 +227,15 @@ Claude.md
 
 # Log files
 *.log
-temp/
 
-# Subtitle/Audio/Video files
-*.srt
-*.wav
-*.mp4
+# Loose test files
+/*.mp4
+/*.srt
+/*.wav
+
+# Informal test directories
+temp/
+dump/
 test/
 
 # Local per-machine CLI defaults (auto-generated on first run). Named

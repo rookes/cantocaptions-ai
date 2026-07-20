@@ -303,6 +303,7 @@ def load_vocal_isolation(
     batch_size: Optional[int] = None,
     compute_type: str = "float32",
     vram_checks: bool = True,
+    local_files_only: bool = False,
 ) -> VocalIsolationProcessor:
     """Load a vocal isolation model and return a processor.
 
@@ -336,13 +337,14 @@ def load_vocal_isolation(
     # Download checkpoint from HuggingFace (cached after first download)
     logger.info("Loading vocal isolation model (MelBandRoformer)...")
     try:
-        ensure_hf_file_downloaded(_HF_REPO_ID, _HF_FILENAME, cache_dir=model_dir)
+        ensure_hf_file_downloaded(_HF_REPO_ID, _HF_FILENAME, cache_dir=model_dir, local_files_only=local_files_only)
     except Exception as e:
         logger.warning("Could not download %r: %s — using cached version if available.", _HF_FILENAME, e)
     checkpoint_path = hf_hub_download(
         repo_id=_HF_REPO_ID,
         filename=_HF_FILENAME,
         cache_dir=model_dir,
+        local_files_only=local_files_only,
     )
     torch_model.load_state_dict(
         torch.load(checkpoint_path, map_location=torch.device("cpu"))

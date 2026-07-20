@@ -1,7 +1,9 @@
 import gc
+import os
 import torch
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from functools import lru_cache
 from typing import Any, Callable, Dict, Generator, Generic, List, Optional, Tuple, TypeVar
 
 from cantocaptions_ai.utils.schema import ProgressCallback
@@ -261,8 +263,12 @@ class PipelineStage(ABC, Generic[InputT, OutputT]):
 
 @contextmanager
 def model_scope(load_fn: Callable[..., _ModelT], *args, **kwargs) -> Generator[_ModelT, None, None]:
-    """Load a model, yield it for use, then delete it and free CUDA memory."""
-    model = load_fn(*args, **kwargs)
+    """Load a model, yield it for use, then delete it and free CUDA memory.
+
+    The load goes through load_with_offline_fallback so a cached model still loads
+    when the machine is offline (the hub revision check is retried against the cache).
+    """
+    model = load_with_offline_fallback(load_fn, *args, **kwargs)
     try:
         yield model
     finally:
@@ -499,3 +505,108 @@ def ensure_hf_file_downloaded(repo_id: str, filename: str, cache_dir=None, local
     logger.info("Downloading %r from HuggingFace Hub", f"{repo_id}/{filename}")
     hf_hub_download(repo_id=repo_id, filename=filename, cache_dir=cache_dir)
     logger.info("Download complete: %r", f"{repo_id}/{filename}")
+
+
+# ---------------------------------------------------------------------------
+# Offline fallback: try online, fall back to the local cache on a network error
+# ---------------------------------------------------------------------------
+
+# Substrings that identify transformers' generic OSError as a connectivity failure
+# (it wraps offline/connection problems in a plain OSError rather than a typed hub
+# error). Matched against str(exc) in load_with_offline_fallback — we deliberately
+# do NOT widen the caught tuple to bare OSError, which would also swallow genuinely
+# missing files, permission errors, etc.
+_OFFLINE_OSERROR_HINTS = (
+    "couldn't connect",
+    "can't load",
+    "offline",
+    "connectionerror",
+    "failed to connect",
+    "max retries exceeded",
+)
+
+
+@lru_cache(maxsize=1)
+def _offline_error_types() -> Tuple[type, ...]:
+    """Exception types that mean "the HuggingFace hub is unreachable".
+
+    Built lazily and cached: the hub/requests modules are only imported the first
+    time a fallback might be needed, and names are pulled defensively with getattr
+    so a version that renamed/removed one never breaks import here.
+    """
+    types: List[type] = []
+    try:
+        from huggingface_hub import errors as _hf_errors
+        for name in ("OfflineModeIsEnabled", "LocalEntryNotFoundError"):
+            exc = getattr(_hf_errors, name, None)
+            if isinstance(exc, type):
+                types.append(exc)
+    except Exception:  # pragma: no cover - huggingface_hub always present in practice
+        pass
+    try:
+        from requests import exceptions as _req_exc
+        for name in ("ConnectionError", "Timeout"):
+            exc = getattr(_req_exc, name, None)
+            if isinstance(exc, type):
+                types.append(exc)
+    except Exception:  # pragma: no cover - requests is a hub transitive dep
+        pass
+    return tuple(types)
+
+
+def _looks_offline(exc: BaseException) -> bool:
+    """True if *exc* indicates a connectivity failure we can retry against the cache."""
+    if isinstance(exc, _offline_error_types()):
+        return True
+    # transformers wraps connectivity problems in a plain OSError.
+    if isinstance(exc, OSError):
+        msg = str(exc).lower()
+        return any(hint in msg for hint in _OFFLINE_OSERROR_HINTS)
+    return False
+
+
+def enable_hf_offline() -> None:
+    """Put the process into HuggingFace offline mode, idempotently.
+
+    Sets the HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE env vars and, because both
+    libraries snapshot these into module constants at import time, also mutates the
+    already-imported huggingface_hub constant so the change takes effect mid-run.
+    Best-effort: any failure here is swallowed (the caller still retries with an
+    explicit local_files_only flag).
+    """
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        import huggingface_hub.constants as _hf_const
+        _hf_const.HF_HUB_OFFLINE = True
+    except Exception:
+        pass
+
+
+def load_with_offline_fallback(load_fn: Callable[..., _ModelT], *args, **kwargs) -> _ModelT:
+    """Call ``load_fn(*args, **kwargs)``; on a network/offline error, retry from cache.
+
+    The first attempt runs online exactly as before. If it fails because the hub is
+    unreachable, this switches the whole process into offline mode (see
+    ``enable_hf_offline``) and retries once — so every later stage's first attempt
+    already resolves to the local cache instead of paying another failed round-trip.
+    When ``load_fn`` exposes an explicit offline flag (``local_files_only`` or
+    ``model_cache_only``) it is forced True on the retry, so the redundant revision
+    check is skipped rather than merely disabled globally.
+
+    If the model is genuinely absent from the cache, the retry re-raises a clean
+    local error instead of an opaque network traceback.
+    """
+    try:
+        return load_fn(*args, **kwargs)
+    except Exception as e:
+        if not _looks_offline(e):
+            raise
+        logger.warning(
+            "HuggingFace hub unreachable (%s); retrying from local cache.", e
+        )
+        enable_hf_offline()
+        for name in ("local_files_only", "model_cache_only"):
+            if name in kwargs:
+                kwargs[name] = True
+        return load_fn(*args, **kwargs)

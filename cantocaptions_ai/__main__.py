@@ -5,6 +5,7 @@ import platform
 
 from cantocaptions_ai.pipeline.cli_config import ConfigAwareHelpFormatter, resolve_pipeline_args
 from cantocaptions_ai.pipeline.config import PipelineConfig
+from cantocaptions_ai.pipeline.model_profiles import MODEL_PROFILES
 from cantocaptions_ai.utils.output import (LANGUAGES, TO_LANGUAGE_CODE,
                             optional_int, str2bool)
 from cantocaptions_ai.utils.log_utils import setup_logging, get_logger
@@ -61,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_grp.add_argument("--cfg", type=str, default=argparse.SUPPRESS, metavar="NAME", help="load config/NAME.cfg instead of the auto-created config/default.cfg (see config/cpu.cfg for a commented example); its values act as a layer beneath stage-preset and explicit CLI flags")
 
     model_grp = parser.add_argument_group("model")
-    model_grp.add_argument("--model", default=argparse.SUPPRESS, choices=["Qwen3-ASR", "Qwen3-ASR-0.6B"], help="name of the model to use" "Qwen3-ASR")
+    model_grp.add_argument("--model", default=argparse.SUPPRESS, choices=list(MODEL_PROFILES.keys()), help="name of the ASR model to use (see pipeline/model_profiles.py)")
     model_grp.add_argument("--model_cache_only", type=str2bool, default=argparse.SUPPRESS, help="If True, will not attempt to download models, instead using cached models from --model_dir")
     model_grp.add_argument("--model_dir", type=str, default=argparse.SUPPRESS, help="the path to save/load model files; if unset, defers to huggingface_hub's own cache resolution (~/.cache/huggingface/hub, or $HF_HOME/$XDG_CACHE_HOME if set)")
 

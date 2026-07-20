@@ -11,8 +11,8 @@ from cantocaptions_ai.utils.schema import AlignedTranscriptionResult, Processing
 from typing import Callable, List, Optional
 from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer
 from cantocaptions_ai.utils.log_utils import StageTimer, TranscriptionSummary, get_logger
-from cantocaptions_ai.utils.model_utils import model_scope, flush_vram, vram_stats
-from cantocaptions_ai.cantonese.text import is_mergeable, is_removable
+from cantocaptions_ai.utils.model_utils import model_scope, flush_vram, vram_stats, load_with_offline_fallback
+from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION, is_mergeable, is_removable
 from cantocaptions_ai.utils.debug import _debug_stage_exists, write_precleaning_debug
 from cantocaptions_ai.pipeline.vad import VadProcessor
 
@@ -56,6 +56,8 @@ def _run_alignment(
     batch_size: int,
     progress_callback: ProgressCallback = None,
     vram_checks: bool = True,
+    spotchecks=None,
+    punctuation=DEFAULT_PUNCTUATION,
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.alignment import align
     if progress_callback is not None:
@@ -80,6 +82,8 @@ def _run_alignment(
                 batch_size=batch_size,
                 progress_callback=progress_callback,
                 vram_checks=vram_checks,
+                spotchecks=spotchecks,
+                punctuation=punctuation,
             )
             aligned_result['language'] = result['language']
         else:
@@ -117,7 +121,9 @@ def _run_diarization(
     from cantocaptions_ai.pipeline.diarize import DiarizationPipeline, assign_word_speakers
     logger.info("Performing diarization...")
     logger.info(f"Using model: {diarize_model_name}")
-    diarize_model = DiarizationPipeline(model_name=diarize_model_name, token=hf_token, device=device, cache_dir=model_dir)
+    diarize_model = load_with_offline_fallback(
+        DiarizationPipeline, model_name=diarize_model_name, token=hf_token, device=device, cache_dir=model_dir
+    )
     if load_complete_callback:
         load_complete_callback()
 
@@ -151,7 +157,9 @@ def _run_speaker_verification(
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.speaker_verification import SpeakerVerificationPipeline
     logger.info("Performing speaker verification...")
-    speaker_verification_model = SpeakerVerificationPipeline(device=device, cache_dir=model_dir)
+    speaker_verification_model = load_with_offline_fallback(
+        SpeakerVerificationPipeline, device=device, cache_dir=model_dir
+    )
     if load_complete_callback:
         load_complete_callback()
 
@@ -216,6 +224,7 @@ def _merge_and_write(
     writer_args: dict,
     cleaner=None,
     debug_dir: Optional[str] = None,
+    punctuation=DEFAULT_PUNCTUATION,
 ) -> None:
     for item in items:
         result = item['result']
@@ -237,7 +246,7 @@ def _merge_and_write(
             prev_text = prev_segment["text"]
             prev_end = prev_segment["end"]
 
-            if start - prev_end <= align_merge_distance - align_padding and is_mergeable(prev_text, text):
+            if start - prev_end <= align_merge_distance - align_padding and is_mergeable(prev_text, text, punctuation):
                 new_seg = merge_segments(prev_segment, segment)
                 new_segments.pop()
                 new_segments.append(new_seg)
@@ -277,6 +286,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         parser: argparse.ArgumentParser object.
     """
     from cantocaptions_ai.pipeline.config import PipelineConfig
+    from cantocaptions_ai.pipeline.model_profiles import get_model_profile
     from huggingface_hub.utils.tqdm import disable_progress_bars
 
     # HF Hub's own tqdm download bars race StageTimer's spinner over the same
@@ -312,6 +322,12 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
 
     align_language = cfg.language if cfg.language is not None else "yue"
     task: str = "transcribe"
+
+    # The ASR model's profile drives the downstream path: post-ASR text normalization
+    # (applied inside the ASR backend), the alignment particle spot-checks, and the
+    # punctuation set used for sentence splitting / line merging. Unregistered models get
+    # an all-default (no-op) profile. See pipeline/model_profiles.py.
+    profile = get_model_profile(cfg.model)
 
     qwen_threads = torch.get_num_threads()
     if cfg.threads > 0:
@@ -432,13 +448,15 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     if need_vocal_isolation:
         with StageTimer("Vocal isolation", summary) as stage:
             from cantocaptions_ai.pipeline.vocal_isolation import load_vocal_isolation
-            vocal_isolation_processor = load_vocal_isolation(
+            vocal_isolation_processor = load_with_offline_fallback(
+                load_vocal_isolation,
                 model_name=cfg.vocal_isolation_method,
                 device=cfg.device,
                 device_index=cfg.device_index,
                 batch_size=cfg.vocal_isolation_batch_size,
                 compute_type=cfg.vocal_isolation_compute_type,
                 vram_checks=cfg.vram_checks,
+                local_files_only=cfg.model_cache_only,
             )
             stage.mark_inference_start()
             items = vocal_isolation_processor.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
@@ -455,8 +473,11 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         # Retime mode: skip ASR entirely; use the alignment model for both search and fine alignment.
         with StageTimer("Subtitle retiming + alignment", summary) as stage:
             from cantocaptions_ai.pipeline.alignment import load_align_model, load_bert_processor
-            bert_processor = load_bert_processor(cfg.model_dir, cfg.model_cache_only)
-            align_model, align_metadata = load_align_model(
+            bert_processor = load_with_offline_fallback(
+                load_bert_processor, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only
+            )
+            align_model, align_metadata = load_with_offline_fallback(
+                load_align_model,
                 align_language, cfg.device, cfg.device_index,
                 model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
                 compute_type=cfg.align_compute_type,
@@ -475,6 +496,8 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     cfg.return_char_alignments, cfg.print_progress, cfg.align_batch_size,
                     progress_callback=stage.reporter,
                     vram_checks=cfg.vram_checks,
+                    spotchecks=profile.spotchecks,
+                    punctuation=profile.punctuation,
                 )
             else:
                 items = _extract_timestamps(items)
@@ -576,8 +599,11 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         if not cfg.no_align:
             with StageTimer("Alignment", summary) as stage:
                 from cantocaptions_ai.pipeline.alignment import load_align_model, load_bert_processor
-                bert_processor = load_bert_processor(cfg.model_dir, cfg.model_cache_only)
-                align_model, align_metadata = load_align_model(
+                bert_processor = load_with_offline_fallback(
+                    load_bert_processor, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only
+                )
+                align_model, align_metadata = load_with_offline_fallback(
+                    load_align_model,
                     align_language, cfg.device, cfg.device_index,
                     model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
                     compute_type=cfg.align_compute_type,
@@ -590,6 +616,8 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     cfg.return_char_alignments, cfg.print_progress, cfg.align_batch_size,
                     progress_callback=stage.reporter,
                     vram_checks=cfg.vram_checks,
+                    spotchecks=profile.spotchecks,
+                    punctuation=profile.punctuation,
                 )
             del align_model, bert_processor
             flush_vram()
@@ -622,7 +650,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     # Write
     _merge_and_write(
         items, writer, align_language, cfg.align_merge_distance, cfg.align_padding, writer_args,
-        cleaner=cleaner, debug_dir=cfg.debug_dir,
+        cleaner=cleaner, debug_dir=cfg.debug_dir, punctuation=profile.punctuation,
     )
 
     summary.print_summary(process_elapsed=time.perf_counter() - process_start)

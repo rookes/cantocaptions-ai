@@ -5,7 +5,7 @@ C. Max Bain
 from dataclasses import dataclass
 import math
 import time
-from typing import Iterable, Optional, Union, List, Tuple
+from typing import Iterable, Mapping, Optional, Union, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,7 +23,7 @@ from cantocaptions_ai.utils.schema import (
     VadAudioSegment,
     interpolate_nans,
 )
-from cantocaptions_ai.cantonese.text import SPLIT_CHARS, get_particle_candidates
+from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION, PunctuationConfig, SpotCheck
 
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.output import LANGUAGES_WITHOUT_SPACES
@@ -258,18 +258,10 @@ def _get_blank_id(model_dictionary: dict) -> int:
     return next((code for char, code in model_dictionary.items() if char in ('[pad]', '<pad>')), 0)
 
 
-def _get_sentence_spans(text: str, model_lang: str) -> List[Tuple[int, int]]:
+def _get_sentence_spans(text: str, model_lang: str, punctuation: PunctuationConfig) -> List[Tuple[int, int]]:
     """Split text into sentence span tuples using language-appropriate tokenization."""
     if model_lang in ['yue', 'zh']:
-        split_chars = SPLIT_CHARS
-        split_indexes = [i for i, char in enumerate(text) if char in split_chars]
-        spans, cur_start = [], 0
-        for val in split_indexes:
-            spans.append((cur_start, val))
-            cur_start = val + 1
-        if cur_start <= len(text):
-            spans.append((cur_start, len(text)))
-        return spans
+        return punctuation.sentence_spans(text)
 
     import nltk
     from nltk.data import load as nltk_load
@@ -282,7 +274,10 @@ def _get_sentence_spans(text: str, model_lang: str) -> List[Tuple[int, int]]:
     return list(sentence_splitter.span_tokenize(text))
 
 
-def _preprocess_segment(text: str, model_lang: str, model_dictionary: dict) -> SegmentData:
+def _preprocess_segment(
+    text: str, model_lang: str, model_dictionary: dict,
+    punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
+) -> SegmentData:
     """Clean text and produce per-segment alignment metadata."""
     num_leading = len(text) - len(text.lstrip())
     num_trailing = len(text) - len(text.rstrip())
@@ -296,7 +291,7 @@ def _preprocess_segment(text: str, model_lang: str, model_dictionary: dict) -> S
             char_ = char_.replace(" ", "|")
         if cdx < num_leading or cdx > len(text) - num_trailing - 1:
             continue
-        if char_ in model_dictionary or char_ in SPLIT_CHARS:
+        if char_ in model_dictionary or char_ in punctuation.split_chars:
             clean_char.append(char_)
             clean_cdx.append(cdx)
 
@@ -309,20 +304,21 @@ def _preprocess_segment(text: str, model_lang: str, model_dictionary: dict) -> S
         "clean_char": clean_char,
         "clean_cdx": clean_cdx,
         "clean_wdx": clean_wdx,
-        "sentence_spans": _get_sentence_spans(text, model_lang),
+        "sentence_spans": _get_sentence_spans(text, model_lang, punctuation),
     }
 
 def _preprocess_transcript(
     transcript: List[SingleSegment],
     model_lang: str,
     model_dictionary: dict,
+    punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
     print_progress: bool = False,
 ) -> dict:
     """First pass: build SegmentData for every transcript segment."""
     total = len(transcript)
     segment_data = {}
     for sdx, segment in enumerate(transcript):
-        segment_data[sdx] = _preprocess_segment(segment["text"], model_lang, model_dictionary)
+        segment_data[sdx] = _preprocess_segment(segment["text"], model_lang, model_dictionary, punctuation)
     return segment_data
 
 
@@ -549,6 +545,8 @@ def _align_segment(
     t2: float,
     interpolate_method: str,
     return_char_alignments: bool,
+    spotchecks: Mapping[str, SpotCheck],
+    punctuation: PunctuationConfig,
 ) -> List[dict]:
     """Align one transcript segment against its emission, returning subsegment dicts."""
     text = segment["text"]
@@ -567,45 +565,52 @@ def _align_segment(
     text_clean = "".join(seg_data["clean_char"])
 
     # Replace punctuation with spacing token to better align breaks at sentence ends
-    tokens = [model_dictionary[c] if c not in SPLIT_CHARS else spacing_char_id for c in text_clean]
+    split_chars = punctuation.split_chars
+    tokens = [model_dictionary[c] if c not in split_chars else spacing_char_id for c in text_clean]
 
     trellis = get_trellis(emission, tokens, blank_id)
     path = backtrack(trellis, emission, tokens, blank_id)
 
-    logger.debug("Checking particle candidates for text: '%s'.", text_clean)
+    # Spot checks: for each char with an interchangeable candidate set (per the model's
+    # profile), pick the candidate whose acoustic log-prob at this char's aligned frame is
+    # highest, plus any per-candidate bias weight. Empty `spotchecks` (the default for a
+    # model whose output already uses the intended particles) makes this loop a no-op.
+    if spotchecks and path is not None:
+        logger.debug("Checking particle candidates for text: '%s'.", text_clean)
 
-    lowercase_text = text.lower()
-    t_i = 0
-    for p_i, p in enumerate(text_clean):
-        # Use t_i to mark the position in the base "text" var. Keep this updated to avoid conflicts.
-        # TODO: roll text, text_clean, and seg_data["clean_char"] all up into a single dynamic type
-        t_i = t_i + lowercase_text[t_i:].index(p) + 1
+        lowercase_text = text.lower()
+        t_i = 0
+        for p_i, p in enumerate(text_clean):
+            # Use t_i to mark the position in the base "text" var. Keep this updated to avoid conflicts.
+            # TODO: roll text, text_clean, and seg_data["clean_char"] all up into a single dynamic type
+            t_i = t_i + lowercase_text[t_i:].index(p) + 1
 
-        candidates = get_particle_candidates(p)
-        if len(candidates) <= 1:
-            continue
+            sc = spotchecks.get(p)
+            if sc is None or len(sc.candidates) <= 1:
+                continue
 
-        path_i = min(x.time_index for x in path if x.token_index == p_i)
+            path_i = min(x.time_index for x in path if x.token_index == p_i)
 
-        max_score = -math.inf
-        best_candidate = None
-        for c in candidates:
-            c_token = model_dictionary[c]
-            score = emission[path_i, c_token].item()
+            max_score = -math.inf
+            best_candidate = None
+            for c in sc.candidates:
+                c_token = model_dictionary.get(c)
+                if c_token is None:
+                    logger.warning("Spot-check candidate %r absent from align model vocab; skipping.", c)
+                    continue
+                score = emission[path_i, c_token].item() + sc.weights.get(c, 0.0)
+                if score > max_score:
+                    best_candidate = c
+                    max_score = score
 
-            # TODO: Yeah, I'll fix it later
-            if c == '噉':
-                score += 0.8
+            if best_candidate is None:
+                continue
 
-            if score > max_score:
-                best_candidate = c
-                max_score = score
+            if best_candidate != p:
+                text_clean = text_clean[:p_i] + best_candidate + text_clean[p_i + 1:]
+                text = text[:t_i - 1] + best_candidate + text[t_i:] # messy :(
 
-        if best_candidate != p:
-            text_clean = text_clean[:p_i] + best_candidate + text_clean[p_i + 1:]
-            text = text[:t_i - 1] + best_candidate + text[t_i:] # messy :(
-
-        logger.debug("Best candidate for char '%d' ('%s'): '%s' (score %.3f).", p_i, p, best_candidate, max_score)
+            logger.debug("Best candidate for char '%d' ('%s'): '%s' (score %.3f).", p_i, p, best_candidate, max_score)
 
     seg_data["clean_char"] = [c for c in text_clean]
 
@@ -652,7 +657,7 @@ def _align_segment(
         # Sentences ending on punctuation get their end time released (extended) later,
         # in align(), once the position relative to *all* subsegments in the file
         # (not just this transcript segment) is known — see release_from below.
-        release_from = last_char["start"] if last_char["char"] in SPLIT_CHARS else None
+        release_from = last_char["start"] if last_char["char"] in split_chars else None
 
         sentence_words = []
         for word_idx in curr_chars["word-idx"].unique():
@@ -811,8 +816,16 @@ def align(
     progress_callback: ProgressCallback = None,
     batch_size: int = 4,
     vram_checks: bool = True,
+    spotchecks: Optional[Mapping[str, SpotCheck]] = None,
+    punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
 ) -> AlignedTranscriptionResult:
-    """Align phoneme recognition predictions to known transcription."""
+    """Align phoneme recognition predictions to known transcription.
+
+    ``spotchecks`` and ``punctuation`` come from the ASR model's profile (see
+    ``pipeline/model_profiles.py``); their defaults (no spot checks, standard
+    punctuation) keep alignment independent of any specific model.
+    """
+    spotchecks = spotchecks or {}
 
     # --- Audio setup ---
     vad_segments: Optional[List[VadAudioSegment]] = None
@@ -842,7 +855,7 @@ def align(
 
     # --- Preprocess transcript ---
     transcript = list(transcript)
-    segment_data = _preprocess_transcript(transcript, model_lang, model_dictionary, print_progress)
+    segment_data = _preprocess_transcript(transcript, model_lang, model_dictionary, punctuation, print_progress)
 
     # --- Align each segment ---
     aligned_segments: List[SingleAlignedSegment] = []
@@ -877,6 +890,7 @@ def align(
             segment, segment_data[sdx], emission,
             model_dictionary, model_lang, blank_id, spacing_char_id,
             t1, t2, interpolate_method, return_char_alignments,
+            spotchecks, punctuation,
         )
         aligned_segments += subsegments
 

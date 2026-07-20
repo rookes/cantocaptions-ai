@@ -18,15 +18,11 @@ from cantocaptions_ai.utils.model_utils import (
     ensure_hf_model_downloaded,
     guard_model_load,
 )
-from cantocaptions_ai.cantonese.text import normalize_segment_text
+from cantocaptions_ai.cantonese.text import DEFAULT_NORMALIZATION, TextNormalization, normalize_segment_text
+from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
-
-_MODEL_IDS = {
-    "Qwen3-ASR":      "Qwen/Qwen3-ASR-1.7B-hf",
-    "Qwen3-ASR-0.6B": "Qwen/Qwen3-ASR-0.6B-hf",
-}
 
 
 def _compile_and_warmup(model, processor, language: str, batch_size: Optional[int]) -> None:
@@ -100,7 +96,9 @@ def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device, poli
 class QwenPipelineNative(QwenPipeline):
     """Native backend: uses AutoModelForMultimodalLM (Qwen3ASRForConditionalGeneration).
 
-    Loads Qwen/Qwen3-ASR-1.7B-hf or -0.6B-hf via transformers' official qwen3_asr support.
+    Loads a Qwen3-ASR checkpoint (repo id / local path resolved from the model profile)
+    via transformers' official qwen3_asr support, and applies the profile's post-ASR
+    ``normalization`` to each decoded segment.
     """
 
     def __init__(
@@ -114,9 +112,11 @@ class QwenPipelineNative(QwenPipeline):
         print_progress: bool = False,
         verbose: bool = False,
         vram_checks: bool = True,
+        normalization: TextNormalization = DEFAULT_NORMALIZATION,
     ):
         self.model = model
         self.processor = processor
+        self.normalization = normalization
         if isinstance(device, torch.device):
             self.device = device
         elif isinstance(device, str):
@@ -172,7 +172,7 @@ class QwenPipelineNative(QwenPipeline):
         computed = {}
         for idx, buf in buffers.items():
             segments: List[SingleSegment] = [
-                normalize_segment_text({'text': text or '', 'start': seg['start'], 'end': seg['end']})
+                normalize_segment_text({'text': text or '', 'start': seg['start'], 'end': seg['end']}, self.normalization)
                 for seg, text in zip(buf['segs'], buf['texts'])
             ]
             result: TranscriptionResult = {"segments": segments, "language": language}
@@ -211,7 +211,7 @@ class QwenPipelineNative(QwenPipeline):
         ).run(jobs, infer_fn, reporter=progress_callback)
 
         segments: List[SingleSegment] = [
-            normalize_segment_text({'text': texts[i] or '', 'start': input[i]['start'], 'end': input[i]['end']})
+            normalize_segment_text({'text': texts[i] or '', 'start': input[i]['start'], 'end': input[i]['end']}, self.normalization)
             for i in range(len(input))
         ]
         return {"segments": segments, "language": language}
@@ -273,7 +273,8 @@ def load_model_native(
 ) -> QwenPipelineNative:
     from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-    model_id = _MODEL_IDS.get(model_name, model_name)
+    profile = get_model_profile(model_name)
+    model_id = profile.hf_id
 
     try:
         ensure_hf_model_downloaded(model_id, cache_dir=download_root, local_files_only=local_files_only)
@@ -337,4 +338,5 @@ def load_model_native(
         print_progress=print_progress,
         verbose=verbose,
         vram_checks=vram_checks,
+        normalization=profile.normalization,
     )
