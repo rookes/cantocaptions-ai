@@ -529,9 +529,29 @@ pattern = '無理乎'
 replace = '冇你符'
 
 [[rules]]
+pattern = '冇([謂罪恥])'
+replace = '無\1'
+
+[[rules]]
+pattern = '冇情白事'
+replace = '無情白事'
+
+[[rules]]
+pattern = '紅波波'
+replace = '紅卜卜'
+
+[[rules]]
 pattern = '老網'
 replace = '魯莽'
 
 [[rules]]
 pattern = '碎星'
 replace = '彗星'
+
+[[rules]]
+pattern = '左頭左勢'
+replace = '阻頭阻勢'
+
+[[rules]]
+pattern = '大爛林頭'
+replace = '大難臨頭'

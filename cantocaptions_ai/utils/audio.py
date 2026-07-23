@@ -53,18 +53,50 @@ def probe_audio_tracks(file: str) -> List[dict]:
         return []
 
 
-def select_cantonese_track(streams: List[dict]) -> int:
-    """Return the 0-based audio stream index for the first Cantonese track.
+# Language codes and title keywords that identify a Chinese-language audio
+# track (Cantonese, Mandarin, or an unspecified Chinese variant). Used as a
+# fallback when no explicit Cantonese track is present, so a clearly-Chinese
+# stream is preferred over ffmpeg's default (which is often English/Japanese).
+_CHINESE_LANG_CODES = {
+    "yue", "zh", "zho", "chi", "cmn", "nan", "hak", "wuu",
+    "zh-hans", "zh-hant", "zh-hk", "zh-tw", "zh-cn", "zh-sg",
+}
+_CHINESE_TITLE_KEYWORDS = (
+    "chinese", "cantonese", "mandarin", "putonghua", "guoyu", "huayu",
+    "中文", "汉语", "漢語", "华语", "華語", "国语", "國語",
+    "普通话", "普通話", "粤", "粵", "粵語", "粤语", "廣東話", "广东话",
+)
 
-    Checks each stream's tags for ``language == "yue"`` or a title containing
-    ``"cantonese"`` (case-insensitive). Returns 0 if no matching track is found,
-    which causes ffmpeg to use its default stream-selection heuristic.
+
+def _is_chinese_track(stream: dict) -> bool:
+    tags = stream.get("tags", {})
+    lang = (tags.get("language") or "").lower()
+    if lang in _CHINESE_LANG_CODES:
+        return True
+    title = (tags.get("title") or "").lower()
+    return any(k in title for k in _CHINESE_TITLE_KEYWORDS)
+
+
+def select_cantonese_track(streams: List[dict]) -> int:
+    """Return the 0-based audio stream index for the best Chinese audio track.
+
+    Preference order:
+      1. An explicit Cantonese track (``language == "yue"`` or a title
+         containing ``"cantonese"``).
+      2. Otherwise the first Chinese track of any kind (Mandarin / generic
+         ``zh`` / a Chinese-language title) so a clear Chinese option is used
+         instead of falling through to whatever ffmpeg's default heuristic
+         picks (frequently an English or Japanese dub).
+      3. If no Chinese audio is present at all, return 0 and let ffmpeg choose.
     """
     for i, stream in enumerate(streams):
         tags = stream.get("tags", {})
         if tags.get("language") == "yue":
             return i
         if "cantonese" in tags.get("title", "").lower():
+            return i
+    for i, stream in enumerate(streams):
+        if _is_chinese_track(stream):
             return i
     return 0
 
