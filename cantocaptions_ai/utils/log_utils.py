@@ -3,7 +3,7 @@ import logging
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
 
 import torch
 from tqdm import tqdm
@@ -133,6 +133,24 @@ class TranscriptionSummary:
         print(f"{eq}\n", file=sys.__stdout__)
 
 
+@runtime_checkable
+class ProgressSink(Protocol):
+    """Duck-typed sink a caller (e.g. a web worker) passes in to observe pipeline
+    progress out-of-band from the console tqdm bars.
+
+    ``StageTimer`` forwards to it independently of ``TranscriptionSummary.enabled``,
+    so a headless server can suppress console output (``print_progress=False``) yet
+    still stream per-stage progress to a client. All methods are optional-ish: a
+    minimal implementation only needs the ones it cares about, but the protocol
+    lists the full surface StageTimer will call.
+    """
+
+    def stage_start(self, name: str) -> None: ...
+    def stage_end(self, name: str) -> None: ...
+    def set_total(self, total: int, unit: str = "it") -> None: ...
+    def advance(self, n: int = 1) -> None: ...
+
+
 class ProgressReporter:
     """Lightweight facade handed to pipeline stages so they can drive a stage's
     progress bar without touching StageTimer internals.
@@ -155,9 +173,15 @@ class ProgressReporter:
 class StageTimer:
     """Context manager that times a pipeline stage and drives a tqdm progress bar."""
 
-    def __init__(self, label: str, summary: TranscriptionSummary) -> None:
+    def __init__(
+        self,
+        label: str,
+        summary: TranscriptionSummary,
+        progress: "Optional[ProgressSink]" = None,
+    ) -> None:
         self._label = label
         self._summary = summary
+        self._progress = progress
         self._start: float = 0.0
         self._load_end: Optional[float] = None
         self._bar: "Optional[_TqdmBar]" = None
@@ -168,12 +192,16 @@ class StageTimer:
         self._spinner_thread: Optional[threading.Thread] = None
 
     def __enter__(self) -> "StageTimer":
+        # Notify the out-of-band sink regardless of console-summary state so a
+        # headless caller still sees stage boundaries with print_progress=False.
+        if self._progress is not None:
+            self._progress.stage_start(self._label)
         if self._summary.enabled and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         if not self._summary.enabled:
             self._start = time.perf_counter()
             return self
-        
+
         self._start = time.perf_counter()
         self._spinner_stop.clear()
         self._bar = tqdm(
@@ -220,6 +248,8 @@ class StageTimer:
             load_time = None
             run_time = end - self._start
         self._summary.record(self._label, load_time, run_time, vram_peak_mb)
+        if self._progress is not None:
+            self._progress.stage_end(self._label)
 
     def mark_inference_start(self) -> None:
         """Record the boundary between model loading and inference within this stage."""
@@ -235,6 +265,8 @@ class StageTimer:
 
         tqdm owns rate (unit/s) and ETA; we only feed it monotonic update() deltas.
         """
+        if self._progress is not None:
+            self._progress.set_total(total, unit)
         if not self._summary.enabled:
             return
         self._spinner_stop.set()
@@ -258,6 +290,8 @@ class StageTimer:
         self._determinate = True
 
     def _advance(self, n: int = 1) -> None:
+        if self._progress is not None:
+            self._progress.advance(n)
         if not self._summary.enabled:
             return
         if not self._determinate:

@@ -17,8 +17,9 @@ This replaces the former ``_MODEL_IDS`` dict in ``_asr_native.py``. The value ob
 themselves (``TextNormalization``, ``PunctuationConfig``, ``SpotCheck``) live in
 ``cantonese/text.py`` so that module stays free of any ``pipeline`` import.
 """
+import os
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Dict, Mapping
 
 from cantocaptions_ai.cantonese.text import (
     DEFAULT_PUNCTUATION,
@@ -60,24 +61,37 @@ _QWEN_SPOTCHECKS: Mapping[str, SpotCheck] = {
 }
 
 
-MODEL_PROFILES: Mapping[str, ModelProfile] = {
-    "Qwen3-ASR": ModelProfile(
-        hf_id="Qwen/Qwen3-ASR-1.7B-hf",
-        normalization=_QWEN_NORMALIZATION,
-        spotchecks=_QWEN_SPOTCHECKS,
-    ),
-    "Qwen3-ASR-0.6B": ModelProfile(
-        hf_id="Qwen/Qwen3-ASR-0.6B-hf",
-        normalization=_QWEN_NORMALIZATION,
-        spotchecks=_QWEN_SPOTCHECKS,
-    ),
+# Env var pointing at a local fine-tuned/merged LoRA checkpoint directory. Kept out of the
+# source tree so no machine-specific path ships in git: the "Qwen3-ASR-lora" profile is only
+# registered (and only offered as a --model choice) when this is set. See _build_profiles.
+_LORA_MODEL_DIR_ENV = "CANTOCAPTIONS_LORA_MODEL_DIR"
+
+
+def _build_profiles() -> Dict[str, ModelProfile]:
+    profiles: Dict[str, ModelProfile] = {
+        "Qwen3-ASR": ModelProfile(
+            hf_id="Qwen/Qwen3-ASR-1.7B-hf",
+            normalization=_QWEN_NORMALIZATION,
+            spotchecks=_QWEN_SPOTCHECKS,
+        ),
+        "Qwen3-ASR-0.6B": ModelProfile(
+            hf_id="Qwen/Qwen3-ASR-0.6B-hf",
+            normalization=_QWEN_NORMALIZATION,
+            spotchecks=_QWEN_SPOTCHECKS,
+        ),
+    }
     # Fine-tuned checkpoint: already emits HK-traditional text and custom final particles,
     # so it takes all defaults — no OpenCC, default punctuation, no spot checks. Copy this
-    # entry as the template when adding a new model.
-    "Qwen3-ASR-lora": ModelProfile(
-        hf_id="<your custom model filepath>", # model training in progress - replace with local directory
-    ),
-}
+    # entry as the template when adding a new model. Registered only when the env var points
+    # at a local merged-weights directory; otherwise --model Qwen3-ASR-lora is simply not a
+    # valid choice (clean argparse error) rather than a broken hardcoded path.
+    lora_dir = os.environ.get(_LORA_MODEL_DIR_ENV)
+    if lora_dir:
+        profiles["Qwen3-ASR-lora"] = ModelProfile(hf_id=lora_dir)
+    return profiles
+
+
+MODEL_PROFILES: Mapping[str, ModelProfile] = _build_profiles()
 
 
 def get_model_profile(name: str) -> ModelProfile:

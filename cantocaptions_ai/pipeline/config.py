@@ -65,7 +65,9 @@ class PipelineConfig:
     chunk_size: int = 30
 
     # Vocal isolation
-    vocal_isolation_method: str = "mbroformer"
+    # Off by default: the Mel-Band RoFormer stage is a heavy add for a small gain on clean
+    # speech. Opt in with --vocal_isolation_method mbroformer for noisy/music-heavy audio.
+    vocal_isolation_method: str = "none"
     vocal_isolation_batch_size: int = 4
     vocal_isolation_compute_type: str = "float32"
 

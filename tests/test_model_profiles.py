@@ -45,6 +45,8 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertAlmostEqual(gam.weights.get("噉"), 0.8)
 
     def test_finetuned_lora_is_clean_slate(self):
+        # Whether registered (env set) or resolved as a passthrough (env unset), the
+        # LoRA model gets all-default no-op downstream behavior.
         profile = get_model_profile("Qwen3-ASR-lora")
         self.assertIsNone(profile.normalization.opencc_config)
         self.assertFalse(profile.normalization.chars_hk)
@@ -53,7 +55,22 @@ class TestGetModelProfile(unittest.TestCase):
     def test_registry_keys_are_the_cli_choices_source(self):
         # __main__ derives --model choices from these keys.
         self.assertIn("Qwen3-ASR", MODEL_PROFILES)
-        self.assertIn("Qwen3-ASR-lora", MODEL_PROFILES)
+
+    def test_lora_profile_registered_only_when_env_set(self):
+        import os
+        from unittest import mock
+        from cantocaptions_ai.pipeline.model_profiles import _build_profiles, _LORA_MODEL_DIR_ENV
+
+        # Unset: no machine-specific path ships; the choice is simply unavailable.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(_LORA_MODEL_DIR_ENV, None)
+            self.assertNotIn("Qwen3-ASR-lora", _build_profiles())
+
+        # Set: the profile appears, pointing at the given directory.
+        with mock.patch.dict(os.environ, {_LORA_MODEL_DIR_ENV: "/models/lora-merged"}):
+            profiles = _build_profiles()
+            self.assertIn("Qwen3-ASR-lora", profiles)
+            self.assertEqual(profiles["Qwen3-ASR-lora"].hf_id, "/models/lora-merged")
 
 
 class TestNormalizeSegmentText(unittest.TestCase):

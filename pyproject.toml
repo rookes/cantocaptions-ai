@@ -6,7 +6,7 @@ version = "0.8.0"
 description = "End-to-end pipeline for high-quality, time-accurate written Cantonese subtitles."
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
-license = "GPL-3.0-only"
+license = "BSD-2-Clause"
 
 dependencies = [
     "transformers>=4.57.6",

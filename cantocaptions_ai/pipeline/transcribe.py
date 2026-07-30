@@ -10,7 +10,7 @@ from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE
 from cantocaptions_ai.utils.schema import AlignedTranscriptionResult, ProcessingItem, ProgressCallback, VadItem, merge_segments
 from typing import Callable, List, Optional
 from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer
-from cantocaptions_ai.utils.log_utils import StageTimer, TranscriptionSummary, get_logger
+from cantocaptions_ai.utils.log_utils import ProgressSink, StageTimer, TranscriptionSummary, get_logger
 from cantocaptions_ai.utils.model_utils import model_scope, flush_vram, vram_stats, load_with_offline_fallback
 from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION, is_mergeable, is_removable
 from cantocaptions_ai.utils.debug import _debug_stage_exists, write_precleaning_debug
@@ -215,6 +215,29 @@ def _run_retime(
     return result_items
 
 
+def _offset_result_times(result: dict, offset: float) -> None:
+    """Shift every timestamp in *result* forward by *offset* seconds, in place.
+
+    Used to map clip-relative times (produced when an audio_start/audio_end clip is
+    applied at load time) back onto the source-media timeline. No-op when offset==0.
+    """
+    if not offset:
+        return
+    for segment in result.get("segments", []):
+        for key in ("start", "end"):
+            if segment.get(key) is not None:
+                segment[key] += offset
+        for token_key in ("words", "chars"):
+            for token in segment.get(token_key, []) or []:
+                for key in ("start", "end"):
+                    if token.get(key) is not None:
+                        token[key] += offset
+    for token in result.get("word_segments", []) or []:
+        for key in ("start", "end"):
+            if token.get(key) is not None:
+                token[key] += offset
+
+
 def _merge_and_write(
     items: List[ProcessingItem],
     writer,
@@ -225,10 +248,24 @@ def _merge_and_write(
     cleaner=None,
     debug_dir: Optional[str] = None,
     punctuation=DEFAULT_PUNCTUATION,
-) -> None:
+    *,
+    collect: bool = False,
+    audio_start_offset: float = 0.0,
+    display_paths: Optional[dict] = None,
+) -> List[ProcessingItem]:
+    """Merge, clean, offset, then write (unless writer is None) and/or return results.
+
+    ``display_paths`` maps a (possibly clip-substituted temp) audio path back to the
+    original path so output filenames and returned results reference the source file,
+    not the temp clip. ``collect`` returns the final per-item results for in-memory
+    (server) use; ``writer`` is None when nothing should be written to disk.
+    """
+    finalized: List[ProcessingItem] = []
     for item in items:
         result = item['result']
         audio_path = item['audio_path']
+        if display_paths:
+            audio_path = display_paths.get(audio_path, audio_path)
         result["language"] = align_language
 
         new_segments = []
@@ -275,17 +312,138 @@ def _merge_and_write(
                 logger.info(f"Text cleaning: dropped {dropped} interjection/noise subtitles")
             result["segments"] = cleaned_segments
 
-        writer(result, audio_path, writer_args)
+        # Map clip-relative times back onto the source-media timeline before output.
+        _offset_result_times(result, audio_start_offset)
+
+        if writer is not None:
+            writer(result, audio_path, writer_args)
+        if collect:
+            finalized.append({'audio_path': audio_path, 'result': result})
+    return finalized
+
+
+def validate_config(cfg) -> None:
+    """Validate and normalize a PipelineConfig, raising ConfigError on bad input.
+
+    Extracted from the former CLI-only body so library/server callers get a
+    catchable exception instead of argparse's process-killing ``sys.exit``. Mutates
+    ``cfg.language`` in place (lowercase + code mapping). Advisory-only issues are
+    emitted as warnings, not errors.
+    """
+    from cantocaptions_ai.errors import ConfigError
+
+    if cfg.speaker_embeddings and not cfg.diarize:
+        warnings.warn("speaker_embeddings has no effect without diarize")
+    if cfg.reference_subtitle and not cfg.llm_correction:
+        raise ConfigError("reference_subtitle requires llm_correction")
+    if cfg.reference_correction_semantic and not cfg.reference_subtitle:
+        warnings.warn("reference_correction_semantic has no effect without reference_subtitle")
+
+    if cfg.language is not None:
+        cfg.language = cfg.language.lower()
+        if cfg.language not in LANGUAGES:
+            if cfg.language in TO_LANGUAGE_CODE:
+                cfg.language = TO_LANGUAGE_CODE[cfg.language]
+            else:
+                raise ConfigError(f"Unsupported language: {cfg.language}")
+    if cfg.language != "yue":
+        warnings.warn(
+            f"Configured language '{cfg.language}' is not yue/cantonese, and may not be compatible with this framework."
+        )
+
+    if cfg.no_align:
+        for option in ("highlight_words", "max_line_count", "max_line_width"):
+            if getattr(cfg, option):
+                raise ConfigError(f"{option} not possible with no_align")
+    if cfg.max_line_count and not cfg.max_line_width:
+        warnings.warn("max_line_count has no effect without max_line_width")
+
+
+def _prepare_clips(audio_paths: List[str], cfg):
+    """Apply an audio_start/audio_end clip by extracting a clipped WAV per input.
+
+    Returns ``(paths, display_paths, temp_files)``. When no clip is configured the
+    inputs pass through unchanged. Otherwise each input is written to a temporary
+    16 kHz mono WAV (with its Cantonese track already selected) so every downstream
+    stage — including those that reload the file by path — sees the clipped audio;
+    ``display_paths`` maps each temp path back to the original for output naming, and
+    ``temp_files`` must be cleaned up by the caller.
+    """
+    if cfg.audio_start is None and cfg.audio_end is None:
+        return audio_paths, {}, []
+    import tempfile
+    from cantocaptions_ai.utils.audio import extract_clip_to_wav
+    new_paths: List[str] = []
+    display: dict = {}
+    temps: List[str] = []
+    for p in audio_paths:
+        track = _select_audio_track(p)
+        fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="cantoclip_")
+        os.close(fd)
+        extract_clip_to_wav(
+            p, tmp, audio_start=cfg.audio_start, audio_end=cfg.audio_end, audio_track=track
+        )
+        new_paths.append(tmp)
+        display[tmp] = p
+        temps.append(tmp)
+    return new_paths, display, temps
+
+
+def _cleanup_temp_files(paths: List[str]) -> None:
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            logger.warning("Could not remove temp clip file: %s", p)
 
 
 def transcribe_task(args: dict, parser: argparse.ArgumentParser):
-    """Transcription task to be called from CLI.
+    """CLI adapter: build a PipelineConfig from parsed args and run the pipeline.
 
-    Args:
-        args: Dictionary of command-line arguments.
-        parser: argparse.ArgumentParser object.
+    Thin wrapper over :func:`_execute_pipeline` that preserves the CLI contract —
+    validation errors become ``parser.error(...)`` (exit 2) and results are written
+    to ``cfg.output_dir``. Library/server callers should use
+    ``cantocaptions_ai.service.run_pipeline`` instead.
     """
     from cantocaptions_ai.pipeline.config import PipelineConfig
+    from cantocaptions_ai.errors import ConfigError
+
+    audio_paths = args.pop("audio")
+    cfg = PipelineConfig.from_args(args)
+    try:
+        validate_config(cfg)
+    except ConfigError as e:
+        parser.error(str(e))
+
+    paths, display_paths, temp_files = _prepare_clips(audio_paths, cfg)
+    try:
+        _execute_pipeline(
+            paths, cfg, collect=False,
+            audio_start_offset=cfg.audio_start or 0.0,
+            display_paths=display_paths,
+        )
+    finally:
+        _cleanup_temp_files(temp_files)
+
+
+def _execute_pipeline(
+    audio_paths: List[str],
+    cfg,
+    *,
+    progress: "Optional[ProgressSink]" = None,
+    collect: bool = False,
+    audio_start_offset: float = 0.0,
+    display_paths: Optional[dict] = None,
+    vad_model=None,
+) -> List[ProcessingItem]:
+    """Run all pipeline stages for *audio_paths* under *cfg*.
+
+    Assumes *cfg* has already passed :func:`validate_config`, and that any audio clip
+    has already been applied (paths point at clipped temp files; see
+    :func:`_prepare_clips`). With ``collect=True`` the final per-item results are
+    returned and nothing is written to disk; otherwise results are written to
+    ``cfg.output_dir``. ``progress`` receives stage/progress events out-of-band.
+    """
     from cantocaptions_ai.pipeline.model_profiles import get_model_profile
     from huggingface_hub.utils.tqdm import disable_progress_bars
 
@@ -294,31 +452,6 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     # explicit "Downloading %r..." log lines are the only download-progress signal,
     # so a slow first-run download never looks like a stalled/hung stage.
     disable_progress_bars()
-
-    audio_paths = args.pop("audio")
-    cfg = PipelineConfig.from_args(args)
-    os.makedirs(cfg.output_dir, exist_ok=True)
-
-    if cfg.speaker_embeddings and not cfg.diarize:
-        warnings.warn("--speaker_embeddings has no effect without --diarize")
-
-    if cfg.reference_subtitle and not cfg.llm_correction:
-        parser.error("--reference_subtitle requires --llm_correction")
-    if cfg.reference_correction_semantic and not cfg.reference_subtitle:
-        warnings.warn("--reference_correction_semantic has no effect without --reference_subtitle")
-
-    if cfg.language is not None:
-        cfg.language = cfg.language.lower()
-        if cfg.language not in LANGUAGES:
-            if cfg.language in TO_LANGUAGE_CODE:
-                cfg.language = TO_LANGUAGE_CODE[cfg.language]
-            else:
-                raise ValueError(f"Unsupported language: {cfg.language}")
-
-    if cfg.language != "yue":
-        warnings.warn(
-            f"Configured language '{cfg.language}' is not yue/cantonese, and may not be compatible with this framework."
-        )
 
     align_language = cfg.language if cfg.language is not None else "yue"
     task: str = "transcribe"
@@ -342,14 +475,11 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         "suppress_numerals": cfg.suppress_numerals,
     }
 
-    writer = get_writer(cfg.output_format, cfg.output_dir)
-    word_options = ["highlight_words", "max_line_count", "max_line_width"]
-    if cfg.no_align:
-        for option in word_options:
-            if getattr(cfg, option):
-                parser.error(f"--{option} not possible with --no_align")
-    if cfg.max_line_count and not cfg.max_line_width:
-        warnings.warn("--max_line_count has no effect without --max_line_width")
+    if collect:
+        writer = None
+    else:
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        writer = get_writer(cfg.output_format, cfg.output_dir)
     writer_args = {
         "highlight_words": cfg.highlight_words,
         "max_line_count": cfg.max_line_count,
@@ -422,10 +552,14 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     process_start = time.perf_counter()
 
     # Stage 1: VAD
-    with StageTimer("VAD", summary) as stage:
+    with StageTimer("VAD", summary, progress=progress) as stage:
         stub_items = [{'audio_path': p, 'audio_track': _select_audio_track(p)} for p in audio_paths]
         if need_vad:
             from cantocaptions_ai.pipeline.vad import load_vad
+            # A caller (e.g. PipelineService in resident mode) may pass a preloaded
+            # VAD model to reuse across jobs — load_vad reuses it and ignores
+            # vad_method. It stays alive via the caller's reference after the
+            # processor wrapper is dropped below, skipping the ~20-30s reload.
             vad_processor = load_vad(
                 vad_method=cfg.vad_method,
                 device=cfg.device,
@@ -433,6 +567,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 vad_onset=cfg.vad_onset,
                 vad_offset=cfg.vad_offset,
                 chunk_size=cfg.chunk_size,
+                vad_model=vad_model,
                 use_auth_token=cfg.hf_token,
             )
             stage.mark_inference_start()
@@ -446,7 +581,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         bool(cfg.vocal_isolation_method) and cfg.vocal_isolation_method.lower() != "none"
     )
     if need_vocal_isolation:
-        with StageTimer("Vocal isolation", summary) as stage:
+        with StageTimer("Vocal isolation", summary, progress=progress) as stage:
             from cantocaptions_ai.pipeline.vocal_isolation import load_vocal_isolation
             vocal_isolation_processor = load_with_offline_fallback(
                 load_vocal_isolation,
@@ -471,7 +606,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
 
     if cfg.retime:
         # Retime mode: skip ASR entirely; use the alignment model for both search and fine alignment.
-        with StageTimer("Subtitle retiming + alignment", summary) as stage:
+        with StageTimer("Subtitle retiming + alignment", summary, progress=progress) as stage:
             from cantocaptions_ai.pipeline.alignment import load_align_model, load_bert_processor
             bert_processor = load_with_offline_fallback(
                 load_bert_processor, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only
@@ -507,7 +642,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         # Stage 3: Transcription
         if need_asr:
             from cantocaptions_ai.pipeline.asr import load_model
-            with StageTimer("Transcription", summary) as stage:
+            with StageTimer("Transcription", summary, progress=progress) as stage:
                 with model_scope(
                     load_model,
                     cfg.model,
@@ -540,7 +675,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         if cfg.ensemble_model != "none":
             if need_ensemble:
                 from cantocaptions_ai.pipeline.ensemble import load_faster_whisper
-                with StageTimer("Ensemble ASR (faster-whisper)", summary) as stage:
+                with StageTimer("Ensemble ASR (faster-whisper)", summary, progress=progress) as stage:
                     with model_scope(
                         load_faster_whisper,
                         device=cfg.device,
@@ -559,7 +694,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             if cfg.reference_subtitle:
                 from cantocaptions_ai.pipeline.retime import load_subtitle_file
                 from cantocaptions_ai.pipeline.llm_correction import match_reference_to_segments
-                with StageTimer("Reference subtitle matching", summary):
+                with StageTimer("Reference subtitle matching", summary, progress=progress):
                     logger.info(f"Loading reference subtitle: {cfg.reference_subtitle}")
                     reference_subs = load_subtitle_file(cfg.reference_subtitle)
                     logger.info(f"Loaded {len(reference_subs)} reference subtitle lines.")
@@ -578,7 +713,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                             f"reserved={stats['reserved_mb']:.0f} MB, "
                             f"free={stats['free_mb']:.0f} MB / {stats['total_mb']:.0f} MB"
                         )
-                with StageTimer("LLM correction", summary) as stage:
+                with StageTimer("LLM correction", summary, progress=progress) as stage:
                     with model_scope(
                         load_llm,
                         model_id=cfg.llm_model,
@@ -597,7 +732,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
 
         # Stage 4: Alignment
         if not cfg.no_align:
-            with StageTimer("Alignment", summary) as stage:
+            with StageTimer("Alignment", summary, progress=progress) as stage:
                 from cantocaptions_ai.pipeline.alignment import load_align_model, load_bert_processor
                 bert_processor = load_with_offline_fallback(
                     load_bert_processor, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only
@@ -630,7 +765,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             logger.warning(
                 "No --hf_token provided, needs to be saved in environment variable, otherwise will throw error loading diarization model"
             )
-        with StageTimer("Diarization", summary) as stage:
+        with StageTimer("Diarization", summary, progress=progress) as stage:
             items = _run_diarization(
                 items, cfg.diarize_model, cfg.hf_token, cfg.device, cfg.model_dir,
                 cfg.min_speakers, cfg.max_speakers, cfg.speaker_embeddings,
@@ -640,17 +775,19 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
 
     # Stage 6: Speaker Verification
     if cfg.verify_speakers:
-        with StageTimer("Speaker verification", summary) as stage:
+        with StageTimer("Speaker verification", summary, progress=progress) as stage:
             items = _run_speaker_verification(
                 items, cfg.device, cfg.model_dir,
                 progress_callback=stage.reporter,
                 load_complete_callback=stage.mark_inference_start,
             )
 
-    # Write
-    _merge_and_write(
+    # Write and/or collect final results
+    results = _merge_and_write(
         items, writer, align_language, cfg.align_merge_distance, cfg.align_padding, writer_args,
         cleaner=cleaner, debug_dir=cfg.debug_dir, punctuation=profile.punctuation,
+        collect=collect, audio_start_offset=audio_start_offset, display_paths=display_paths,
     )
 
     summary.print_summary(process_elapsed=time.perf_counter() - process_start)
+    return results

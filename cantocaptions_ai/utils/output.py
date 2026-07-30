@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import re
@@ -346,4 +347,38 @@ def get_writer(
     if output_format in optional_writers:
         return optional_writers[output_format](output_dir)
     return writers[output_format](output_dir)
+
+
+# Formats that render to a single text document (i.e. everything except "all", which
+# fans out to multiple files and so has no single-string form).
+_SINGLE_DOC_WRITERS = {
+    "txt": WriteTXT,
+    "vtt": WriteVTT,
+    "srt": WriteSRT,
+    "tsv": WriteTSV,
+    "json": WriteJSON,
+    "aud": WriteAudacity,
+}
+
+
+def render_result(result: dict, output_format: str, options: Optional[dict] = None) -> str:
+    """Render a transcription ``result`` to a subtitle/transcript string in memory.
+
+    The disk-free counterpart to ``get_writer``: reuses each writer's
+    ``write_result(result, file, options)`` (which already accepts any TextIO) by
+    pointing it at an ``io.StringIO``. Lets a server serve output as an HTTP body
+    without writing to ``output_dir``.
+
+    ``"all"`` is rejected — it produces several files, not one string; callers that
+    want multiple formats should call this once per format.
+    """
+    if output_format == "all":
+        raise ValueError("render_result cannot render output_format='all' to a single string")
+    writer_cls = _SINGLE_DOC_WRITERS.get(output_format)
+    if writer_cls is None:
+        raise ValueError(f"Unknown output_format: {output_format!r}")
+    buf = io.StringIO()
+    # output_dir is unused by write_result (only ResultWriter.__call__ touches disk).
+    writer_cls(output_dir="").write_result(result, file=buf, options=options or {})
+    return buf.getvalue()
 

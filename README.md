@@ -44,6 +44,35 @@ uv run cantocaptions_ai audio.wav
 
 This produces `audio.srt` in the current directory. Note that the first run will take a while, as it downloads model weights automatically (~6 GB).
 
+### Library / server use
+
+Besides the CLI, the pipeline exposes a programmatic entry point that returns results
+in memory and raises catchable exceptions instead of exiting the process — suitable
+for a web server or batch job:
+
+```python
+from cantocaptions_ai.pipeline.config import PipelineConfig
+from cantocaptions_ai.service import run_pipeline, PipelineService
+
+cfg = PipelineConfig(output_format="srt", vocal_isolation_method="none")
+result = run_pipeline("audio.wav", cfg)          # raises ConfigError / InputError
+print(result.subtitle_text)                       # rendered SRT string
+print(result.num_segments, result.empty)          # empty=True if no speech found
+
+# For a long-lived worker, PipelineService serializes GPU access and keeps the
+# VAD model warm across jobs (skipping its ~20-30s reload):
+service = PipelineService(resident=True)
+result = service.run("audio.wav", cfg)
+```
+
+A full reference web service (upload UI + job queue + GPU worker) built on this API
+lives in the companion `cantocaptions-web` repo. To pre-fetch model weights for a
+container image or fresh server, run `python scripts/download_models.py [--full]`.
+
+A fine-tuned LoRA checkpoint can be registered as the `Qwen3-ASR-lora` model by
+pointing `CANTOCAPTIONS_LORA_MODEL_DIR` at its merged-weights directory (otherwise
+that model choice is simply unavailable).
+
 ### HuggingFace access token
 
 The VAD model (`pyannote/segmentation`) may require accepting its terms of use on HuggingFace. Pass your token once if necessary:
@@ -59,7 +88,8 @@ You can update default command line arguments by editing the file `config/defaul
 * `--help` - show command line arguments and syntax
 * `-o [DIR_NAME]` - output directory for the SRT file
 * `--input_dir [DIR_NAME]` - run all 
-* `--vocal_isolation_method [OPTION]` - set to "none" for no vocal isolation, or "mbroformer" for full mbroformer vocal isolation
+* `--vocal_isolation_method [OPTION]` - "mbroformer" enables Mel-Band RoFormer vocal isolation (helps on noisy/music-heavy audio); defaults to "none" as it is a heavy stage for little gain on clean speech
+* `--audio_start [SECONDS]` / `--audio_end [SECONDS]` - transcribe only a clip of the input; output timestamps map back to the source timeline
 * `--log_file [FILE_PATH]` - simplify console logging and output full logs to designated file
 * `--debug_dir [DIR_NAME]` - directory for intermediate processed data for debugging purposes
 * `--load_debug_dir [DIR_NAME]` - load previously generated `--debug_dir` data from this directory to skip processing steps (such as VAD, vocal isolation, and transcription)

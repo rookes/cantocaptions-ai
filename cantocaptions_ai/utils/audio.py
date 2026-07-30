@@ -101,10 +101,97 @@ def select_cantonese_track(streams: List[dict]) -> int:
     return 0
 
 
-def load_audio(file: str, 
-               sr: int = SAMPLE_RATE, 
-               audio_track: int = 0, 
-               audio_start: Optional[float] = None, 
+def _clip_ffmpeg_args(audio_start: Optional[float], audio_end: Optional[float]) -> tuple:
+    """Return (pre_input_args, post_input_args) implementing an [start, end) clip.
+
+    ``-ss`` is placed before ``-i`` (fast, keyframe-accurate input seeking — plenty
+    accurate for speech) and the clip length is bounded with ``-t``. Both bounds are
+    optional; ``None`` means "from the very start" / "to the very end". Negative or
+    inverted ranges raise ValueError so a bad request fails loudly rather than
+    silently transcribing the whole file (the old no-op behavior).
+    """
+    if audio_start is not None and audio_start < 0:
+        raise ValueError(f"audio_start must be >= 0, got {audio_start}")
+    if audio_end is not None and audio_end < 0:
+        raise ValueError(f"audio_end must be >= 0, got {audio_end}")
+    if audio_start is not None and audio_end is not None and audio_end <= audio_start:
+        raise ValueError(f"audio_end ({audio_end}) must be greater than audio_start ({audio_start})")
+
+    pre: list = []
+    post: list = []
+    if audio_start is not None:
+        pre += ["-ss", f"{audio_start:.3f}"]
+    if audio_end is not None:
+        duration = audio_end - (audio_start or 0.0)
+        post += ["-t", f"{duration:.3f}"]
+    return pre, post
+
+
+def probe_duration_seconds(file: str) -> Optional[float]:
+    """Return the media duration in seconds via ffprobe, or None if unavailable.
+
+    Reads the container-level ``format.duration`` (present for essentially all real
+    media). None means ffprobe could not determine a duration (e.g. a malformed or
+    non-media file) — callers should treat that as "not a usable media file."
+    """
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        file,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, check=False)
+    except FileNotFoundError:
+        raise RuntimeError("ffprobe not found; ensure ffmpeg is installed and on PATH")
+    try:
+        data = json.loads(result.stdout)
+        dur = data.get("format", {}).get("duration")
+        return float(dur) if dur is not None else None
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def validate_input_file(
+    file: str,
+    *,
+    max_duration_s: Optional[float] = None,
+    max_bytes: Optional[int] = None,
+) -> float:
+    """Fast pre-flight check that ``file`` is a usable media input; return its duration.
+
+    Fails fast with :class:`InputError` — before any model loads — instead of the
+    old behavior where the only signal was ffmpeg erroring partway into VAD. Checks:
+    existence, non-empty, optional size cap, at least one readable audio stream, and
+    a positive duration within an optional cap.
+    """
+    from cantocaptions_ai.errors import InputError
+
+    if not os.path.isfile(file):
+        raise InputError(f"File not found: {file}")
+    size = os.path.getsize(file)
+    if size == 0:
+        raise InputError(f"File is empty: {file}")
+    if max_bytes is not None and size > max_bytes:
+        raise InputError(
+            f"File is too large: {size} bytes exceeds the {max_bytes}-byte limit"
+        )
+    if not probe_audio_tracks(file):
+        raise InputError(f"No readable audio stream found in {file}")
+    duration = probe_duration_seconds(file)
+    if duration is None or duration <= 0:
+        raise InputError(f"Could not determine a positive audio duration for {file}")
+    if max_duration_s is not None and duration > max_duration_s:
+        raise InputError(
+            f"Audio is too long: {duration:.1f}s exceeds the {max_duration_s:.0f}s limit"
+        )
+    return duration
+
+
+def load_audio(file: str,
+               sr: int = SAMPLE_RATE,
+               audio_track: int = 0,
+               audio_start: Optional[float] = None,
                audio_end: Optional[float] = None
                ) -> np.ndarray:
     """
@@ -122,25 +209,56 @@ def load_audio(file: str,
         The index of the audio track, if there are multiple
 
     audio_start: float
-        The amount of audio to cut from the beginning
+        Start of the clip to read, in seconds (None = from the beginning)
 
-    sr: int
-        The sample rate to resample the audio if necessary
+    audio_end: float
+        End of the clip to read, in seconds (None = to the end)
 
     Returns
     -------
     A NumPy array containing the audio waveform, in float32 dtype.
     """
+    pre_input, post_input = _clip_ffmpeg_args(audio_start, audio_end)
     try:
-        cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", file]
+        cmd = ["ffmpeg", "-nostdin", "-threads", "0", *pre_input, "-i", file]
         if audio_track != 0:
             cmd += ["-map", f"0:a:{audio_track}"]
-        cmd += ["-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), "-"]
+        cmd += [*post_input, "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), "-"]
         out = subprocess.run(cmd, capture_output=True, check=True).stdout
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
 
     return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+
+
+def extract_clip_to_wav(
+    src: str,
+    dst: str,
+    *,
+    audio_start: Optional[float] = None,
+    audio_end: Optional[float] = None,
+    audio_track: int = 0,
+    sr: int = SAMPLE_RATE,
+) -> str:
+    """Write a 16 kHz mono WAV of ``src``'s [audio_start, audio_end) clip to ``dst``.
+
+    Used by the pipeline entry point to apply an audio clip *once*: every downstream
+    stage then reads the already-clipped, single-track ``dst`` file (with
+    ``audio_track=0``), so clipping works uniformly even for stages that reload the
+    file by path (diarization, speaker verification). Output timestamps are relative
+    to the clip start; the caller offsets them by ``audio_start`` to map back to the
+    source timeline. Returns ``dst``.
+    """
+    pre_input, post_input = _clip_ffmpeg_args(audio_start, audio_end)
+    cmd = ["ffmpeg", "-nostdin", "-y", "-threads", "0", *pre_input, "-i", src]
+    if audio_track != 0:
+        cmd += ["-map", f"0:a:{audio_track}"]
+    cmd += [*post_input, "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), dst]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Failed to extract audio clip: {e.stderr.decode()}") from e
+    return dst
 
 
 def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
