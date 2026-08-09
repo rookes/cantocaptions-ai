@@ -60,8 +60,11 @@ class PipelineConfig:
 
     # VAD
     vad_method: str = "pyannote"
-    vad_onset: float = 0.500
-    vad_offset: float = 0.363
+    vad_onset: float = 0.450
+    vad_offset: float = 0.300
+    vad_pad_onset: float = 0.20
+    vad_pad_offset: float = 0.20
+    vad_min_duration_off: float = 0.25
     chunk_size: int = 30
 
     # Vocal isolation
@@ -93,6 +96,8 @@ class PipelineConfig:
     align_padding: float = 0.04
     align_release: float = 0.64
     align_merge_distance: float = 0.08
+    min_cue_duration: float = 0.5
+    merge_gap: float = 0.25
     align_batch_size: int = 4
     align_compute_type: str = "float32"
 

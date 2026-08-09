@@ -24,11 +24,17 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
         vad_onset: float,
         vad_offset: float,
         chunk_size: int,
+        vad_pad_onset: float = 0.0,
+        vad_pad_offset: float = 0.0,
+        vad_min_duration_off: float = 0.0,
     ):
         self.vad_model = vad_model
         self.vad_onset = vad_onset
         self.vad_offset = vad_offset
         self.chunk_size = chunk_size
+        self.vad_pad_onset = vad_pad_onset
+        self.vad_pad_offset = vad_pad_offset
+        self.vad_min_duration_off = vad_min_duration_off
 
     @staticmethod
     def read_debug(audio_path, debug_dir): return load_vad_debug(audio_path, debug_dir)
@@ -62,6 +68,9 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
             self.chunk_size,
             onset=self.vad_onset,
             offset=self.vad_offset,
+            pad_onset=self.vad_pad_onset,
+            pad_offset=self.vad_pad_offset,
+            min_duration_off=self.vad_min_duration_off,
         )
 
         segments = []
@@ -79,11 +88,14 @@ def load_vad(
     vad_method: str = "pyannote",
     device: str = "cpu",
     device_index: int = 0,
-    vad_onset: float = 0.500,
-    vad_offset: float = 0.363,
+    vad_onset: float = 0.450,
+    vad_offset: float = 0.300,
     chunk_size: int = 30,
     vad_model: Optional[Vad] = None,
     use_auth_token: Optional[Union[str, bool]] = None,
+    vad_pad_onset: float = 0.20,
+    vad_pad_offset: float = 0.20,
+    vad_min_duration_off: float = 0.25,
 ) -> VadProcessor:
     """Load a VAD model and return a VadProcessor for audio segmentation."""
     if vad_model is not None:
@@ -105,4 +117,7 @@ def load_vad(
         vad_onset=vad_onset,
         vad_offset=vad_offset,
         chunk_size=chunk_size,
+        vad_pad_onset=vad_pad_onset,
+        vad_pad_offset=vad_pad_offset,
+        vad_min_duration_off=vad_min_duration_off,
     )

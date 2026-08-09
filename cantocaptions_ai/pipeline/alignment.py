@@ -408,11 +408,20 @@ def _compute_vad_emissions_batched(
 ) -> List[Tuple[torch.Tensor, float]]:
     """Batch VAD segments through the HF Wav2Vec2-BERT model via BatchExecutor.
 
-    bert_processor's feature extractor pads each batch to its own longest segment
-    and returns an attention_mask; this model has add_adapter=False, so the mask's
-    per-row valid length maps 1:1 onto the CTC emission's frame dimension with no
-    extra downsampling to account for — used directly to trim each item's emission
-    back to its real (unpadded) length before it's stored.
+    bert_processor's feature extractor pads each batch to its own longest segment and returns
+    an attention_mask, whose per-row sum is the segment's real length **in input feature
+    frames**. That is not the same unit as the CTC emission: alvanlii/wav2vec2-BERT-cantonese
+    sets add_adapter=True with adapter_stride=2, so the emission runs at half the feature rate
+    (~25 fps vs ~50 fps). The mask length is therefore converted through the model's own
+    _get_feat_extract_output_lengths before it is used to trim each row's emission back to its
+    real (unpadded) length — that helper applies the adapter convs and is an identity when a
+    model has no adapter, so this stays correct for a different align model.
+
+    Getting this wrong is silent and costly: an over-long real_len makes the slice a no-op, so
+    the segment keeps the whole batch-padded emission, _align_segment's
+    `ratio = duration / (trellis.size(0) - 1)` divides the true duration by too many frames,
+    and every timestamp in the segment compresses toward its start (seconds of drift by the
+    end). Only the longest segment in each batch escapes. Hence the assertion below.
 
     Jobs are processed longest-segment-first (not VAD order) via BatchExecutor's
     order_key, for two reasons: VAD segments range from sub-second to the full
@@ -449,9 +458,18 @@ def _compute_vad_emissions_batched(
             emissions = torch.log_softmax(
                 model(input_features, attention_mask=attention_mask).logits, dim=-1
             )
+        # Feature frames -> emission frames (see docstring); identity without an adapter.
         valid_lens = features["attention_mask"].sum(dim=-1)
+        emission_lens = model._get_feat_extract_output_lengths(valid_lens)
         for row, i in enumerate(batch):
-            real_len = int(valid_lens[row].item())
+            real_len = int(emission_lens[row].item())
+            if real_len > emissions.shape[1]:
+                raise RuntimeError(
+                    f"Alignment emission trim is longer than the emission itself "
+                    f"({real_len} > {emissions.shape[1]} frames). The feature-frame -> "
+                    f"emission-frame conversion does not match this align model; timestamps "
+                    f"would silently compress. Check the model's adapter config."
+                )
             emission = emissions[row, :real_len, :].cpu().detach()
             vad_duration = vad_segments[i]["end"] - vad_segments[i]["start"]
             frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
@@ -460,6 +478,21 @@ def _compute_vad_emissions_batched(
     BatchExecutor(
         batch_size, order_key=lambda i: len(vad_segments[i]["audio"]),
     ).run(jobs, infer_fn)
+
+    # A correct run yields the model's constant frame rate for every segment regardless of
+    # length. Spread means some emission still carries batch padding, which shows up as
+    # timestamps compressed toward the segment start -- cheap to check, and otherwise silent.
+    rates = [r[1] for r in results if r is not None and r[1] > 0]
+    if rates:
+        median_rate = sorted(rates)[len(rates) // 2]
+        spread = max(abs(rate - median_rate) for rate in rates) / median_rate
+        if spread > 0.02:
+            logger.warning(
+                "Alignment emission frame rate varies by %.1f%% across VAD segments "
+                "(median %.2f fps, range %.2f-%.2f). Timestamps in the outlying segments are "
+                "likely compressed; suspect the emission length conversion.",
+                spread * 100, median_rate, min(rates), max(rates),
+            )
     return results
 
 

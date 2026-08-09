@@ -1,3 +1,4 @@
+import bisect
 import os
 from typing import Optional, Union
 
@@ -17,7 +18,12 @@ class _Segment:
         self.speaker = speaker
 
 
-def load_vad_model(device, vad_onset=0.500, vad_offset=0.363, token=None, model_fp=None):
+def load_vad_model(device, token=None, model_fp=None):
+    """Load the pyannote segmentation model as a frame-scoring Inference.
+
+    Note this only produces the score curve; the onset/offset thresholds and all smoothing
+    are applied later, in Binarize (via merge_chunks) — not here.
+    """
     # Import only from pyannote.audio.core — avoids pyannote.audio.pipelines.__init__,
     # which eagerly loads SpeakerDiarization → speaker_verification → NeMo.
     from pyannote.audio.core.model import Model
@@ -50,8 +56,27 @@ def load_vad_model(device, vad_onset=0.500, vad_offset=0.363, token=None, model_
     )
 
 class Binarize:
-    """Binarize detection scores using hysteresis thresholding, with min-cut operation
-    to ensure not segments are longer than max_duration.
+    """Binarize detection scores using hysteresis thresholding, then smooth, then cap length.
+
+    The three stages run in this order, which matters:
+
+    1. **Hysteresis** — a region opens when the score exceeds ``onset`` and closes when it
+       drops below ``offset``.
+    2. **Smoothing** — regions are widened by ``pad_onset``/``pad_offset``, then any pair
+       separated by no more than ``min_duration_off`` is merged, then regions shorter than
+       ``min_duration_on`` are dropped. Without this the model's frame-exact threshold
+       crossings clip word onsets and tails, and a single sub-threshold frame (~17 ms) tears a
+       region in half.
+    3. **Min-cut** — any region still longer than ``max_duration`` is split at the
+       lowest-scoring frame in the second half of the over-long window, repeatedly. Splits are
+       contiguous (the split timestamp ends one piece and starts the next), so no audio is
+       dropped.
+
+    Stage 3 runs *last* on purpose. It used to run inside the hysteresis loop, which made it
+    mutually exclusive with stage 2 — setting any padding raised NotImplementedError whenever
+    ``max_duration`` was finite, and ``max_duration`` is always finite here because it is the
+    ASR chunk budget. Capping the *final* regions instead lets both apply, and guarantees the
+    cap holds after padding has widened things.
 
     Parameters
     ----------
@@ -106,6 +131,74 @@ class Binarize:
 
         self.max_duration = max_duration
 
+    def _hysteresis(self, timestamps, k_scores):
+        """Stage 1: raw (start, end) regions from hysteresis thresholding, no smoothing."""
+        regions = []
+        start = timestamps[0]
+        is_active = k_scores[0] > self.onset
+        t = start
+        for t, y in zip(timestamps[1:], k_scores[1:]):
+            if is_active:
+                if y < self.offset:
+                    regions.append((start, t))
+                    is_active = False
+            elif y > self.onset:
+                start = t
+                is_active = True
+        if is_active:
+            regions.append((start, t))
+        return regions
+
+    def _smooth(self, regions, lower_bound, upper_bound):
+        """Stage 2: pad outward, merge across short gaps, drop stragglers."""
+        if not regions:
+            return regions
+
+        # Clamp so a padded region can never start before the audio (which would become a
+        # negative sample index when the caller slices the waveform) or run past its end.
+        padded = [
+            (max(start - self.pad_onset, lower_bound), min(end + self.pad_offset, upper_bound))
+            for start, end in regions
+        ]
+
+        merged = [padded[0]]
+        for start, end in padded[1:]:
+            prev_start, prev_end = merged[-1]
+            # Negative gaps (overlaps created by padding) are <= min_duration_off too.
+            if start - prev_end <= self.min_duration_off:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+
+        if self.min_duration_on > 0:
+            merged = [r for r in merged if r[1] - r[0] >= self.min_duration_on]
+        return merged
+
+    def _split_long(self, regions, timestamps, k_scores):
+        """Stage 3: cap region length, cutting at the lowest-scoring frame.
+
+        Searches the second half of the over-long window (as WhisperX's min-cut does) so each
+        emitted piece is at least ``max_duration / 2`` and the loop always makes progress.
+        The split timestamp both ends one piece and starts the next, so no audio is dropped.
+        """
+        if self.max_duration == float("inf"):
+            return regions
+
+        out = []
+        for start, end in regions:
+            while end - start > self.max_duration:
+                lo = bisect.bisect_left(timestamps, start + self.max_duration / 2)
+                hi = bisect.bisect_right(timestamps, start + self.max_duration)
+                if hi <= lo:
+                    break
+                split_t = timestamps[lo + int(np.argmin(k_scores[lo:hi]))]
+                if not (start < split_t < end):
+                    break
+                out.append((start, split_t))
+                start = split_t
+            out.append((start, end))
+        return out
+
     def __call__(self, scores: "SlidingWindowFeature") -> "Annotation":
         """Binarize detection scores
         Parameters
@@ -122,67 +215,20 @@ class Binarize:
         num_frames, num_classes = scores.data.shape
         frames = scores.sliding_window
         timestamps = [frames[i].middle for i in range(num_frames)]
+        lower_bound = min(frames[0].start, timestamps[0])
+        upper_bound = max(frames[num_frames - 1].end, timestamps[-1])
 
         # annotation meant to store 'active' regions
         active = Annotation()
         for k, k_scores in enumerate(scores.data.T):
-
             label = k if scores.labels is None else scores.labels[k]
 
-            # initial state
-            start = timestamps[0]
-            is_active = k_scores[0] > self.onset
-            curr_scores = [k_scores[0]]
-            curr_timestamps = [start]
-            t = start
-            for t, y in zip(timestamps[1:], k_scores[1:]):
-                # currently active
-                if is_active:
-                    curr_duration = t - start
-                    if curr_duration > self.max_duration:
-                        search_after = len(curr_scores) // 2
-                        # divide segment
-                        min_score_div_idx = search_after + np.argmin(curr_scores[search_after:])
-                        min_score_t = curr_timestamps[min_score_div_idx]
-                        region = Segment(start - self.pad_onset, min_score_t + self.pad_offset)
-                        active[region, k] = label
-                        start = curr_timestamps[min_score_div_idx]
-                        curr_scores = curr_scores[min_score_div_idx + 1:]
-                        curr_timestamps = curr_timestamps[min_score_div_idx + 1:]
-                    # switching from active to inactive
-                    elif y < self.offset:
-                        region = Segment(start - self.pad_onset, t + self.pad_offset)
-                        active[region, k] = label
-                        start = t
-                        is_active = False
-                        curr_scores = []
-                        curr_timestamps = []
-                    curr_scores.append(y)
-                    curr_timestamps.append(t)
-                # currently inactive
-                else:
-                    # switching from inactive to active
-                    if y > self.onset:
-                        start = t
-                        is_active = True
+            regions = self._hysteresis(timestamps, k_scores)
+            regions = self._smooth(regions, lower_bound, upper_bound)
+            regions = self._split_long(regions, timestamps, k_scores)
 
-            # if active at the end, add final region
-            if is_active:
-                region = Segment(start - self.pad_onset, t + self.pad_offset)
-                active[region, k] = label
-
-        # because of padding, some active regions might be overlapping: merge them.
-        # also: fill same speaker gaps shorter than min_duration_off
-        if self.pad_offset > 0.0 or self.pad_onset > 0.0 or self.min_duration_off > 0.0:
-            if self.max_duration < float("inf"):
-                raise NotImplementedError(f"This would break current max_duration param")
-            active = active.support(collar=self.min_duration_off)
-
-        # remove tracks shorter than min_duration_on
-        if self.min_duration_on > 0:
-            for segment, track in list(active.itertracks()):
-                if segment.duration < self.min_duration_on:
-                    del active[segment, track]
+            for start, end in regions:
+                active[Segment(start, end), k] = label
 
         return active
 
@@ -206,9 +252,17 @@ class Pyannote(Vad):
                      chunk_size,
                      onset: float = 0.5,
                      offset: Optional[float] = None,
+                     pad_onset: float = 0.0,
+                     pad_offset: float = 0.0,
+                     min_duration_off: float = 0.0,
+                     min_duration_on: float = 0.0,
                      ):
         assert chunk_size > 0
-        binarize = Binarize(max_duration=chunk_size, onset=onset, offset=offset)
+        binarize = Binarize(
+            max_duration=chunk_size, onset=onset, offset=offset,
+            pad_onset=pad_onset, pad_offset=pad_offset,
+            min_duration_off=min_duration_off, min_duration_on=min_duration_on,
+        )
         segments = binarize(segments)
         segments_list = []
         for speech_turn in segments.get_timeline():
@@ -217,5 +271,4 @@ class Pyannote(Vad):
         if len(segments_list) == 0:
             logger.warning("No active speech found in audio")
             return []
-        assert segments_list, "segments_list is empty."
-        return Vad.merge_chunks(segments_list, chunk_size, onset, offset)
+        return Vad.merge_chunks(segments_list, chunk_size)

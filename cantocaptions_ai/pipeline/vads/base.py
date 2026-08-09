@@ -13,17 +13,17 @@ class Vad:
 
     # keep merge_chunks as static so it can be also used by manually assigned vad_model (see 'load_model')
     @staticmethod
-    def merge_chunks(segments,
-                     chunk_size,
-                     onset: float,
-                     offset: Optional[float]):
+    def merge_chunks(segments, chunk_size):
+        """Group speech regions into chunks of at most ``chunk_size`` seconds.
+
+        Each emitted chunk spans contiguously from the first grouped region's start to the
+        last one's end, so silence *between* grouped regions is kept; only the silence at a
+        chunk boundary is left out. Thresholds are not used here — they were already applied
+        when the regions were binarized.
         """
-         Merge operation described in paper
-         """
         curr_end = 0
         merged_segments = []
         seg_idxs: list[tuple]= []
-        speaker_idxs: list[Optional[str]] = []
 
         curr_start = segments[0].start
         for seg in segments:
@@ -35,10 +35,8 @@ class Vad:
                 })
                 curr_start = seg.start
                 seg_idxs = []
-                speaker_idxs = []
             curr_end = seg.end
             seg_idxs.append((seg.start, seg.end))
-            speaker_idxs.append(seg.speaker)
 
         # add final
         merged_segments.append({

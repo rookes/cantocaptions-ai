@@ -64,8 +64,27 @@ class SpotCheck:
     weights: Mapping[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class SegmentationConfig:
+    """Model-specific discourse markers that introduce the clause following them.
+
+    Markers like 嗱/哎吔/喂 are punctuated off by the ASR as their own clause, but acoustically
+    they sit inside a continuous speech run, so forced alignment collapses them to a few
+    frames and they surface as sub-100 ms cues. Cue assembly (``pipeline/segmentation.py``)
+    uses this list to rejoin them *forwards*, onto the sentence they introduce, rather than
+    stranding them on the end of the previous one.
+
+    Only list tokens that reliably *lead*. Final particles (呀, 啦, 吓 -- see
+    ``PARTICLE_CHARS``) are ambiguous: they attach backwards just as often, so they are left
+    to the generic duration-based rescue instead. Empty by default (a no-op), like every
+    other model-profile field.
+    """
+    leading_markers: Tuple[str, ...] = ()
+
+
 DEFAULT_NORMALIZATION = TextNormalization()
 DEFAULT_PUNCTUATION = PunctuationConfig()
+DEFAULT_SEGMENTATION = SegmentationConfig()
 
 
 @lru_cache(maxsize=None)
@@ -108,13 +127,32 @@ def is_punctuation(char):
     "Returns true if char contains only Chinese punctuation chars."
     return re.match(r'[，？！…：；\s\-]', char)
 
-def is_mergeable(text1: str, text2: str, punctuation: PunctuationConfig = DEFAULT_PUNCTUATION) -> bool:
+def boundary_is_mergeable(text1: str, punctuation: PunctuationConfig = DEFAULT_PUNCTUATION) -> bool:
+    """Returns true if a line ending in ``text1`` reads acceptably joined to what follows.
+
+    This is the punctuation half of :func:`is_mergeable`, split out so the cue-assembly
+    passes can reuse one definition of the rule: the adjacency merge applies it as a hard
+    gate, while the short-cue rescue applies it only to *rank* the two possible join
+    directions (see ``pipeline/segmentation.py``).
+    """
+    if len(text1) == 0:
+        return True
+
+    return text1[-1] not in punctuation.split_chars or text1[-1] in punctuation.mergeable_chars
+
+
+def is_mergeable(
+    text1: str,
+    text2: str,
+    punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
+    max_chars: int = MAX_CHARS,
+) -> bool:
     "Returns true if text1 and text2 can be acceptably merged into a single line."
     if len(text1) == 0 or len(text2) == 0:
         return True
 
-    if text1[-1] not in punctuation.split_chars or text1[-1] in punctuation.mergeable_chars:
-        if len(text1 + text2) <= MAX_CHARS:
+    if boundary_is_mergeable(text1, punctuation):
+        if len(text1 + text2) <= max_chars:
             return True
 
     return False

@@ -13,6 +13,7 @@ import unittest
 from cantocaptions_ai.cantonese.text import (
     DEFAULT_NORMALIZATION,
     PunctuationConfig,
+    SegmentationConfig,
     SpotCheck,
     TextNormalization,
     normalize_segment_text,
@@ -32,6 +33,8 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertEqual(dict(profile.spotchecks), {})
         # Standard punctuation.
         self.assertEqual(profile.punctuation, PunctuationConfig())
+        # No discourse markers get a widened rescue window.
+        self.assertEqual(profile.segmentation, SegmentationConfig())
 
     def test_vanilla_qwen_preserves_behavior(self):
         profile = get_model_profile("Qwen3-ASR")
@@ -43,6 +46,8 @@ class TestGetModelProfile(unittest.TestCase):
         gam = profile.spotchecks["咁"]
         self.assertEqual(gam.candidates, ("咁", "噉"))
         self.assertAlmostEqual(gam.weights.get("噉"), 0.8)
+        # Qwen punctuates leading discourse markers off as their own clause.
+        self.assertIn("嗱", profile.segmentation.leading_markers)
 
     def test_finetuned_lora_is_clean_slate(self):
         # Whether registered (env set) or resolved as a passthrough (env unset), the
@@ -51,6 +56,7 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertIsNone(profile.normalization.opencc_config)
         self.assertFalse(profile.normalization.chars_hk)
         self.assertEqual(dict(profile.spotchecks), {})
+        self.assertEqual(profile.segmentation.leading_markers, ())
 
     def test_registry_keys_are_the_cli_choices_source(self):
         # __main__ derives --model choices from these keys.

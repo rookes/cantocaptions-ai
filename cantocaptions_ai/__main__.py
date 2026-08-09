@@ -97,6 +97,9 @@ def build_parser() -> argparse.ArgumentParser:
     vad_grp.add_argument("--vad_method", type=str, default=argparse.SUPPRESS, choices=["pyannote"], help="VAD method to be used")
     vad_grp.add_argument("--vad_onset", type=float, default=argparse.SUPPRESS, help="Onset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected")
     vad_grp.add_argument("--vad_offset", type=float, default=argparse.SUPPRESS, help="Offset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected.")
+    vad_grp.add_argument("--vad_pad_onset", type=float, default=argparse.SUPPRESS, help="seconds of audio to keep before each detected speech region, so word onsets are not clipped at the threshold crossing")
+    vad_grp.add_argument("--vad_pad_offset", type=float, default=argparse.SUPPRESS, help="seconds of audio to keep after each detected speech region, so word tails are not clipped")
+    vad_grp.add_argument("--vad_min_duration_off", type=float, default=argparse.SUPPRESS, help="silences shorter than this (seconds) do not split a speech region; prevents a brief dip mid-word from tearing it in two")
     vad_grp.add_argument("--chunk_size", type=int, default=argparse.SUPPRESS, help="Chunk size for merging VAD segments. Default is 30, reduce this if the chunk is too long.")
 
     isol_grp = parser.add_argument_group("vocal isolation")
@@ -129,6 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
     align_grp.add_argument("--align_padding", type=float, default=argparse.SUPPRESS, help="The minimum allowed timebetween subttitles.")
     align_grp.add_argument("--align_release", type=float, default=argparse.SUPPRESS, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
     align_grp.add_argument("--align_merge_distance", type=float, default=argparse.SUPPRESS, help="The maximum distance between utterances that allows them to be merged.")
+    align_grp.add_argument("--min_cue_duration", type=float, default=argparse.SUPPRESS, help="subtitles shorter than this (seconds) are merged into a neighbouring cue, dropped if they are pure interjection noise, or held longer; 0 disables all three")
+    align_grp.add_argument("--merge_gap", type=float, default=argparse.SUPPRESS, help="the maximum silence (seconds) a too-short subtitle may be merged across; doubled for the discourse markers listed in the ASR model's profile")
     align_grp.add_argument("--align_batch_size", default=argparse.SUPPRESS, type=int, help="number of VAD segments the alignment model processes per batch")
     align_grp.add_argument("--align_compute_type", default=argparse.SUPPRESS, type=str, choices=["float32", "float16"], help="compute type (weight dtype) for the alignment model; float16 lowers VRAM usage but may reduce forced-alignment accuracy (falls back to float32 off CUDA)")
     align_grp.add_argument("--align", "-a", choices=["fast", "quality"], default=argparse.SUPPRESS, help="shorthand for --align_compute_type (fast=float16, quality=float32). Does NOT affect --align_batch_size (no benchmarked safe bump exists for the 'fast' tier — see scripts/bench_alignment_batching.py). The granular --align_compute_type flag always wins if both are given.")

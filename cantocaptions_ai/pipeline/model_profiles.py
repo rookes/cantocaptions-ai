@@ -23,7 +23,9 @@ from typing import Dict, Mapping
 
 from cantocaptions_ai.cantonese.text import (
     DEFAULT_PUNCTUATION,
+    DEFAULT_SEGMENTATION,
     PunctuationConfig,
+    SegmentationConfig,
     SpotCheck,
     TextNormalization,
 )
@@ -40,6 +42,7 @@ class ModelProfile:
     normalization: TextNormalization = TextNormalization()
     punctuation: PunctuationConfig = DEFAULT_PUNCTUATION
     spotchecks: Mapping[str, SpotCheck] = field(default_factory=dict)
+    segmentation: SegmentationConfig = DEFAULT_SEGMENTATION
 
 
 # Vanilla Qwen3-ASR outputs Simplified characters and generic particles, so it needs the
@@ -60,6 +63,16 @@ _QWEN_SPOTCHECKS: Mapping[str, SpotCheck] = {
     "咁": SpotCheck(("咁", "噉"), weights={"噉": 0.8}),
 }
 
+# Qwen punctuates leading discourse markers off as their own clause ("嗱，你知啦，" -> "嗱，"
+# + "你知啦，"), so alignment gives them a standalone subsegment that CTC then squeezes to a
+# few frames. Listing them here rejoins them onto the sentence they introduce.
+# Deliberately excludes 呀/啦/吓: those double as final particles, so they attach backwards
+# about as often as forwards and are better left to the generic duration-based rescue.
+_QWEN_SEGMENTATION = SegmentationConfig(leading_markers=(
+    "嗱", "喂", "咦", "哦", "唉", "誒", "哎",
+    "哎呀", "哎吔", "哇", "嚇", "嗯", "好啦",
+))
+
 
 # Env var pointing at a local fine-tuned/merged LoRA checkpoint directory. Kept out of the
 # source tree so no machine-specific path ships in git: the "Qwen3-ASR-lora" profile is only
@@ -73,11 +86,13 @@ def _build_profiles() -> Dict[str, ModelProfile]:
             hf_id="Qwen/Qwen3-ASR-1.7B-hf",
             normalization=_QWEN_NORMALIZATION,
             spotchecks=_QWEN_SPOTCHECKS,
+            segmentation=_QWEN_SEGMENTATION,
         ),
         "Qwen3-ASR-0.6B": ModelProfile(
             hf_id="Qwen/Qwen3-ASR-0.6B-hf",
             normalization=_QWEN_NORMALIZATION,
             spotchecks=_QWEN_SPOTCHECKS,
+            segmentation=_QWEN_SEGMENTATION,
         ),
     }
     # Fine-tuned checkpoint: already emits HK-traditional text and custom final particles,

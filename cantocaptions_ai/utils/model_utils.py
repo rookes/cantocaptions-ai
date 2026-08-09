@@ -465,16 +465,24 @@ def guard_model_load(stage: str, remediation: str, load_fn: Callable[[], _ModelT
 def ensure_hf_model_downloaded(repo_id: str, cache_dir=None, local_files_only: bool = False) -> None:
     """Download a full HF Hub repo snapshot to the local cache if not already present.
 
-    Logs before/after the download so a first-run fetch (which can take a while and
-    would otherwise produce no visible signal until it completes) doesn't look like a
-    hang. Uses huggingface_hub.snapshot_download, which skips files already cached.
+    Always calls snapshot_download, which is incremental: with a complete cache it
+    costs one metadata round-trip and downloads nothing. It is deliberately *not*
+    gated on a cheap "is anything cached?" probe — a snapshot can be partial (an
+    upstream revision bump that landed config.json but not the weights, or an
+    interrupted first fetch), and such a cache passes any single-file probe while
+    still failing at load time. Re-running the download is what repairs it.
+
+    Logs before/after only when the cache looks incomplete, so a first-run fetch
+    (which can take a while and would otherwise produce no visible signal until it
+    completes) doesn't look like a hang, without narrating a no-op every run.
     """
     if local_files_only:
         return
     from huggingface_hub import snapshot_download, try_to_load_from_cache
 
-    probe = try_to_load_from_cache(repo_id, "config.json", cache_dir=cache_dir)
-    if probe is not None:
+    if try_to_load_from_cache(repo_id, "config.json", cache_dir=cache_dir) is not None:
+        logger.debug("Verifying cached snapshot of %r against HuggingFace Hub", repo_id)
+        snapshot_download(repo_id, cache_dir=cache_dir)
         return
 
     try:

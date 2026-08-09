@@ -7,12 +7,18 @@ import numpy as np
 import torch
 
 from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE
-from cantocaptions_ai.utils.schema import AlignedTranscriptionResult, ProcessingItem, ProgressCallback, VadItem, merge_segments
+from cantocaptions_ai.utils.schema import AlignedTranscriptionResult, ProcessingItem, ProgressCallback, VadItem
 from typing import Callable, List, Optional
 from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer
 from cantocaptions_ai.utils.log_utils import ProgressSink, StageTimer, TranscriptionSummary, get_logger
 from cantocaptions_ai.utils.model_utils import model_scope, flush_vram, vram_stats, load_with_offline_fallback
-from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION, is_mergeable, is_removable
+from cantocaptions_ai.cantonese.text import (
+    DEFAULT_PUNCTUATION,
+    DEFAULT_SEGMENTATION,
+    MAX_CHARS,
+    is_removable,
+)
+from cantocaptions_ai.pipeline.segmentation import assemble_cues
 from cantocaptions_ai.utils.debug import _debug_stage_exists, write_precleaning_debug
 from cantocaptions_ai.pipeline.vad import VadProcessor
 
@@ -248,18 +254,36 @@ def _merge_and_write(
     cleaner=None,
     debug_dir: Optional[str] = None,
     punctuation=DEFAULT_PUNCTUATION,
+    segmentation=DEFAULT_SEGMENTATION,
+    min_cue_duration: float = 0.5,
+    merge_gap: float = 0.25,
+    max_line_width: Optional[int] = None,
+    max_line_count: Optional[int] = None,
     *,
     collect: bool = False,
     audio_start_offset: float = 0.0,
     display_paths: Optional[dict] = None,
 ) -> List[ProcessingItem]:
-    """Merge, clean, offset, then write (unless writer is None) and/or return results.
+    """Assemble cues, clean, offset, then write (unless writer is None) and/or return results.
 
     ``display_paths`` maps a (possibly clip-substituted temp) audio path back to the
     original path so output filenames and returned results reference the source file,
     not the temp clip. ``collect`` returns the final per-item results for in-memory
     (server) use; ``writer`` is None when nothing should be written to disk.
     """
+    # An ordinary merge is capped at one subtitle line, but a short-cue rescue may use the
+    # full multi-line budget -- the cleaner's linebreak step will split the result across
+    # max_line_count lines anyway. Fall back to the single-line cap when line limits are off
+    # (e.g. under --no_align, where both are required to be unset).
+    rescue_max_chars = (
+        max_line_width * max_line_count
+        if max_line_width and max_line_count
+        else MAX_CHARS
+    )
+    # Reuse the cleaner as the single source of truth for "is this line pure noise": a cue
+    # whose cleaned text is removable would have been dropped later anyway, so dropping it
+    # before the rescue pass just stops it being glued onto a neighbour first.
+    is_noise = (lambda text: is_removable(cleaner.clean(text))) if cleaner is not None else None
     finalized: List[ProcessingItem] = []
     for item in items:
         result = item['result']
@@ -268,29 +292,17 @@ def _merge_and_write(
             audio_path = display_paths.get(audio_path, audio_path)
         result["language"] = align_language
 
-        new_segments = []
-        prev_segment = None
-
-        for segment in result["segments"]:
-            text = segment["text"].strip()
-            start = segment["start"]
-
-            if prev_segment is None:
-                new_segments.append(segment)
-                prev_segment = segment
-                continue
-
-            prev_text = prev_segment["text"]
-            prev_end = prev_segment["end"]
-
-            if start - prev_end <= align_merge_distance - align_padding and is_mergeable(prev_text, text, punctuation):
-                new_seg = merge_segments(prev_segment, segment)
-                new_segments.pop()
-                new_segments.append(new_seg)
-                prev_segment = new_seg
-            else:
-                new_segments.append(segment)
-                prev_segment = segment
+        new_segments = assemble_cues(
+            result["segments"],
+            punctuation=punctuation,
+            segmentation=segmentation,
+            align_merge_distance=align_merge_distance,
+            align_padding=align_padding,
+            min_cue_duration=min_cue_duration,
+            merge_gap=merge_gap,
+            rescue_max_chars=rescue_max_chars,
+            is_noise=is_noise,
+        )
 
         result["segments"] = new_segments  # TODO: update word_segments as well
 
@@ -566,6 +578,9 @@ def _execute_pipeline(
                 device_index=cfg.device_index,
                 vad_onset=cfg.vad_onset,
                 vad_offset=cfg.vad_offset,
+                vad_pad_onset=cfg.vad_pad_onset,
+                vad_pad_offset=cfg.vad_pad_offset,
+                vad_min_duration_off=cfg.vad_min_duration_off,
                 chunk_size=cfg.chunk_size,
                 vad_model=vad_model,
                 use_auth_token=cfg.hf_token,
@@ -786,6 +801,9 @@ def _execute_pipeline(
     results = _merge_and_write(
         items, writer, align_language, cfg.align_merge_distance, cfg.align_padding, writer_args,
         cleaner=cleaner, debug_dir=cfg.debug_dir, punctuation=profile.punctuation,
+        segmentation=profile.segmentation, min_cue_duration=cfg.min_cue_duration,
+        merge_gap=cfg.merge_gap, max_line_width=cfg.max_line_width,
+        max_line_count=cfg.max_line_count,
         collect=collect, audio_start_offset=audio_start_offset, display_paths=display_paths,
     )
 

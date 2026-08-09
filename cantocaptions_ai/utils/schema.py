@@ -127,13 +127,21 @@ class ProcessingItem(TypedDict):
 
 
 def merge_segments(seg1: SingleAlignedSegment, seg2: SingleAlignedSegment) -> SingleAlignedSegment:
-    """Merge two adjacent aligned segments into one."""
+    """Merge two adjacent aligned segments into one.
+
+    Starts from a copy of ``seg1`` so keys attached by later stages (``speaker`` from
+    diarization/verification, and anything else a caller carries) survive the merge; only the
+    fields that a merge actually redefines are overridden. ``avg_logprob`` is cleared because
+    it is genuinely undefined for a merged cue.
+    """
     s3_chars = (seg1.get("chars") or []) + (seg2.get("chars") or [])
-    return {
+    merged = dict(seg1)
+    merged.update({
         "start": seg1["start"],
         "end": seg2["end"],
         "text": seg1["text"] + seg2["text"],
         "avg_logprob": None,
         "words": seg1["words"] + seg2["words"],
         "chars": s3_chars or None,
-    }
+    })
+    return merged

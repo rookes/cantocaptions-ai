@@ -160,6 +160,7 @@ class PipelineService:
         key = (
             cfg.vad_method, cfg.device, cfg.device_index,
             cfg.vad_onset, cfg.vad_offset, cfg.chunk_size, cfg.hf_token,
+            cfg.vad_pad_onset, cfg.vad_pad_offset, cfg.vad_min_duration_off,
         )
         if self._vad_model is None or self._vad_key != key:
             from cantocaptions_ai.pipeline.vad import load_vad
@@ -170,6 +171,9 @@ class PipelineService:
                 device_index=cfg.device_index,
                 vad_onset=cfg.vad_onset,
                 vad_offset=cfg.vad_offset,
+                vad_pad_onset=cfg.vad_pad_onset,
+                vad_pad_offset=cfg.vad_pad_offset,
+                vad_min_duration_off=cfg.vad_min_duration_off,
                 chunk_size=cfg.chunk_size,
                 use_auth_token=cfg.hf_token,
             )

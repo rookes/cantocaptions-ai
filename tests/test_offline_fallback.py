@@ -1,9 +1,12 @@
-"""Tests for the offline-fallback helpers (cantocaptions_ai/utils/model_utils.py).
+"""Tests for the HF cache helpers (cantocaptions_ai/utils/model_utils.py).
 
 When the machine is offline but all models are cached, HuggingFace loaders can raise
 on their revision check instead of falling back to the cache. load_with_offline_fallback
 retries such a failure against the local cache: it enables process-wide offline mode
 and, if the loader exposes a local_files_only/model_cache_only flag, forces it True.
+
+ensure_hf_model_downloaded covers the other direction: keeping the cache complete, so
+a partially-cached snapshot doesn't reach a loader that will fail on the missing file.
 
 All CPU-only; no network or model files are touched (loaders are faked).
 """
@@ -18,6 +21,7 @@ import cantocaptions_ai.utils.model_utils as mu
 from cantocaptions_ai.utils.model_utils import (
     load_with_offline_fallback,
     enable_hf_offline,
+    ensure_hf_model_downloaded,
     _looks_offline,
 )
 
@@ -141,6 +145,38 @@ class TestLoadWithOfflineFallback(unittest.TestCase):
         with self.assertRaises(requests.exceptions.ConnectionError):
             load_with_offline_fallback(loader, local_files_only=False)
         self.assertEqual(calls, [False, True])  # exactly one retry, then give up
+
+
+class TestEnsureHfModelDownloaded(unittest.TestCase):
+    """snapshot_download must run even when the cache already has something.
+
+    A snapshot can be partial — an upstream revision bump that landed config.json but
+    not the weights, or an interrupted first fetch — and any single-file probe reports
+    that cache as present. Skipping the (incremental) download on such a probe leaves
+    the gap in place until the loader fails on it.
+    """
+
+    def _run(self, probe_result, **kwargs):
+        with mock.patch("huggingface_hub.snapshot_download") as snap, \
+             mock.patch("huggingface_hub.try_to_load_from_cache", return_value=probe_result):
+            ensure_hf_model_downloaded("some/repo", **kwargs)
+        return snap
+
+    def test_downloads_when_nothing_cached(self):
+        snap = self._run(None)
+        snap.assert_called_once_with("some/repo", cache_dir=None)
+
+    def test_still_downloads_when_probe_finds_a_cached_file(self):
+        snap = self._run("/cache/some--repo/snapshots/abc/config.json")
+        snap.assert_called_once_with("some/repo", cache_dir=None)
+
+    def test_cache_dir_is_forwarded(self):
+        snap = self._run(None, cache_dir="/models")
+        snap.assert_called_once_with("some/repo", cache_dir="/models")
+
+    def test_local_files_only_skips_the_hub_entirely(self):
+        snap = self._run(None, local_files_only=True)
+        snap.assert_not_called()
 
 
 if __name__ == "__main__":
