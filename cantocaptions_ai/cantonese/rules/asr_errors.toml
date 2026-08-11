@@ -555,3 +555,7 @@ replace = '阻頭阻勢'
 [[rules]]
 pattern = '大爛林頭'
 replace = '大難臨頭'
+
+[[rules]]
+pattern = '摘花'
+replace = '紮花'

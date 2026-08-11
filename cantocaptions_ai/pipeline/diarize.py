@@ -1,288 +1,381 @@
-import sys
+"""Speaker diarization via pyannote's speaker-diarization-community-1 pipeline.
+
+This stage answers only "who spoke when". Turning those turns into segment labels is a
+separate, model-free concern and lives in ``pipeline/speaker_assign.py``.
+
+Runs after alignment, so the speaker turns can be mapped onto the over-split subsegments that
+cue assembly is about to glue back together -- see ``pipeline/segmentation.py``, which refuses
+to merge across a confident speaker change.
+
+Two scopes, as sibling strategies over a shared base (the same shape as the VAD and ASR
+backends):
+
+- ``SegmentDiarization`` (default) diarizes each VAD segment independently. Speaker identity
+  is then only meaningful *within* a segment, so labels are namespaced with the segment id
+  (``S0007/SPEAKER_00``) and the merge gate ignores comparisons across that boundary. This
+  matches what the gate actually asks -- "is the voice in these two adjacent clauses the same
+  one?" -- which is a local question that global clustering can only get wrong.
+- ``FileDiarization`` diarizes the whole file in one pass, giving globally consistent speaker
+  identities at the cost of every clustering error being spread across the episode.
+"""
+
+import logging
+from typing import List, Optional
+
 import numpy as np
-import pandas as pd
-from typing import Optional, Union, List, Tuple
 import torch
 
-from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE
-from cantocaptions_ai.utils.schema import TranscriptionResult, AlignedTranscriptionResult, ProgressCallback
+from cantocaptions_ai.pipeline.speaker_assign import scoped_speaker, segment_scope_id
+from cantocaptions_ai.utils.audio import SAMPLE_RATE, load_audio, resolve_device
+from cantocaptions_ai.utils.debug import load_diarization_debug, write_diarization_debug
 from cantocaptions_ai.utils.log_utils import get_logger
+from cantocaptions_ai.utils.model_utils import (
+    MemoryPolicy,
+    PipelineStage,
+    flush_vram,
+    partition_by_cache,
+    vram_stats,
+)
+from cantocaptions_ai.utils.schema import (
+    DiarizationResult,
+    ProgressCallback,
+    SpeakerTurn,
+    VadAudioSegment,
+)
 
 logger = get_logger(__name__)
 
+DEFAULT_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
 
-class IntervalTree:
+DIARIZE_SCOPES = ("segment", "file")
+
+# Below this a VAD segment carries too little speech for the segmentation model's sliding
+# window to say anything useful, and asking anyway invites a spurious second speaker. Such
+# segments are left undiarized, which reads downstream as "unknown" (merge-permissive).
+MIN_SEGMENT_DURATION = 0.5
+
+
+def _to_turns(annotation, *, offset: float = 0.0, scope: Optional[str] = None) -> List[SpeakerTurn]:
+    """Flatten a ``pyannote.core.Annotation`` into sorted plain-dict speaker turns.
+
+    ``offset`` shifts segment-relative times back onto the file timeline; ``scope`` namespaces
+    the speaker labels so identities from different segments can never be confused for each
+    other (see ``speaker_assign.speaker_scope``).
     """
-    Simple interval tree for fast overlap queries using sorted array + binary search.
+    turns: List[SpeakerTurn] = [
+        {
+            "start": round(segment.start + offset, 3),
+            "end": round(segment.end + offset, 3),
+            "speaker": scoped_speaker(scope, speaker) if scope else speaker,
+        }
+        for segment, _, speaker in annotation.itertracks(yield_label=True)
+    ]
+    turns.sort(key=lambda turn: (turn["start"], turn["end"]))
+    return turns
 
-    Uses O(n) space and provides O(log n) query time instead of O(n) linear scan.
-    This achieves ~228x speedup for speaker assignment in long-form content.
+
+class _BaseDiarization(PipelineStage):
+    """Shared plumbing for the two diarization scopes: the model, the checkpoint, the carrier.
+
+    Subclasses supply ``_extract`` (what slice of the item they need) and ``process`` (how
+    they drive the model over it).
     """
 
-    def __init__(self, intervals: List[Tuple[float, float, str]]):
-        """
-        Initialize the interval tree with diarization segments.
+    scope: str
 
-        Args:
-            intervals: List of (start, end, speaker) tuples
-        """
-        if not intervals:
-            self.starts = np.array([])
-            self.ends = np.array([])
-            self.speakers: List[str] = []
-            return
-
-        # Sort intervals by start time for binary search
-        sorted_intervals = sorted(intervals, key=lambda x: x[0])
-        self.starts = np.array([i[0] for i in sorted_intervals], dtype=np.float64)
-        self.ends = np.array([i[1] for i in sorted_intervals], dtype=np.float64)
-        self.speakers = [i[2] for i in sorted_intervals]
-
-    def query(self, start: float, end: float) -> List[Tuple[str, float]]:
-        """
-        Find all intervals that overlap with [start, end] and compute intersection.
-
-        Args:
-            start: Query interval start time
-            end: Query interval end time
-
-        Returns:
-            List of (speaker, intersection_duration) tuples for overlapping segments
-        """
-        if len(self.starts) == 0:
-            return []
-
-        # Binary search to find candidate intervals
-        # Only intervals with start < end could overlap
-        right_idx = np.searchsorted(self.starts, end, side='left')
-        if right_idx == 0:
-            return []
-
-        # Check candidates for actual overlap
-        candidates = slice(0, right_idx)
-        overlaps = (self.starts[candidates] < end) & (self.ends[candidates] > start)
-
-        results = []
-        for idx in np.where(overlaps)[0]:
-            intersection = min(self.ends[idx], end) - max(self.starts[idx], start)
-            if intersection > 0:
-                results.append((self.speakers[idx], intersection))
-        return results
-
-    def find_nearest(self, time: float) -> Optional[str]:
-        """
-        Find the speaker of the nearest segment to a given time point.
-
-        Args:
-            time: Time point to find nearest segment for
-
-        Returns:
-            Speaker ID of nearest segment, or None if no segments exist
-        """
-        if len(self.starts) == 0:
-            return None
-
-        # Calculate midpoints of all segments
-        mids = (self.starts + self.ends) / 2
-        nearest_idx = np.argmin(np.abs(mids - time))
-        return self.speakers[nearest_idx]
-
-
-class DiarizationPipeline:
     def __init__(
         self,
-        model_name=None,
-        token=None,
-        device: Optional[Union[str, torch.device]] = "cpu",
-        cache_dir=None,
-    ):
-        if isinstance(device, str):
-            device = torch.device(device)
-        self.device = device
-        if sys.platform != "linux":
-            raise RuntimeError(
-                "Diarization (--diarize) requires NeMo, which is only supported on Linux. "
-                "Run on a Linux system to use this feature."
-            )
-        import nemo.collections.asr as nemo_asr
-        model_config = model_name or "pyannote/speaker-diarization-community-1"
-        logger.info(f"Loading diarization model: {model_config}")
-
-        self.model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained("nvidia/speakerverification_en_titanet_large").to(device)
-        self.model.eval()
-
-    def __call__(
-        self,
-        audio: Union[str, np.ndarray],
-        num_speakers: Optional[int] = None,
+        pipeline,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
         return_embeddings: bool = False,
-        progress_callback: ProgressCallback = None,
-    ) -> Union[tuple[pd.DataFrame, Optional[dict[str, list[float]]]], pd.DataFrame]:
-        """
-        Perform speaker diarization on audio.
+        device_index: Optional[int] = None,
+    ):
+        self.pipeline = pipeline
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
+        self.return_embeddings = return_embeddings
+        self.device_index = device_index
 
-        Args:
-            audio: Path to audio file or audio array
-            num_speakers: Exact number of speakers (if known)
-            min_speakers: Minimum number of speakers to detect
-            max_speakers: Maximum number of speakers to detect
-            return_embeddings: Whether to return speaker embeddings
-            progress_callback: Optional callable receiving a float (0-100) with progress percentage
+    @staticmethod
+    def read_debug(audio_path, debug_dir): return load_diarization_debug(audio_path, debug_dir)
 
-        Returns:
-            If return_embeddings is True:
-                Tuple of (diarization dataframe, speaker embeddings dictionary)
-            Otherwise:
-                Just the diarization dataframe
+    @staticmethod
+    def write_debug(audio_path, result, debug_dir): write_diarization_debug(audio_path, result, debug_dir)
+
+    @staticmethod
+    def _pack(item, result): return {**item, 'diarization': result}
+
+    def _annotate(self, waveform: np.ndarray):
+        """Run the pipeline over one waveform and return pyannote's ``DiarizeOutput``.
+
+        Audio is handed over in memory rather than by path so the caller controls exactly
+        what is diarized -- the chosen audio track, or a single vocal-isolated VAD segment.
         """
-        if isinstance(audio, str):
-            audio = load_audio(audio)
-        audio_data = {
-            'waveform': torch.from_numpy(audio[None, :]).to(self.device),
-            'sample_rate': SAMPLE_RATE,
-            'input_signal': torch.from_numpy(audio[None, :]).to(self.device),
-            'input_len': torch.tensor([torch.from_numpy(audio[None, :]).shape[1]]).to(self.device)
+        file = {
+            "waveform": torch.from_numpy(waveform).unsqueeze(0),
+            "sample_rate": SAMPLE_RATE,
         }
-
-        hook = None
-        if progress_callback is not None:
-            # pyannote's diarization has two progress-trackable steps, each with
-            # its own completed/total counter that resets between steps. Map each
-            # step into a sub-range so progress is monotonic and meaningful.
-            _STEP_RANGES = {
-                "segmentation": (0.0, 50.0),
-                "embeddings": (50.0, 99.0),
-            }
-            last_pct = [0.0]
-            def hook(step_name, step_artifact, file=None, total=None, completed=None):
-                if total is not None and completed is not None and total > 0:
-                    offset, end = _STEP_RANGES.get(step_name, (0.0, 99.0))
-                    pct = offset + min(completed / total, 1.0) * (end - offset)
-                    if pct > last_pct[0]:
-                        last_pct[0] = pct
-                        progress_callback(pct)
-
-        # Convert to Mel spectrogram
-        processed_signal, processed_len = self.model.preprocessor(
-            input_signal=audio_data["input_signal"],
-            length=audio_data["input_len"]
+        return self.pipeline(
+            file, min_speakers=self.min_speakers, max_speakers=self.max_speakers
         )
 
-        _, embs = self.model.forward(input_signal=audio_data["input_signal"], input_signal_length=audio_data["input_len"])
-        emb_shape = embs.shape[-1]
-        embs = embs.view(-1, emb_shape)
-        all_embs = embs.cpu().detach()
+
+class FileDiarization(_BaseDiarization):
+    """Diarize a whole file in one pass: globally consistent speakers, global failure modes."""
+
+    scope = "file"
+
+    @staticmethod
+    def _extract(item): return load_audio(item['audio_path'], audio_track=item.get('audio_track', 0))
+
+    def process(
+        self, input: np.ndarray, *, progress_callback: ProgressCallback = None
+    ) -> DiarizationResult:
+        """Diarize one file's waveform.
+
+        Progress stays at the base class's one-unit-per-file granularity: pyannote's per-batch
+        hook only learns its batch count once the model is already running, and
+        ``StageTimer._start_determinate`` replaces the bar on every ``set_total`` (see the same
+        note in ``vocal_isolation.run``), so a per-file total would reset the bar each file.
+        """
+        output = self._annotate(input)
+
+        # Exclusive diarization drops overlapping speech, which is what segment attribution
+        # wants: a subsegment should be credited to whoever actually carries it, not to both
+        # parties of a moment of crosstalk. The overlapping version is kept for debugging.
+        speakers = sorted(output.speaker_diarization.labels())
+        result: DiarizationResult = {
+            "scope": self.scope,
+            "speakers": speakers,
+            "turns": _to_turns(output.exclusive_speaker_diarization),
+            "overlap_turns": _to_turns(output.speaker_diarization),
+        }
+
+        if self.return_embeddings and output.speaker_embeddings is not None:
+            # speaker_embeddings rows follow speaker_diarization.labels() order.
+            result["embeddings"] = {
+                speaker: output.speaker_embeddings[index].tolist()
+                for index, speaker in enumerate(output.speaker_diarization.labels())
+            }
+
+        logger.info(f"Diarization found {len(speakers)} speaker(s): {', '.join(speakers)}")
+        return result
+
+
+class SegmentDiarization(_BaseDiarization):
+    """Diarize each VAD segment independently, namespacing speakers by segment id.
+
+    The merge gate only ever compares *adjacent* cues, so it only needs to know whether two
+    neighbouring clauses share a voice. That is a local question; answering it locally avoids
+    inheriting the errors of clustering a whole episode into a fixed speaker set. The cost is
+    that identities are not comparable between segments, which the ``S0007/`` prefix makes
+    explicit and ``segmentation._same_speaker`` honours by declining to compare across it.
+    """
+
+    scope = "segment"
+
+    def __init__(self, *args, flush_every: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.flush_every = flush_every
+
+    def _release(self, position: int, index: int) -> None:
+        """Trace VRAM at debug level, and optionally return cached blocks to the driver.
+
+        ``flush_every`` defaults to 0 (off), matching BatchExecutor. Measurement showed live
+        allocation flat at 42 MB across segments -- diarization does not accumulate between
+        calls, so there is nothing for a flush to reclaim. What breaks it is the *in-call*
+        peak, which is governed by --diarize_batch_size, not by flushing.
+        """
+        if self.flush_every and position % self.flush_every == 0:
+            flush_vram()
+        if logger.isEnabledFor(logging.DEBUG):
+            stats = vram_stats(self.device_index)
+            if stats is not None:
+                # peak is the number that matters: a segment fails not by leaking but by its
+                # in-call high-water mark exceeding the card. free/total come from
+                # torch.cuda.mem_get_info, which on Windows/WDDM does NOT agree with Task
+                # Manager's dedicated-memory figure -- the driver can page an oversubscribed
+                # allocation into host RAM while CUDA still reports memory free -- so read
+                # peak, not free, when judging whether a segment fits.
+                logger.debug(
+                    "Diarization segment %d: VRAM live %.0f MB, peak %.0f MB, reserved %.0f MB "
+                    "(mem_get_info says %.0f MB free of %.0f MB; unreliable on Windows)",
+                    index, stats['allocated_mb'], torch.cuda.max_memory_allocated(
+                        self.device_index if self.device_index is not None else 0
+                    ) / 1e6,
+                    stats['reserved_mb'], stats['free_mb'], stats['total_mb'],
+                )
+            torch.cuda.reset_peak_memory_stats(
+                self.device_index if self.device_index is not None else 0
+            )
+
+    @staticmethod
+    def _extract(item) -> List[VadAudioSegment]:
+        segments = item.get('vad_segments')
+        if segments is None:
+            raise RuntimeError(
+                "--diarize_scope segment needs the VAD segments, which are not available for "
+                f"'{item['audio_path']}' (this happens under --retime). "
+                "Use --diarize_scope file instead."
+            )
+        return segments
+
+    def process(
+        self, input: List[VadAudioSegment], *, progress_callback: ProgressCallback = None
+    ) -> DiarizationResult:
+        """Diarize each VAD segment and merge the results onto the file timeline."""
+        turns: List[SpeakerTurn] = []
+        overlap_turns: List[SpeakerTurn] = []
+        speakers: List[str] = []
+        breakdown = []
+        skipped = 0
+
+        # Longest segment first. Every segment is a separate model invocation over a
+        # differently shaped tensor, so in input order the caching allocator meets a longer
+        # segment than it has ever seen again and again, and its reserved pool ratchets up
+        # instead of being reused. Front-loading the biggest one sizes the pool once, up
+        # front (the same reasoning as BatchExecutor.order_key). Results are keyed by index
+        # and re-sorted below, so processing order does not affect output.
+        order = sorted(range(len(input)), key=lambda i: len(input[i]["audio"]), reverse=True)
+
+        for position, index in enumerate(order):
+            segment = input[index]
+            duration = segment["end"] - segment["start"]
+            if duration < MIN_SEGMENT_DURATION:
+                skipped += 1
+            else:
+                scope = segment_scope_id(index)
+                output = self._annotate(segment["audio"])
+                self._release(position, index)
+                local = sorted(output.speaker_diarization.labels())
+                speakers.extend(scoped_speaker(scope, label) for label in local)
+                # Segment audio starts at t=0; shift back onto the file timeline.
+                turns.extend(_to_turns(
+                    output.exclusive_speaker_diarization, offset=segment["start"], scope=scope
+                ))
+                overlap_turns.extend(_to_turns(
+                    output.speaker_diarization, offset=segment["start"], scope=scope
+                ))
+                breakdown.append({
+                    "index": index,
+                    "start": round(segment["start"], 3),
+                    "end": round(segment["end"], 3),
+                    "scope": scope,
+                    "speakers": local,
+                })
+            if progress_callback is not None:
+                progress_callback.advance(1)
+
+        turns.sort(key=lambda turn: (turn["start"], turn["end"]))
+        overlap_turns.sort(key=lambda turn: (turn["start"], turn["end"]))
+        breakdown.sort(key=lambda entry: entry["index"])
+
+        multi = sum(1 for entry in breakdown if len(entry["speakers"]) > 1)
+        logger.info(
+            "Diarization: %d/%d VAD segments diarized (%d skipped as shorter than %.2gs), "
+            "%d with more than one speaker",
+            len(breakdown), len(input), skipped, MIN_SEGMENT_DURATION, multi,
+        )
+        return {
+            "scope": self.scope,
+            "speakers": sorted(speakers),
+            "turns": turns,
+            "overlap_turns": overlap_turns,
+            "segment_speakers": breakdown,
+        }
+
+    def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback=None):
+        """Override the per-file bar with a per-segment one.
+
+        Unlike whole-file diarization, the unit count is knowable before the model runs, so a
+        single ``set_total`` up front spans every file (``StageTimer._start_determinate``
+        closes and replaces the bar on each call, so it must only be called once).
+        """
+        cached, to_compute = partition_by_cache(items, self.read_debug, load_debug_dir)
 
         if progress_callback is not None:
-            progress_callback(100.0)
+            progress_callback.set_total(
+                sum(len(self._extract(item)) for _, item in to_compute), unit="seg"
+            )
 
-        import torch.nn.functional as F
-        diarization = F.cosine_similarity(all_embs, all_embs)
+        results = dict(cached)
+        for index, item in to_compute:
+            result = self.process(self._extract(item), progress_callback=progress_callback)
+            if debug_dir:
+                self.write_debug(item['audio_path'], result, debug_dir)
+            results[index] = result
 
-        diarize_df = pd.DataFrame(diarization.itertracks(yield_label=True), columns=['segment', 'label', 'speaker'])
-        diarize_df['start'] = diarize_df['segment'].apply(lambda x: x.start)
-        diarize_df['end'] = diarize_df['segment'].apply(lambda x: x.end)
-
-        if return_embeddings and embeddings is not None:
-            speaker_embeddings = {speaker: embeddings[s].tolist() for s, speaker in enumerate(diarization.labels())}
-            return diarize_df, speaker_embeddings
-
-        # For backwards compatibility
-        if return_embeddings:
-            return diarize_df, None
-        else:
-            return diarize_df
+        return [self._pack(item, results[i]) for i, item in enumerate(items)]
 
 
-def assign_word_speakers(
-    diarize_df: pd.DataFrame,
-    transcript_result: Union[AlignedTranscriptionResult, TranscriptionResult],
-    speaker_embeddings: Optional[dict[str, list[float]]] = None,
-    fill_nearest: bool = False,
-) -> Union[AlignedTranscriptionResult, TranscriptionResult]:
+_SCOPES = {cls.scope: cls for cls in (SegmentDiarization, FileDiarization)}
+
+
+def load_diarization_cache(items: List[dict], debug_dir: str) -> List[dict]:
+    """Attach every item's cached diarization without loading a model.
+
+    Scope-independent: the checkpoint records which scope produced it, and reading it back
+    needs neither the model nor the scope's own logic.
     """
-    Assign speakers to words and segments in the transcript.
-
-    Uses an interval tree for O(log n) overlap queries instead of O(n) linear scan,
-    achieving ~228x speedup for long-form content (3+ hour podcasts).
-
-    Args:
-        diarize_df: Diarization dataframe from DiarizationPipeline
-        transcript_result: Transcription result to augment with speaker labels
-        speaker_embeddings: Optional dictionary mapping speaker IDs to embedding vectors
-        fill_nearest: If True, assign speakers even when there's no direct time overlap
-
-    Returns:
-        Updated transcript_result with speaker assignments and optionally embeddings
-    """
-    transcript_segments = transcript_result.get("segments", [])
-    if not transcript_segments or diarize_df is None or len(diarize_df) == 0:
-        return transcript_result
-
-    # Build interval tree from diarization segments for O(log n) queries
-    intervals = [
-        (row['start'], row['end'], row['speaker'])
-        for _, row in diarize_df.iterrows()
-    ]
-    tree = IntervalTree(intervals)
-
-    for seg in transcript_segments:
-        seg_start = seg.get('start', 0.0)
-        seg_end = seg.get('end', 0.0)
-
-        # Query overlapping segments using interval tree
-        overlaps = tree.query(seg_start, seg_end)
-
-        if overlaps:
-            # Sum intersection durations per speaker and pick the dominant one
-            speaker_intersections: dict[str, float] = {}
-            for speaker, intersection in overlaps:
-                speaker_intersections[speaker] = speaker_intersections.get(speaker, 0.0) + intersection
-            seg['speaker'] = max(speaker_intersections.items(), key=lambda x: x[1])[0]
-        elif fill_nearest:
-            # Find nearest segment if no overlap
-            seg_mid = (seg_start + seg_end) / 2
-            nearest_speaker = tree.find_nearest(seg_mid)
-            if nearest_speaker:
-                seg['speaker'] = nearest_speaker
-
-        # Assign speaker to words
-        if 'words' in seg:
-            for word in seg['words']:
-                if 'start' not in word:
-                    continue
-
-                word_start = word['start']
-                word_end = word.get('end', word_start)
-
-                word_overlaps = tree.query(word_start, word_end)
-
-                if word_overlaps:
-                    speaker_intersections = {}
-                    for speaker, intersection in word_overlaps:
-                        speaker_intersections[speaker] = speaker_intersections.get(speaker, 0.0) + intersection
-                    word['speaker'] = max(speaker_intersections.items(), key=lambda x: x[1])[0]
-                elif fill_nearest:
-                    word_mid = (word_start + word_end) / 2
-                    nearest_speaker = tree.find_nearest(word_mid)
-                    if nearest_speaker:
-                        word['speaker'] = nearest_speaker
-
-            seg_text = seg["text"]
-            seg_speaker = seg["speaker"]
-            word_speakers = pd.DataFrame(seg["words"])
-
-    # Add speaker embeddings to the result if provided
-    if speaker_embeddings is not None:
-        transcript_result["speaker_embeddings"] = speaker_embeddings
-
-    return transcript_result
+    return _BaseDiarization.load_cache(items, debug_dir)
 
 
-class Segment:
-    def __init__(self, start:int, end:int, speaker:Optional[str]=None):
-        self.start = start
-        self.end = end
-        self.speaker = speaker
+def load_diarization(
+    device: str = "cpu",
+    device_index: int = 0,
+    model_name: str = DEFAULT_DIARIZE_MODEL,
+    token: Optional[str] = None,
+    model_dir: Optional[str] = None,
+    scope: str = "segment",
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    return_embeddings: bool = False,
+    batch_size: Optional[int] = None,
+    vram_checks: bool = True,
+    vram_headroom_mb: int = 512,
+) -> _BaseDiarization:
+    """Load the diarization pipeline and return the processor for the requested scope."""
+    try:
+        processor_cls = _SCOPES[scope]
+    except KeyError:
+        raise ValueError(
+            f"Unknown diarize_scope {scope!r}; choose from {sorted(_SCOPES)}"
+        ) from None
+
+    # Import from pyannote.audio.core.pipeline rather than pyannote.audio.pipelines: the
+    # package __init__ eagerly imports speaker_verification, which probes for NeMo,
+    # speechbrain and onnxruntime. Same reasoning as vads/pyannote.py.
+    from pyannote.audio.core.pipeline import Pipeline
+
+    logger.info(f"Loading diarization model: {model_name} (scope: {scope})")
+    pipeline = Pipeline.from_pretrained(model_name, token=token, cache_dir=model_dir)
+    if pipeline is None:
+        raise RuntimeError(
+            f"Could not load diarization pipeline '{model_name}'. It is a gated model: accept "
+            "its terms on huggingface.co and pass a token via --hf_token."
+        )
+    # The checkpoint's own config sets both batch sizes (32 for community-1), which is
+    # tuned for one pass over a whole file. Under segment scope the model runs once per VAD
+    # segment, and it is that per-batch peak -- not the total audio -- that has to fit; lower
+    # it here when it does not.
+    if batch_size is not None:
+        pipeline.segmentation_batch_size = batch_size
+        pipeline.embedding_batch_size = batch_size
+        logger.info(f"Diarization batch size set to {batch_size}")
+
+    pipeline.to(torch.device(resolve_device(device, device_index)))
+
+    # Cap the allocator once the weights are resident, exactly as the ASR backend does. This
+    # stage runs the model once per VAD segment, so without a cap a near-OOM does not raise
+    # on Windows -- the driver pages into host RAM instead and the stage crawls.
+    if device == "cuda":
+        MemoryPolicy(vram_checks, vram_headroom_mb).cap_after_load(device_index)
+
+    return processor_cls(
+        pipeline=pipeline,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        return_embeddings=return_embeddings,
+        device_index=device_index if device == "cuda" else None,
+    )

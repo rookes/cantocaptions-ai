@@ -20,10 +20,6 @@ def load_audio(*args, **kwargs):
     audio = _lazy_import("utils.audio")
     return audio.load_audio(*args, **kwargs)
 
-def assign_word_speakers(*args, **kwargs):
-    diarize = _lazy_import("pipeline.diarize")
-    return diarize.assign_word_speakers(*args, **kwargs)
-
 def setup_logging(*args, **kwargs):
     logging_module = _lazy_import("utils.log_utils")
     return logging_module.setup_logging(*args, **kwargs)

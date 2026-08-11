@@ -10,10 +10,12 @@ Covers the four passes that turn over-split aligned subsegments into displayable
 All pure functions -- no models, no I/O.
 """
 
+import logging
 import unittest
 
 from cantocaptions_ai.cantonese.text import SegmentationConfig
 from cantocaptions_ai.pipeline.segmentation import assemble_cues
+from cantocaptions_ai.utils.schema import merge_segments
 
 
 def seg(start, end, text, **extra):
@@ -260,6 +262,238 @@ class TestPassToggles(unittest.TestCase):
         before = [dict(s) for s in segments]
         assemble_cues(segments)
         self.assertEqual(segments, before)
+
+
+class TestSpeakerGate(unittest.TestCase):
+    """The merge veto diarization exists to drive (segmentation._same_speaker).
+
+    The gate is deliberately one-directional: it only ever blocks a merge between two
+    *differently labeled* cues. An unlabeled cue means "diarization was not confident here",
+    which must behave exactly as it did before diarization existed.
+    """
+
+    def test_pass_a_will_not_merge_across_a_speaker_change(self):
+        cues = assemble_cues(
+            [
+                seg(0.0, 2.0, "你好嗎，", speaker="SPEAKER_00"),
+                seg(2.04, 4.0, "幾好呀，", speaker="SPEAKER_01"),
+            ],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["你好嗎，", "幾好呀，"])
+
+    def test_pass_a_merges_the_same_speaker(self):
+        cues = assemble_cues(
+            [
+                seg(0.0, 2.0, "你好嗎，", speaker="SPEAKER_00"),
+                seg(2.04, 4.0, "幾好呀，", speaker="SPEAKER_00"),
+            ],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["你好嗎，幾好呀，"])
+
+    def test_an_unlabeled_cue_does_not_block_a_merge(self):
+        cues = assemble_cues(
+            [seg(0.0, 2.0, "你好嗎，", speaker="SPEAKER_00"), seg(2.04, 4.0, "幾好呀，")],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["你好嗎，幾好呀，"])
+
+    def test_labels_from_different_segments_are_not_compared(self):
+        # Under --diarize_scope segment, SPEAKER_00 in one VAD segment is an unrelated voice
+        # to SPEAKER_00 in the next. Vetoing on that would block every cross-segment merge on
+        # no evidence, so differing scopes must read as "unknown".
+        cues = assemble_cues(
+            [
+                seg(0.0, 2.0, "你好嗎，", speaker="S0003/SPEAKER_00"),
+                seg(2.04, 4.0, "幾好呀，", speaker="S0004/SPEAKER_01"),
+            ],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["你好嗎，幾好呀，"])
+
+    def test_labels_within_one_segment_still_veto(self):
+        cues = assemble_cues(
+            [
+                seg(0.0, 2.0, "你好嗎，", speaker="S0003/SPEAKER_00"),
+                seg(2.04, 4.0, "幾好呀，", speaker="S0003/SPEAKER_01"),
+            ],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["你好嗎，", "幾好呀，"])
+
+    def test_same_scoped_speaker_merges(self):
+        cues = assemble_cues(
+            [
+                seg(0.0, 2.0, "你好嗎，", speaker="S0003/SPEAKER_00"),
+                seg(2.04, 4.0, "幾好呀，", speaker="S0003/SPEAKER_00"),
+            ],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["你好嗎，幾好呀，"])
+
+    def test_a_label_survives_a_merge_with_an_unlabeled_left_neighbour(self):
+        # The regression this guards: taking seg1's speaker unconditionally dropped
+        # SPEAKER_01 here, so the third cue -- a genuinely different speaker -- was then
+        # free to merge in too.
+        cues = assemble_cues(
+            [
+                seg(0.0, 2.0, "你好嗎，"),
+                seg(2.04, 4.0, "幾好呀，", speaker="SPEAKER_01"),
+                seg(4.04, 6.0, "唔該晒。", speaker="SPEAKER_00"),
+            ],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["你好嗎，幾好呀，", "唔該晒。"])
+        self.assertEqual(cues[0]["speaker"], "SPEAKER_01")
+
+
+class TestMergeSegmentsSpeakerKeys(unittest.TestCase):
+    """utils/schema.py:merge_segments -- speaker bookkeeping across a join."""
+
+    def test_right_hand_speaker_is_adopted_when_the_left_has_none(self):
+        merged = merge_segments(seg(0.0, 1.0, "你好"), seg(1.0, 2.0, "嗎？", speaker="B"))
+        self.assertEqual(merged["speaker"], "B")
+
+    def test_left_hand_speaker_wins_when_both_are_present(self):
+        merged = merge_segments(
+            seg(0.0, 1.0, "你好", speaker="A"), seg(1.0, 2.0, "嗎？", speaker="A")
+        )
+        self.assertEqual(merged["speaker"], "A")
+
+    def test_no_speaker_key_when_neither_side_has_one(self):
+        merged = merge_segments(seg(0.0, 1.0, "你好"), seg(1.0, 2.0, "嗎？"))
+        self.assertNotIn("speaker", merged)
+
+    def test_conflict_flag_propagates_from_either_side(self):
+        merged = merge_segments(
+            seg(0.0, 1.0, "你好"), seg(1.0, 2.0, "嗎？", speaker_conflict=True)
+        )
+        self.assertTrue(merged["speaker_conflict"])
+
+    def test_confidence_is_dropped_because_it_described_only_one_side(self):
+        merged = merge_segments(
+            seg(0.0, 1.0, "你好", speaker="A", speaker_confidence=0.9),
+            seg(1.0, 2.0, "嗎？", speaker="A", speaker_confidence=0.72),
+        )
+        self.assertNotIn("speaker_confidence", merged)
+
+
+class TestSpeakerVetoLogging(unittest.TestCase):
+    """The INFO line reporting that diarization held two cues apart.
+
+    A veto is only reported when diarization is the *sole* reason the merge did not happen,
+    so the log can be read as "loosen --speaker_confidence and these would join".
+    """
+
+    LOGGER = "cantocaptions_ai.pipeline.segmentation"
+
+    def veto_lines(self, segments, **kwargs):
+        with self.assertLogs(self.LOGGER, level="INFO") as captured:
+            # A log record of our own guarantees assertLogs never fails on an empty run.
+            logging.getLogger(self.LOGGER).info("probe")
+            assemble_cues(segments, **kwargs)
+        return [m for m in captured.output if "held a cue boundary" in m]
+
+    def test_pass_a_reports_a_blocked_merge(self):
+        lines = self.veto_lines(
+            [
+                seg(0.0, 2.0, "你好嗎，", speaker="SPEAKER_00"),
+                seg(2.04, 4.0, "幾好呀，", speaker="SPEAKER_01"),
+            ],
+            min_cue_duration=0,
+        )
+        self.assertEqual(len(lines), 1)
+        self.assertIn("00:00:02,040", lines[0])
+        self.assertIn("SPEAKER_00", lines[0])
+        self.assertIn("SPEAKER_01", lines[0])
+
+    def test_silent_when_punctuation_would_have_blocked_the_merge_anyway(self):
+        # 。 is a hard stop, so these never merge regardless of speaker. Reporting it would
+        # send someone tuning --speaker_confidence after a boundary it does not control.
+        self.assertEqual(
+            self.veto_lines(
+                [
+                    seg(0.0, 2.0, "你好嗎。", speaker="SPEAKER_00"),
+                    seg(2.04, 4.0, "幾好呀，", speaker="SPEAKER_01"),
+                ],
+                min_cue_duration=0,
+            ),
+            [],
+        )
+
+    def test_silent_for_the_same_speaker(self):
+        self.assertEqual(
+            self.veto_lines(
+                [
+                    seg(0.0, 2.0, "你好嗎，", speaker="SPEAKER_00"),
+                    seg(2.04, 4.0, "幾好呀，", speaker="SPEAKER_00"),
+                ],
+                min_cue_duration=0,
+            ),
+            [],
+        )
+
+    def test_silent_when_diarization_did_not_run(self):
+        self.assertEqual(
+            self.veto_lines(
+                [seg(0.0, 2.0, "你好嗎，"), seg(2.04, 4.0, "幾好呀，")], min_cue_duration=0
+            ),
+            [],
+        )
+
+    def test_pass_c_is_silent_when_the_other_direction_still_rescues_the_cue(self):
+        # Gap 0.15 clears pass A's 0.04 threshold but not pass C's merge_gap, so anything
+        # logged here comes from pass C alone. The fragment joins forwards, so the backward
+        # direction diarization closed cost it nothing.
+        self.assertEqual(
+            self.veto_lines(
+                [
+                    seg(0.0, 2.0, "你好嗎，", speaker="SPEAKER_00"),
+                    seg(2.15, 2.21, "係，", speaker="SPEAKER_01"),
+                    seg(2.36, 5.0, "多謝關心。", speaker="SPEAKER_01"),
+                ],
+                min_cue_duration=0.5,
+            ),
+            [],
+        )
+
+    def test_pass_c_reports_a_fragment_stranded_in_both_directions(self):
+        lines = self.veto_lines(
+            [
+                seg(0.0, 2.0, "你好嗎，", speaker="SPEAKER_00"),
+                seg(2.15, 2.21, "係，", speaker="SPEAKER_01"),
+                seg(2.36, 5.0, "多謝關心。", speaker="SPEAKER_02"),
+            ],
+            min_cue_duration=0.5,
+        )
+        self.assertEqual(len(lines), 2)
+
+    def test_each_boundary_is_reported_once_despite_the_pass_c_rescan(self):
+        # Pass C restarts its scan after every merge, so a stranded cue is re-examined many
+        # times; the report must still name each boundary exactly once.
+        segments = []
+        start = 0.0
+        for i in range(6):
+            segments.append(seg(start, start + 0.10, f"字{i}，", speaker=f"SPEAKER_0{i % 2}"))
+            start += 0.14
+        lines = self.veto_lines(segments, min_cue_duration=0.5)
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(len(set(lines)), 5)
+
+    def test_summary_counts_the_held_boundaries(self):
+        with self.assertLogs(self.LOGGER, level="INFO") as captured:
+            assemble_cues(
+                [
+                    seg(0.0, 2.0, "你好嗎，", speaker="SPEAKER_00"),
+                    seg(2.04, 4.0, "幾好呀，", speaker="SPEAKER_01"),
+                ],
+                min_cue_duration=0,
+            )
+        self.assertTrue(
+            any("kept 1 cue boundary from merging" in m for m in captured.output),
+            captured.output,
+        )
 
 
 if __name__ == "__main__":

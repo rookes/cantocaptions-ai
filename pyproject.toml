@@ -32,7 +32,6 @@ dependencies = [
 [project.optional-dependencies]
 ensemble = ["faster-whisper>=1.0.0"]
 llm = ["bitsandbytes>=0.43.0"]
-diarize = ["nemo_toolkit[asr]; sys_platform == 'linux'", "matplotlib"]
 # Recommended ASR backend: native Qwen3-ASR support (AutoModelForMultimodalLM),
 # officially shipped in transformers>=5.13.0. Triton backs the (now-working)
 # torch.compile speedup on CUDA. Mutually exclusive with the `legacy` extra —
@@ -54,8 +53,6 @@ xet = ["hf-xet"]
 full = [
     "faster-whisper>=1.0.0",
     "bitsandbytes>=0.43.0",
-    "nemo_toolkit[asr]; sys_platform == 'linux'",
-    "matplotlib",
     "transformers>=5.13.0",
     "triton; sys_platform == 'linux'",
     "triton-windows<3.7; sys_platform == 'win32'",

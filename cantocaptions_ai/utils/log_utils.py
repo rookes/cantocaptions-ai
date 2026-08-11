@@ -92,6 +92,30 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(logger_name)
 
 
+def _pick_time_unit(total_seconds: float) -> str:
+    """Choose the unit the whole summary table renders in, from its longest total."""
+    if total_seconds >= 3600:
+        return "h"
+    if total_seconds >= 60:
+        return "m"
+    return "s"
+
+
+def _format_duration(seconds: float, unit: str) -> str:
+    """Render *seconds* in ``unit`` (``"s"``/``"m"``/``"h"``, from `_pick_time_unit`).
+
+    The unit is picked once per table rather than per cell so every row stays on
+    the same scale and the columns remain comparable at a glance: a 32-second
+    stage in an hour-long run reads ``0:00:32``, not ``32.00 s``.
+    """
+    if unit == "s":
+        return f"{seconds:.2f} s"
+    whole = int(round(seconds))
+    if unit == "m":
+        return f"{whole // 60}:{whole % 60:02d}"
+    return f"{whole // 3600}:{whole % 3600 // 60:02d}:{whole % 60:02d}"
+
+
 class TranscriptionSummary:
     """Accumulates per-stage timing records and prints a formatted summary table."""
 
@@ -106,6 +130,10 @@ class TranscriptionSummary:
     def print_summary(self, process_elapsed: Optional[float] = None) -> None:
         if not self.enabled or not self._stages:
             return
+        stage_totals = [(load or 0.0) + run for _, load, run, _ in self._stages]
+        unit = _pick_time_unit(
+            process_elapsed if process_elapsed is not None else sum(stage_totals)
+        )
         show_vram = any(v is not None for _, _, _, v in self._stages)
         col_w = max(len(label) for label, _, _, _ in self._stages) + 2
         vram_col_w = 10 if show_vram else 0  # "  X.XX GB" = 10 chars
@@ -121,15 +149,15 @@ class TranscriptionSummary:
             f" {'':>{col_w}}{'Load Time'.center(11)}{'Run Time'.center(11)}{'Total'.center(11)}{vram_header}",
             file=sys.__stdout__,
         )
-        for label, load_time, run_time, vram_mb in self._stages:
-            load_str  = f" {load_time:>8.2f} s" if load_time is not None else f"{'—':^11}"
-            run_str   = f" {run_time:>8.2f} s"
-            total_str = f" {(load_time or 0.0) + run_time:>8.2f} s"
+        for (label, load_time, run_time, vram_mb), stage_total in zip(self._stages, stage_totals):
+            load_str  = f"{_format_duration(load_time, unit):>11}" if load_time is not None else f"{'—':^11}"
+            run_str   = f"{_format_duration(run_time, unit):>11}"
+            total_str = f"{_format_duration(stage_total, unit):>11}"
             vram_str  = f"  {vram_mb / 1000:>5.1f} GB" if vram_mb is not None else ""
             print(f" {label:<{col_w}}{load_str}{run_str}{total_str}{vram_str}", file=sys.__stdout__)
         if process_elapsed is not None:
             print(dash, file=sys.__stdout__)
-            print(f" Total Process Time   {process_elapsed:.2f} s", file=sys.__stdout__)
+            print(f" Total Process Time   {_format_duration(process_elapsed, unit)}", file=sys.__stdout__)
         print(f"{eq}\n", file=sys.__stdout__)
 
 

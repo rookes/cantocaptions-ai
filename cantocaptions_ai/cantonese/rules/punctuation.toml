@@ -3,6 +3,10 @@
 # Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
 
 [[rules]]
+pattern = '[~～]'
+replace = ''
+
+[[rules]]
 pattern = '[\n\t]+'
 replace = ' '
 comment = 'Replace all line breaks and tabs with a space (to be removed later)'

@@ -78,7 +78,7 @@ class VocalIsolationProcessor(PipelineStage["List[VadAudioSegment]", "List[VadAu
     def _extract(item): return item['vad_segments']
 
     @staticmethod
-    def _pack(item, result): return {'audio_path': item['audio_path'], 'vad_segments': result}
+    def _pack(item, result): return {**item, 'vad_segments': result}
 
     def process(self, input: List[VadAudioSegment], *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
         # Vocal isolation batches chunks across files, so it overrides run() rather

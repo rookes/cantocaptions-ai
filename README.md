@@ -105,4 +105,4 @@ Current updates planned for the near future:
 - [ ] Add an option to use Qwen LLM to do error-correction based on a reference standard Chinese subtitle file (IN PROGRESS)
 - [ ] Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
 - [ ] Add better multilingual recognition for Mandarin and English
-- [ ] Complete diarization implementation to separate lines from different speakers
+- [x] Complete diarization implementation to separate lines from different speakers

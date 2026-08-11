@@ -8,15 +8,30 @@ import numpy as np
 from cantocaptions_ai.utils.audio import SAMPLE_RATE
 from typing import Union
 
-from cantocaptions_ai.utils.schema import VadAudioSegment, TranscriptionResult, AlignedTranscriptionResult
+from cantocaptions_ai.utils.schema import (
+    AlignedTranscriptionResult,
+    DiarizationResult,
+    SingleAlignedSegment,
+    TranscriptionResult,
+    VadAudioSegment,
+)
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
 
 
+def _stem(audio_path: str) -> str:
+    """Directory name a file's checkpoints live under.
+
+    Writers and readers must agree on this: transcribe.py decides whether to skip a
+    stage from `_debug_stage_exists`, so a stem that only the writer strips would make
+    "cached" and "loadable" disagree.
+    """
+    return Path(audio_path).stem.strip()
+
+
 def _stage_dir(audio_path: str, stage: str, debug_dir: str) -> str:
-    stem = Path(audio_path).stem.strip()
-    path = os.path.join(debug_dir, stem, stage)
+    path = os.path.join(debug_dir, _stem(audio_path), stage)
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -91,11 +106,12 @@ def write_transcription_debug(audio_path: str, result: TranscriptionResult, debu
 
 def _debug_stage_exists(audio_path: str, stage: str, debug_dir: str) -> bool:
     """Return True if the expected marker file for a stage exists in the debug directory."""
-    stem = Path(audio_path).stem.strip()
+    stem = _stem(audio_path)
     stage_dir = os.path.join(debug_dir, stem, stage)
     marker = {
         "transcription": "result.json",
         "llm_correction": "result.json",
+        "diarization": "result.json",
         "ensemble": "texts.json",
     }.get(stage, "segments.json")
     return os.path.isfile(os.path.join(stage_dir, marker))
@@ -125,7 +141,7 @@ def _load_audio_segments(stage_dir: str) -> Optional[List[VadAudioSegment]]:
 
 def load_vad_debug(audio_path: str, debug_dir: str) -> Optional[List[VadAudioSegment]]:
     """Load VAD segments from a previous debug run. Returns None if not present."""
-    stem = Path(audio_path).stem
+    stem = _stem(audio_path)
     stage_dir = os.path.join(debug_dir, stem, "vad")
     segments = _load_audio_segments(stage_dir)
     if segments is not None:
@@ -135,7 +151,7 @@ def load_vad_debug(audio_path: str, debug_dir: str) -> Optional[List[VadAudioSeg
 
 def load_isolation_debug(audio_path: str, debug_dir: str) -> Optional[List[VadAudioSegment]]:
     """Load vocal isolation segments from a previous debug run. Returns None if not present."""
-    stem = Path(audio_path).stem
+    stem = _stem(audio_path)
     stage_dir = os.path.join(debug_dir, stem, "vocal_isolation")
     segments = _load_audio_segments(stage_dir)
     if segments is not None:
@@ -145,7 +161,7 @@ def load_isolation_debug(audio_path: str, debug_dir: str) -> Optional[List[VadAu
 
 def load_transcription_debug(audio_path: str, debug_dir: str) -> Optional[TranscriptionResult]:
     """Load a normalized transcription result from a previous debug run. Returns None if not present."""
-    stem = Path(audio_path).stem
+    stem = _stem(audio_path)
     json_path = os.path.join(debug_dir, stem, "transcription", "result.json")
     if not os.path.isfile(json_path):
         return None
@@ -168,7 +184,7 @@ def write_ensemble_debug(audio_path: str, texts: List[str], debug_dir: str) -> N
 
 def load_ensemble_debug(audio_path: str, debug_dir: str) -> Optional[List[str]]:
     """Load ensemble ASR texts from a previous debug run. Returns None if not present."""
-    stem = Path(audio_path).stem
+    stem = _stem(audio_path)
     json_path = os.path.join(debug_dir, stem, "ensemble", "texts.json")
     if not os.path.isfile(json_path):
         return None
@@ -220,7 +236,7 @@ def write_precleaning_debug(
 
 def load_llm_correction_debug(audio_path: str, debug_dir: str) -> Optional[TranscriptionResult]:
     """Load LLM-corrected transcription from a previous debug run. Returns None if not present."""
-    stem = Path(audio_path).stem
+    stem = _stem(audio_path)
     json_path = os.path.join(debug_dir, stem, "llm_correction", "result.json")
     if not os.path.isfile(json_path):
         return None
@@ -229,3 +245,134 @@ def load_llm_correction_debug(audio_path: str, debug_dir: str) -> Optional[Trans
     result: TranscriptionResult = {"segments": data["segments"], "language": data.get("language")}
     logger.info(f"Loaded LLM correction ({len(result['segments'])} segments) from {json_path}")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Diarization
+# ---------------------------------------------------------------------------
+
+def write_diarization_debug(audio_path: str, result: DiarizationResult, debug_dir: str) -> None:
+    """Write raw diarization output to {debug_dir}/{stem}/diarization/result.json.
+
+    This is the loadable half of the stage: it holds the model's answer (speaker count and
+    turns), not the thresholded per-segment attribution, so a --load_debug_dir replay can
+    skip the diarization model while still re-deriving labels at new thresholds.
+    """
+    stage_dir = _stage_dir(audio_path, "diarization", debug_dir)
+    # Under segment scope, "speakers" is the set of per-segment local identities, so its
+    # length is a count of voices-per-segment summed, not a count of people in the episode.
+    # Name it for what it is rather than implying a global speaker count that wasn't computed.
+    count_key = (
+        "num_speakers" if result.get("scope", "file") == "file" else "num_local_speakers"
+    )
+    output = {
+        "audio_path": os.path.abspath(audio_path),
+        count_key: len(result["speakers"]),
+        **result,
+    }
+    json_path = os.path.join(stage_dir, "result.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    logger.info(
+        f"Diarization debug output written to {json_path} "
+        f"({output[count_key]} {count_key.removeprefix('num_')}, {len(result['turns'])} turns)"
+    )
+
+
+def load_diarization_debug(audio_path: str, debug_dir: str) -> Optional[DiarizationResult]:
+    """Load diarization output from a previous debug run. Returns None if not present."""
+    stem = _stem(audio_path)
+    json_path = os.path.join(debug_dir, stem, "diarization", "result.json")
+    if not os.path.isfile(json_path):
+        return None
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    result: DiarizationResult = {
+        "speakers": data["speakers"],
+        "turns": data["turns"],
+        "overlap_turns": data.get("overlap_turns", []),
+    }
+    # Optional keys are copied only when present so a checkpoint written by one scope
+    # reloads as that scope, rather than silently reading back as a whole-file run.
+    for key in ("scope", "segment_speakers", "embeddings"):
+        if data.get(key) is not None:
+            result[key] = data[key]
+    logger.info(
+        f"Loaded diarization ({len(result['speakers'])} speaker labels, "
+        f"{len(result['turns'])} turns, scope: {result.get('scope', 'file')}) from {json_path}"
+    )
+    return result
+
+
+def _assignment_label(segment: SingleAlignedSegment) -> str:
+    """Bracketed diagnostic prefix describing one segment's speaker attribution."""
+    confidence = segment.get("speaker_confidence")
+    if segment.get("speaker") is None:
+        # Unlabeled: either no diarized speech underneath, or no speaker cleared the
+        # threshold. Both are merge-permissive, so both are worth seeing.
+        marker = "?" if confidence is None else f"? {confidence:.2f}"
+    else:
+        marker = f"{segment['speaker']} {confidence:.2f}" if confidence is not None else segment["speaker"]
+    if segment.get("speaker_conflict"):
+        marker += " !MULTI"
+    return f"[{marker}]"
+
+
+def write_speaker_assignment_debug(
+    audio_path: str,
+    segments: List[SingleAlignedSegment],
+    debug_dir: str,
+) -> None:
+    """Write per-subsegment speaker attribution to {debug_dir}/{stem}/diarization/.
+
+    Produces assignments.json plus {stem}.srt, in which every cue is prefixed with the
+    speaker, the confidence, and a !MULTI marker when the cue looks like it spans more than
+    one speaker. Both are snapshots, not checkpoints: assignment is cheap and must re-run so
+    threshold changes take effect on a --load_debug_dir replay.
+
+    Note this runs on the *pre-assembly* subsegments, which is the level diarization acts at
+    -- the final cues are what pre_cleaning/ shows.
+    """
+    from cantocaptions_ai.utils.output import WriteSRT
+
+    stage_dir = _stage_dir(audio_path, "diarization", debug_dir)
+
+    assignments = [
+        {
+            "start": segment["start"],
+            "end": segment["end"],
+            "text": segment["text"],
+            "speaker": segment.get("speaker"),
+            "confidence": segment.get("speaker_confidence"),
+            "conflict": bool(segment.get("speaker_conflict")),
+        }
+        for segment in segments
+    ]
+    json_path = os.path.join(stage_dir, "assignments.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"audio_path": os.path.abspath(audio_path), "assignments": assignments},
+            f, ensure_ascii=False, indent=2,
+        )
+
+    # Build a shadow result rather than reusing the live segments: the speaker key is folded
+    # into the text here so the SRT shows confidence and conflicts too, and the writer's own
+    # "[speaker]: " prefix would double up on it.
+    shadow = {
+        "language": None,
+        "segments": [
+            {
+                "start": segment["start"],
+                "end": segment["end"],
+                "text": f"{_assignment_label(segment)} {segment['text'].strip()}",
+            }
+            for segment in segments
+        ],
+    }
+    WriteSRT(stage_dir)(shadow, audio_path, {})
+
+    flagged = sum(1 for a in assignments if a["conflict"])
+    logger.info(
+        f"Speaker assignment debug output written to {stage_dir} "
+        f"({len(assignments)} subsegments, {flagged} flagged multi-speaker)"
+    )

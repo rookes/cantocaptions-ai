@@ -213,6 +213,22 @@ def format_timestamp(
     )
 
 
+def _with_speaker(
+    segment: dict, text: str, options: dict, fmt: str = "[{speaker}]: {text}"
+) -> str:
+    """Prefix *text* with the segment's speaker label, when the caller asked for labels.
+
+    Diarization is normally run to keep cue assembly from merging across a speaker change,
+    not to caption who is talking, so labels stay out of the subtitle text unless
+    ``--speaker_labels`` opts in. Segments diarization could not confidently attribute are
+    always left bare rather than captioned as an unknown speaker.
+    """
+    speaker = segment.get("speaker")
+    if not options.get("speaker_labels") or speaker is None:
+        return text
+    return fmt.format(speaker=speaker, text=text)
+
+
 class ResultWriter:
     extension: str
 
@@ -238,19 +254,15 @@ class WriteTXT(ResultWriter):
 
     def write_result(self, result: dict, file: TextIO, options: dict):
         for segment in result["segments"]:
-            speaker = segment.get("speaker")
             text = segment["text"].strip()
-            if speaker is not None:
-                print(f"[{speaker}]: {text}", file=file, flush=True)
-            else:
-                print(text, file=file, flush=True)
+            print(_with_speaker(segment, text, options), file=file, flush=True)
 
 
 class SubtitlesWriter(ResultWriter):
     always_include_hours: bool
     decimal_marker: str
 
-    def iterate_result(self, result: dict):
+    def iterate_result(self, result: dict, options: dict):
         if len(result["segments"]) == 0:
             return
 
@@ -258,9 +270,7 @@ class SubtitlesWriter(ResultWriter):
             segment_start = self.format_timestamp(segment["start"])
             segment_end = self.format_timestamp(segment["end"])
             segment_text = segment["text"].strip().replace("-->", "->")
-            if "speaker" in segment:
-                segment_text = f"[{segment['speaker']}]: {segment_text}"
-            yield segment_start, segment_end, segment_text
+            yield segment_start, segment_end, _with_speaker(segment, segment_text, options)
 
     def format_timestamp(self, seconds: float):
         return format_timestamp(
@@ -277,7 +287,7 @@ class WriteVTT(SubtitlesWriter):
 
     def write_result(self, result: dict, file: TextIO, options: dict):
         print("WEBVTT\n", file=file)
-        for start, end, text in self.iterate_result(result):
+        for start, end, text in self.iterate_result(result, options):
             print(f"{start} --> {end}\n{text}\n", file=file, flush=True)
 
 
@@ -288,7 +298,7 @@ class WriteSRT(SubtitlesWriter):
 
     def write_result(self, result: dict, file: TextIO, options: dict):
         for i, (start, end, text) in enumerate(
-            self.iterate_result(result), start=1
+            self.iterate_result(result, options), start=1
         ):
             print(f"{i}\n{start} --> {end}\n{text}\n", file=file, flush=True)
 
@@ -311,7 +321,8 @@ class WriteAudacity(ResultWriter):
         for segment in result["segments"]:
             print(segment["start"], file=file, end=ARROW)
             print(segment["end"], file=file, end=ARROW)
-            print( ( ("[[" + segment["speaker"] + "]]") if "speaker" in segment else "") + segment["text"].strip().replace("\t", " "), file=file, flush=True)
+            text = segment["text"].strip().replace("	", " ")
+            print(_with_speaker(segment, text, options, fmt="[[{speaker}]]{text}"), file=file, flush=True)
 
 
 class WriteJSON(ResultWriter):

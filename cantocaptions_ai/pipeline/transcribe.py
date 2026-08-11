@@ -19,7 +19,11 @@ from cantocaptions_ai.cantonese.text import (
     is_removable,
 )
 from cantocaptions_ai.pipeline.segmentation import assemble_cues
-from cantocaptions_ai.utils.debug import _debug_stage_exists, write_precleaning_debug
+from cantocaptions_ai.utils.debug import (
+    _debug_stage_exists,
+    write_precleaning_debug,
+    write_speaker_assignment_debug,
+)
 from cantocaptions_ai.pipeline.vad import VadProcessor
 
 logger = get_logger(__name__)
@@ -94,7 +98,9 @@ def _run_alignment(
             aligned_result['language'] = result['language']
         else:
             aligned_result = result
-        aligned_items.append({'audio_path': item['audio_path'], 'result': aligned_result})
+        # Keep the rest of the carrier (notably audio_track, chosen by _select_audio_track):
+        # diarization loads the audio again downstream and must not fall back to track 0.
+        aligned_items.append({**item, 'result': aligned_result})
     return aligned_items
 
 
@@ -108,81 +114,95 @@ def _extract_timestamps(items: list) -> List[ProcessingItem]:
             s_start = segment['time_stamps'][0]['start']
             s_end = segment['time_stamps'][-1]['end']
             segments.append({**segment, 'start': s_start, 'end': s_end})
-        extracted_items.append({'audio_path': item['audio_path'], 'result': {**result, 'segments': segments}})
+        # Preserve the rest of the carrier (audio_track, vad_segments): diarization
+        # needs both, and --no_align routes through here instead of _run_alignment.
+        extracted_items.append({**item, 'result': {**result, 'segments': segments}})
     return extracted_items
 
 
 def _run_diarization(
     items: List[ProcessingItem],
-    diarize_model_name: str,
-    hf_token: Optional[str],
-    device: str,
-    model_dir: Optional[str],
-    min_speakers: Optional[int],
-    max_speakers: Optional[int],
-    return_speaker_embeddings: bool,
-    progress_callback: ProgressCallback = None,
-    load_complete_callback: Optional[Callable[[], None]] = None,
+    cfg,
+    summary: TranscriptionSummary,
+    progress: Optional[ProgressSink],
+    need_diarize: bool,
 ) -> List[ProcessingItem]:
-    from cantocaptions_ai.pipeline.diarize import DiarizationPipeline, assign_word_speakers
-    logger.info("Performing diarization...")
-    logger.info(f"Using model: {diarize_model_name}")
-    diarize_model = load_with_offline_fallback(
-        DiarizationPipeline, model_name=diarize_model_name, token=hf_token, device=device, cache_dir=model_dir
-    )
-    if load_complete_callback:
-        load_complete_callback()
+    """Stage 5: attach ``diarization`` to every item, from the model or the debug cache.
 
-    if progress_callback is not None:
-        progress_callback.set_total(len(items), unit="file")
-    diarized_items = []
-    for item in items:
-        diarize_result = diarize_model(
-            item['audio_path'],
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-            return_embeddings=return_speaker_embeddings,
+    Held in its own helper so the stage's load/run/free cycle reads as one unit and
+    ``_execute_pipeline`` stays an outline of the pipeline rather than an implementation.
+    """
+    from cantocaptions_ai.pipeline.diarize import load_diarization, load_diarization_cache
+
+    if not need_diarize:
+        return load_diarization_cache(items, cfg.load_debug_dir)
+
+    if cfg.hf_token is None:
+        logger.info(
+            "No --hf_token provided; %s is a gated model, so its terms must already be "
+            "accepted and a token cached (huggingface-cli login) or this load will fail.",
+            cfg.diarize_model,
         )
-        if return_speaker_embeddings:
-            diarize_segments, speaker_embeddings = diarize_result
-        else:
-            diarize_segments, speaker_embeddings = diarize_result, None
-        result = assign_word_speakers(diarize_segments, item['result'], speaker_embeddings)
-        diarized_items.append({'audio_path': item['audio_path'], 'result': result})
-        if progress_callback is not None:
-            progress_callback.advance(1)
-    return diarized_items
+    with StageTimer("Diarization", summary, progress=progress) as stage:
+        diarizer = load_with_offline_fallback(
+            load_diarization,
+            device=cfg.device,
+            device_index=cfg.device_index,
+            model_name=cfg.diarize_model,
+            token=cfg.hf_token,
+            model_dir=cfg.model_dir,
+            scope=cfg.diarize_scope,
+            min_speakers=cfg.min_speakers,
+            max_speakers=cfg.max_speakers,
+            return_embeddings=cfg.speaker_embeddings,
+            batch_size=cfg.diarize_batch_size,
+            vram_checks=cfg.vram_checks,
+            vram_headroom_mb=cfg.vram_headroom_mb,
+        )
+        stage.mark_inference_start()
+        items = diarizer.run(
+            items,
+            debug_dir=cfg.debug_dir,
+            load_debug_dir=cfg.load_debug_dir,
+            progress_callback=stage.reporter,
+        )
+    del diarizer
+    flush_vram()
+    return items
 
 
-def _run_speaker_verification(
+def _assign_speakers(
     items: List[ProcessingItem],
-    device: str,
-    model_dir: Optional[str],
-    progress_callback: ProgressCallback = None,
-    load_complete_callback: Optional[Callable[[], None]] = None,
+    cfg,
+    debug_dir: Optional[str] = None,
 ) -> List[ProcessingItem]:
-    from cantocaptions_ai.pipeline.speaker_verification import SpeakerVerificationPipeline
-    logger.info("Performing speaker verification...")
-    speaker_verification_model = load_with_offline_fallback(
-        SpeakerVerificationPipeline, device=device, cache_dir=model_dir
-    )
-    if load_complete_callback:
-        load_complete_callback()
+    """Label each aligned subsegment with a speaker, where diarization is confident enough.
 
-    if progress_callback is not None:
-        progress_callback.set_total(len(items), unit="file")
-    verified_items = []
+    Runs outside the diarization StageTimer: it is pure arithmetic over already-computed
+    turns, and it deliberately re-runs on a --load_debug_dir replay so threshold changes
+    take effect without re-diarizing.
+    """
+    from cantocaptions_ai.pipeline.speaker_assign import (
+        SpeakerAssignmentConfig,
+        assign_speakers,
+        format_stats,
+    )
+
+    config = SpeakerAssignmentConfig(
+        min_dominant_share=cfg.speaker_confidence,
+        conflict_share=cfg.speaker_conflict_share,
+        flag_conflicts=cfg.flag_speaker_conflicts,
+    )
     for item in items:
-        audio = load_audio(item['audio_path'], audio_track=item.get('audio_track', 0))
-        audio_segments = [
-            audio[int(seg["start"] * SAMPLE_RATE):int(seg["end"] * SAMPLE_RATE)]
-            for seg in item['result']["segments"]
-        ]
-        speaker_verification_model(transcript=item['result']["segments"], audio=audio_segments)
-        verified_items.append(item)
-        if progress_callback is not None:
-            progress_callback.advance(1)
-    return verified_items
+        diarization = item.get('diarization')
+        if diarization is None:
+            continue
+        segments = item['result']["segments"]
+        stats = assign_speakers(segments, diarization["turns"], config)
+        logger.info(f"Speaker assignment: {format_stats(stats)}")
+        if debug_dir is not None:
+            write_speaker_assignment_debug(item['audio_path'], segments, debug_dir)
+    return items
 
 
 def _run_retime(
@@ -344,8 +364,22 @@ def validate_config(cfg) -> None:
     """
     from cantocaptions_ai.errors import ConfigError
 
-    if cfg.speaker_embeddings and not cfg.diarize:
-        warnings.warn("speaker_embeddings has no effect without diarize")
+    for option in ("speaker_embeddings", "flag_speaker_conflicts", "speaker_labels"):
+        if getattr(cfg, option) and not cfg.diarize:
+            warnings.warn(f"{option} has no effect without diarize")
+    if cfg.min_speakers is not None and cfg.max_speakers is not None:
+        if cfg.min_speakers > cfg.max_speakers:
+            raise ConfigError(
+                f"min_speakers ({cfg.min_speakers}) cannot exceed max_speakers ({cfg.max_speakers})"
+            )
+    # Checked here rather than at the point of use: diarization is stage 5, so a bad
+    # threshold would otherwise only surface after ASR and alignment have already run.
+    if not 0 < cfg.speaker_confidence <= 1:
+        raise ConfigError(f"speaker_confidence must be in (0, 1], got {cfg.speaker_confidence}")
+    if not 0 < cfg.speaker_conflict_share <= 1:
+        raise ConfigError(
+            f"speaker_conflict_share must be in (0, 1], got {cfg.speaker_conflict_share}"
+        )
     if cfg.reference_subtitle and not cfg.llm_correction:
         raise ConfigError("reference_subtitle requires llm_correction")
     if cfg.reference_correction_semantic and not cfg.reference_subtitle:
@@ -496,6 +530,7 @@ def _execute_pipeline(
         "highlight_words": cfg.highlight_words,
         "max_line_count": cfg.max_line_count,
         "max_line_width": cfg.max_line_width,
+        "speaker_labels": cfg.speaker_labels,
     }
 
     # Text cleaning runs on the final merged segments just before writing.
@@ -538,15 +573,26 @@ def _execute_pipeline(
             not _debug_stage_exists(ap, "transcription", cfg.load_debug_dir) for ap in audio_paths
         )
     )
-    need_vad = not cfg.load_debug_dir or any(
-        not _debug_stage_exists(ap, "vad", cfg.load_debug_dir) for ap in audio_paths
-    )
-    need_vocal_isolation = (
+    vocal_isolation_active = (
         bool(cfg.vocal_isolation_method) and cfg.vocal_isolation_method.lower() != "none"
-        and (not cfg.load_debug_dir or any(
-            not _debug_stage_exists(ap, "vocal_isolation", cfg.load_debug_dir) for ap in audio_paths
-        ))
     )
+    # A cached vocal isolation checkpoint makes that file's VAD stage entirely dead
+    # weight: the isolation manifest carries the same segment boundaries, its WAVs
+    # carry the audio ASR actually consumes, and stage 2 replaces vad_segments
+    # wholesale — so reading the VAD WAVs back would only be thrown away.
+    isolation_cached = [
+        vocal_isolation_active
+        and bool(cfg.load_debug_dir)
+        and _debug_stage_exists(ap, "vocal_isolation", cfg.load_debug_dir)
+        for ap in audio_paths
+    ]
+    vad_indices = [i for i, cached in enumerate(isolation_cached) if not cached]
+    need_vad = any(
+        not cfg.load_debug_dir
+        or not _debug_stage_exists(audio_paths[i], "vad", cfg.load_debug_dir)
+        for i in vad_indices
+    )
+    need_vocal_isolation = vocal_isolation_active and not all(isolation_cached)
     need_ensemble = (
         cfg.ensemble_model != "none"
         and (not cfg.load_debug_dir or any(
@@ -559,42 +605,60 @@ def _execute_pipeline(
             not _debug_stage_exists(ap, "llm_correction", cfg.load_debug_dir) for ap in audio_paths
         ))
     )
+    need_diarize = (
+        cfg.diarize
+        and (not cfg.load_debug_dir or any(
+            not _debug_stage_exists(ap, "diarization", cfg.load_debug_dir) for ap in audio_paths
+        ))
+    )
 
     summary = TranscriptionSummary(enabled=cfg.print_progress)
     process_start = time.perf_counter()
 
     # Stage 1: VAD
-    with StageTimer("VAD", summary, progress=progress) as stage:
-        stub_items = [{'audio_path': p, 'audio_track': _select_audio_track(p)} for p in audio_paths]
-        if need_vad:
-            from cantocaptions_ai.pipeline.vad import load_vad
-            # A caller (e.g. PipelineService in resident mode) may pass a preloaded
-            # VAD model to reuse across jobs — load_vad reuses it and ignores
-            # vad_method. It stays alive via the caller's reference after the
-            # processor wrapper is dropped below, skipping the ~20-30s reload.
-            vad_processor = load_vad(
-                vad_method=cfg.vad_method,
-                device=cfg.device,
-                device_index=cfg.device_index,
-                vad_onset=cfg.vad_onset,
-                vad_offset=cfg.vad_offset,
-                vad_pad_onset=cfg.vad_pad_onset,
-                vad_pad_offset=cfg.vad_pad_offset,
-                vad_min_duration_off=cfg.vad_min_duration_off,
-                chunk_size=cfg.chunk_size,
-                vad_model=vad_model,
-                use_auth_token=cfg.hf_token,
-            )
-            stage.mark_inference_start()
-            items = vad_processor.run(stub_items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
-            del vad_processor
-        else:
-            items = VadProcessor.load_cache(stub_items, cfg.load_debug_dir)
+    # Files covered by a cached vocal isolation checkpoint are held back entirely
+    # (see isolation_cached above); they enter stage 2 as bare carriers and get their
+    # vad_segments from the isolation cache.
+    items: List[dict] = [{'audio_path': p} for p in audio_paths]
+    if len(vad_indices) < len(audio_paths):
+        logger.info(
+            "Skipping VAD for %d of %d file(s) already covered by cached vocal isolation",
+            len(audio_paths) - len(vad_indices), len(audio_paths),
+        )
+    if vad_indices:
+        with StageTimer("VAD", summary, progress=progress) as stage:
+            vad_items = [
+                {'audio_path': audio_paths[i], 'audio_track': _select_audio_track(audio_paths[i])}
+                for i in vad_indices
+            ]
+            if need_vad:
+                from cantocaptions_ai.pipeline.vad import load_vad
+                # A caller (e.g. PipelineService in resident mode) may pass a preloaded
+                # VAD model to reuse across jobs — load_vad reuses it and ignores
+                # vad_method. It stays alive via the caller's reference after the
+                # processor wrapper is dropped below, skipping the ~20-30s reload.
+                vad_processor = load_vad(
+                    vad_method=cfg.vad_method,
+                    device=cfg.device,
+                    device_index=cfg.device_index,
+                    vad_onset=cfg.vad_onset,
+                    vad_offset=cfg.vad_offset,
+                    vad_pad_onset=cfg.vad_pad_onset,
+                    vad_pad_offset=cfg.vad_pad_offset,
+                    vad_min_duration_off=cfg.vad_min_duration_off,
+                    chunk_size=cfg.chunk_size,
+                    vad_model=vad_model,
+                    use_auth_token=cfg.hf_token,
+                )
+                stage.mark_inference_start()
+                vad_out = vad_processor.run(vad_items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
+                del vad_processor
+            else:
+                vad_out = VadProcessor.load_cache(vad_items, cfg.load_debug_dir)
+        for i, out in zip(vad_indices, vad_out):
+            items[i] = out
 
     # Stage 2: Vocal Isolation (conditional)
-    vocal_isolation_active = (
-        bool(cfg.vocal_isolation_method) and cfg.vocal_isolation_method.lower() != "none"
-    )
     if need_vocal_isolation:
         with StageTimer("Vocal isolation", summary, progress=progress) as stage:
             from cantocaptions_ai.pipeline.vocal_isolation import load_vocal_isolation
@@ -774,28 +838,12 @@ def _execute_pipeline(
         else:
             items = _extract_timestamps(items)
 
-    # Stage 5: Diarization
+    # Stage 5: Diarization. Runs after alignment so speaker turns land on the over-split
+    # subsegments that cue assembly is about to merge back together, which is what lets
+    # segmentation._same_speaker veto a merge across a speaker change.
     if cfg.diarize:
-        if cfg.hf_token is None:
-            logger.warning(
-                "No --hf_token provided, needs to be saved in environment variable, otherwise will throw error loading diarization model"
-            )
-        with StageTimer("Diarization", summary, progress=progress) as stage:
-            items = _run_diarization(
-                items, cfg.diarize_model, cfg.hf_token, cfg.device, cfg.model_dir,
-                cfg.min_speakers, cfg.max_speakers, cfg.speaker_embeddings,
-                progress_callback=stage.reporter,
-                load_complete_callback=stage.mark_inference_start,
-            )
-
-    # Stage 6: Speaker Verification
-    if cfg.verify_speakers:
-        with StageTimer("Speaker verification", summary, progress=progress) as stage:
-            items = _run_speaker_verification(
-                items, cfg.device, cfg.model_dir,
-                progress_callback=stage.reporter,
-                load_complete_callback=stage.mark_inference_start,
-            )
+        items = _run_diarization(items, cfg, summary, progress, need_diarize)
+        items = _assign_speakers(items, cfg, debug_dir=cfg.debug_dir)
 
     # Write and/or collect final results
     results = _merge_and_write(

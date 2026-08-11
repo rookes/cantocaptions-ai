@@ -35,7 +35,7 @@ pattern = '(?<![譯原])著(?![述名作])'
 replace = '着'
 
 [[rules]]
-pattern = '(?<![空])翻(?![身閲譯一二兩三四五六七八九十百千萬數])'
+pattern = '(?<![空])翻(?![查身閲譯一二兩三四五六七八九十百千萬數])'
 replace = '返'
 
 [[rules]]
@@ -87,10 +87,6 @@ pattern = '黎([\u4e00-\u9fff][？！，…\n])'
 replace = '嚟\1'
 
 [[rules]]
-pattern = '^難道'
-replace = '唔通'
-
-[[rules]]
 pattern = '傾計'
 replace = '傾偈'
 
@@ -109,3 +105,11 @@ replace = '藉口'
 [[rules]]
 pattern = '尋日'
 replace = '噚日'
+
+[[rules]]
+pattern = '([—…，？！])哇'
+replace = '\1嘩'
+
+[[rules]]
+pattern = '^哇'
+replace = '嘩'

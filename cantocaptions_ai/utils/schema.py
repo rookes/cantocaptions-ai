@@ -38,6 +38,7 @@ class SingleWordSegment(TypedDict):
     start: float
     end: float
     score: float
+    speaker: NotRequired[str]  # attached by speaker_assign when diarization ran
 
 class SingleCharSegment(TypedDict):
     """
@@ -66,6 +67,9 @@ class SingleSegment(TypedDict):
     text: str
     time_stamps: NotRequired[List[TimeStampChar]]
     avg_logprob: NotRequired[float]
+    speaker: NotRequired[str]
+    speaker_confidence: NotRequired[float]
+    speaker_conflict: NotRequired[bool]
 
 
 class SegmentData(TypedDict):
@@ -90,6 +94,12 @@ class SingleAlignedSegment(TypedDict):
     avg_logprob: NotRequired[float]
     words: List[SingleWordSegment]
     chars: Optional[List[SingleCharSegment]]
+    # Attached by the diarization stage (see pipeline/speaker_assign.py). ``speaker`` is only
+    # set when one speaker holds a confident majority of the segment; a missing key means
+    # "unknown", which cue assembly treats as "no objection to merging".
+    speaker: NotRequired[str]
+    speaker_confidence: NotRequired[float]
+    speaker_conflict: NotRequired[bool]
 
 
 class TranscriptionResult(TypedDict):
@@ -109,6 +119,32 @@ class AlignedTranscriptionResult(TypedDict):
     language: str
 
 
+class SpeakerTurn(TypedDict):
+    """One contiguous stretch of audio attributed to a single speaker by diarization."""
+    start: float
+    end: float
+    speaker: str
+
+
+class DiarizationResult(TypedDict):
+    """Raw output of the diarization stage for one file, before it is mapped onto segments.
+
+    ``turns`` comes from pyannote's *exclusive* diarization (no overlapping speech), which is
+    what speaker assignment consumes; ``overlap_turns`` keeps the unmodified diarization for
+    debug inspection of crosstalk. Times are always on the file timeline.
+
+    Under ``scope == "segment"`` each VAD segment was diarized independently, so speaker
+    labels are namespaced (``S0007/SPEAKER_00``) and are only comparable within one segment;
+    ``segment_speakers`` then carries the per-segment breakdown.
+    """
+    speakers: List[str]
+    turns: List[SpeakerTurn]
+    overlap_turns: List[SpeakerTurn]
+    scope: NotRequired[str]
+    segment_speakers: NotRequired[List[dict]]
+    embeddings: NotRequired[Optional[dict]]
+
+
 class VadItem(TypedDict):
     """Intermediate carrier for the VAD and vocal-isolation stages (before transcription)."""
     audio_path: str
@@ -124,15 +160,22 @@ class ProcessingItem(TypedDict):
     ensemble_texts: NotRequired[List[str]]  # index-aligned alternative ASR hypotheses
     reference_texts: NotRequired[List[str]]  # time-matched standard Chinese reference; one per segment
     audio_track: NotRequired[int]
+    diarization: NotRequired[DiarizationResult]
 
 
 def merge_segments(seg1: SingleAlignedSegment, seg2: SingleAlignedSegment) -> SingleAlignedSegment:
     """Merge two adjacent aligned segments into one.
 
-    Starts from a copy of ``seg1`` so keys attached by later stages (``speaker`` from
-    diarization/verification, and anything else a caller carries) survive the merge; only the
-    fields that a merge actually redefines are overridden. ``avg_logprob`` is cleared because
-    it is genuinely undefined for a merged cue.
+    Starts from a copy of ``seg1`` so keys attached by later stages (and anything else a
+    caller carries) survive the merge; only the fields that a merge actually redefines are
+    overridden. ``avg_logprob`` is cleared because it is genuinely undefined for a merged cue.
+
+    Speaker attribution needs more than ``dict(seg1)``: callers only merge when the two sides
+    do not contradict each other (see ``segmentation._same_speaker``), so an unlabeled side
+    means "unknown", not "nobody". Taking seg1's label unconditionally would drop seg2's
+    label when merging (unknown, SPEAKER_01) and let a later merge cross a real speaker
+    boundary, so whichever side carries a label wins. ``speaker_confidence`` is dropped for
+    the same reason as ``avg_logprob``: it described one of the two originals, not the union.
     """
     s3_chars = (seg1.get("chars") or []) + (seg2.get("chars") or [])
     merged = dict(seg1)
@@ -144,4 +187,10 @@ def merge_segments(seg1: SingleAlignedSegment, seg2: SingleAlignedSegment) -> Si
         "words": seg1["words"] + seg2["words"],
         "chars": s3_chars or None,
     })
+    speaker = seg1.get("speaker") or seg2.get("speaker")
+    if speaker is not None:
+        merged["speaker"] = speaker
+    merged.pop("speaker_confidence", None)
+    if seg1.get("speaker_conflict") or seg2.get("speaker_conflict"):
+        merged["speaker_conflict"] = True
     return merged

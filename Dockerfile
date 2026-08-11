@@ -4,7 +4,8 @@
 #
 # Notes:
 #  * Linux x86_64 GPU target. Torch is pulled from the CUDA 12.8 index (pyproject).
-#  * Extras installed: transformers_qwen (ASR) + ensemble + llm + diarize. The
+#  * Extras installed: transformers_qwen (ASR) + ensemble + llm. Diarization needs no
+#    extra: pyannote-audio is a base dependency. The
 #    flash-attn extra is intentionally omitted — it compiles from source (needs the
 #    full CUDA toolkit and many minutes) for little gain here, and the default
 #    attention implementation is 'sdpa'. Add it later if you benchmark a win.
@@ -37,8 +38,7 @@ COPY . .
 RUN uv sync --frozen \
         --extra transformers_qwen \
         --extra ensemble \
-        --extra llm \
-        --extra diarize
+        --extra llm
 
 # Optional: bake model weights into the image at build time.
 ARG PREFETCH=none

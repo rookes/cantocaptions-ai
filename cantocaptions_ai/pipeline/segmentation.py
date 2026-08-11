@@ -34,7 +34,11 @@ from cantocaptions_ai.cantonese.text import (
     boundary_is_mergeable,
     is_mergeable,
 )
+from cantocaptions_ai.pipeline.speaker_assign import speaker_scope
+from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.schema import SingleAlignedSegment, merge_segments
+
+logger = get_logger(__name__)
 
 # Alignment writes cue ends as round(next_start - align_padding, 3), so a pair of touching
 # cues is exactly one padding apart *by construction* -- but the rounded floats don't subtract
@@ -56,14 +60,72 @@ def _text(seg: SingleAlignedSegment) -> str:
     return seg["text"].strip()
 
 
+# Longest cue text shown in a veto log line before it is elided.
+_VETO_PREVIEW_CHARS = 14
+
+
+class _MergeVetoLog:
+    """Boundaries where the speaker gate blocked a merge that would otherwise have happened.
+
+    Only merges that were admissible on every *other* count are recorded, so a line here
+    always means "diarization is the reason these two cues stayed separate" and never
+    "punctuation would have kept them apart anyway".
+
+    Keyed by boundary time because pass C rescans the whole cue list after each merge, so
+    the same stranded cue is examined many times; blocked pairs never merge, so the boundary
+    time is a stable identity for one veto.
+    """
+
+    def __init__(self):
+        self._by_boundary = {}
+
+    def record(self, left: SingleAlignedSegment, right: SingleAlignedSegment) -> None:
+        self._by_boundary[right["start"]] = (left, right)
+
+    @staticmethod
+    def _preview(segment: SingleAlignedSegment) -> str:
+        text = _text(segment)
+        if len(text) > _VETO_PREVIEW_CHARS:
+            text = text[:_VETO_PREVIEW_CHARS] + "\u2026"
+        return f"[{segment.get('speaker')}] {text}"
+
+    def report(self) -> None:
+        """Log one line per held boundary, plus a count. Silent when nothing was blocked."""
+        if not self._by_boundary:
+            return
+        # Imported lazily to keep this module's import graph to cantonese/ + utils.schema.
+        from cantocaptions_ai.utils.output import format_timestamp
+
+        for boundary in sorted(self._by_boundary):
+            left, right = self._by_boundary[boundary]
+            logger.info(
+                "Diarization held a cue boundary at %s: %s | %s",
+                format_timestamp(boundary, always_include_hours=True, decimal_marker=","),
+                self._preview(left),
+                self._preview(right),
+            )
+        held = len(self._by_boundary)
+        logger.info(
+            "Diarization kept %d cue %s from merging",
+            held, "boundary" if held == 1 else "boundaries",
+        )
+
+
 def _same_speaker(seg1: SingleAlignedSegment, seg2: SingleAlignedSegment) -> bool:
     """True when merging won't destroy a speaker attribution.
 
     Segments only carry ``speaker`` when diarization ran; if either side lacks a label there
     is nothing to contradict, so the merge is allowed.
+
+    Under ``--diarize_scope segment``, labels are namespaced per VAD segment because speaker
+    identity is only established within one (``S0003/SPEAKER_00`` and ``S0004/SPEAKER_00`` are
+    unrelated voices). Comparing across that boundary would veto every merge spanning a VAD
+    segment on no evidence at all, so differing scopes read as "unknown" and permit the merge.
     """
     spk1, spk2 = seg1.get("speaker"), seg2.get("speaker")
     if spk1 is None or spk2 is None:
+        return True
+    if speaker_scope(spk1) != speaker_scope(spk2):
         return True
     return spk1 == spk2
 
@@ -76,6 +138,7 @@ def _adjacency_merge(
     max_chars: int,
     leading_markers: frozenset,
     min_cue_duration: float,
+    vetoes: "_MergeVetoLog",
 ) -> List[SingleAlignedSegment]:
     """Pass A: greedily join touching neighbours with a clean join boundary.
 
@@ -99,14 +162,18 @@ def _adjacency_merge(
             _duration(segment) < min_cue_duration
             and _text(segment).strip(_TOKEN_TRIM) in leading_markers
         )
-        if (
+        # The speaker gate is checked last so a veto can be attributed to diarization
+        # alone: everything else about this join already reads cleanly.
+        mergeable = (
             not defer
             and gap <= threshold + GAP_EPS
-            and _same_speaker(prev, segment)
             and is_mergeable(_text(prev), _text(segment), punctuation, max_chars=max_chars)
-        ):
+        )
+        if mergeable and _same_speaker(prev, segment):
             merged[-1] = merge_segments(prev, segment)
         else:
+            if mergeable:
+                vetoes.record(prev, segment)
             merged.append(segment)
 
     return merged
@@ -136,6 +203,7 @@ def _rescue_short_cues(
     min_cue_duration: float,
     merge_gap: float,
     rescue_max_chars: int,
+    vetoes: "_MergeVetoLog",
 ) -> List[SingleAlignedSegment]:
     """Pass C: merge each too-short cue into whichever neighbour reads best.
 
@@ -171,16 +239,20 @@ def _rescue_short_cues(
             gap_limit = merge_gap * 2 if is_marker else merge_gap
 
             candidates = []
+            speaker_blocked = []
             for left_idx in (i - 1, i):
                 if left_idx < 0 or left_idx + 1 >= len(cues):
                     continue
                 left, right = cues[left_idx], cues[left_idx + 1]
-                if not _same_speaker(left, right):
-                    continue
                 if len(_text(left)) + len(_text(right)) > rescue_max_chars:
                     continue
                 gap = right["start"] - left["end"]
                 if gap > gap_limit + GAP_EPS:
+                    continue
+                # Checked after the width and gap gates so a veto means this direction was
+                # otherwise usable, and diarization is what closed it.
+                if not _same_speaker(left, right):
+                    speaker_blocked.append((left, right))
                     continue
                 rank = 0 if boundary_is_mergeable(_text(left), punctuation) else 1
                 # left_idx == i means this cue is the left member, i.e. joining forwards.
@@ -188,6 +260,10 @@ def _rescue_short_cues(
                 candidates.append((rank, direction, gap, left_idx))
 
             if not candidates:
+                # Only worth reporting when the cue is stranded outright. A direction the
+                # speaker gate closed costs nothing if the other direction still rescued it.
+                for left, right in speaker_blocked:
+                    vetoes.record(left, right)
                 continue
 
             candidates.sort()
@@ -257,9 +333,10 @@ def assemble_cues(
     # them; with passes B-D off, pass A must behave exactly as it always has.
     leading_markers = frozenset(segmentation.leading_markers) if min_cue_duration > 0 else frozenset()
 
+    vetoes = _MergeVetoLog()
     cues = _adjacency_merge(
         segments, punctuation, align_merge_distance, align_padding, max_chars,
-        leading_markers, min_cue_duration,
+        leading_markers, min_cue_duration, vetoes,
     )
 
     if min_cue_duration > 0:
@@ -267,7 +344,9 @@ def assemble_cues(
             cues = _drop_noise(cues, is_noise, min_cue_duration)
         cues = _rescue_short_cues(
             cues, punctuation, segmentation, min_cue_duration, merge_gap, rescue_max_chars,
+            vetoes,
         )
         cues = _apply_duration_floor(cues, min_cue_duration, align_padding)
 
+    vetoes.report()
     return cues

@@ -113,14 +113,30 @@ class PipelineConfig:
 
     # Diarization
     diarize: bool = False
-    diarize_merge: bool = False
     min_speakers: Optional[int] = None
     max_speakers: Optional[int] = None
     diarize_model: str = "pyannote/speaker-diarization-community-1"
+    # "segment" diarizes each VAD segment independently (speaker labels namespaced per
+    # segment, only comparable within one); "file" diarizes the whole file in one pass.
+    diarize_scope: str = "segment"
+    # Chunks per diarization forward pass. NOT the checkpoint's own value: community-1's
+    # config.yaml asks for 32, whose in-call peak measured 10.7 GB on a 28s segment. That
+    # does not fit a 10 GB card, and Windows answers an oversubscribed allocation by paging
+    # into host RAM rather than raising -- so it does not fail, it runs ~50x slower. Measured
+    # on an RTX 3080, one 28s segment: batch 32 -> 10.7 GB / 60s, 16 -> 10.0 GB / 45s,
+    # 8 -> 9.4 GB / 585s, 4 -> 251 MB / 1.09s. The jump between 4 and 8 is a kernel workspace
+    # threshold, not smooth scaling, so 4 is the safe side of a cliff rather than a tuning
+    # knob. Raise it only if you have measured the peak on your own card.
+    diarize_batch_size: Optional[int] = 4
     speaker_embeddings: bool = False
-
-    # Speaker verification
-    verify_speakers: bool = False
+    # Share of a subsegment's diarized time the leading speaker must hold before the
+    # subsegment is attributed at all. Below it the subsegment stays unlabeled, which cue
+    # assembly reads as "no objection to merging" -- see pipeline/speaker_assign.py.
+    speaker_confidence: float = 0.7
+    # Share the runner-up must hold for a subsegment to be flagged as multi-speaker.
+    speaker_conflict_share: float = 0.25
+    flag_speaker_conflicts: bool = False
+    speaker_labels: bool = False
 
     # Retime
     retime: Optional[str] = None
