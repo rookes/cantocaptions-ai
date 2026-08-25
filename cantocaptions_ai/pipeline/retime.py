@@ -6,6 +6,7 @@ from typing import List
 import torch
 
 from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION
+from cantocaptions_ai.pipeline.align_profiles import DEFAULT_ALIGN_PROFILE
 from cantocaptions_ai.pipeline.alignment import (
     _preprocess_segment,
     compute_vad_emissions,
@@ -109,8 +110,10 @@ def retime_subtitles(
     )
 
     logger.info("Computing VAD emissions for retime search...")
+    profile = align_metadata.get("profile") or DEFAULT_ALIGN_PROFILE
     vad_emissions = compute_vad_emissions(
-        vad_segments, align_model, model_type, bert_processor, device, batch_size, vram_checks=vram_checks
+        vad_segments, align_model, model_type, bert_processor, device, batch_size,
+        vram_checks=vram_checks, primer=profile.primer,
     )
 
     current_offset: float = 0.0

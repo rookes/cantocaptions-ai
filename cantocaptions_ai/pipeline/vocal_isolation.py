@@ -20,7 +20,8 @@ from cantocaptions_ai.utils.model_utils import (
     guard_model_load,
     resolve_torch_compute_dtype,
 )
-from cantocaptions_ai.utils.debug import load_isolation_debug, write_isolation_debug
+from cantocaptions_ai.utils.debug import (_PERSISTED_SEGMENT_KEYS, load_isolation_debug,
+                                          write_isolation_debug)
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
@@ -175,6 +176,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                     'remaining': len(offsets),
                     'start': seg['start'],
                     'end': seg['end'],
+                    **{k: seg[k] for k in _PERSISTED_SEGMENT_KEYS if k in seg},
                 }
                 jobs.extend((key, off) for off in offsets)
 
@@ -286,7 +288,13 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                 torch.from_numpy(vocals_mono), self.model_sample_rate, SAMPLE_RATE
             ).numpy()
         _validate_segment_duration(st['start'], st['end'], vocals_mono)
-        item_out[idx]['segs'][sdx] = {'start': st['start'], 'end': st['end'], 'audio': vocals_mono}
+        rebuilt = {'start': st['start'], 'end': st['end'], 'audio': vocals_mono}
+        # Isolation rewrites the audio but must not lose provenance the VAD stage
+        # attached (currently 'expanded', which --asr_context_scope reads downstream).
+        for key in _PERSISTED_SEGMENT_KEYS:
+            if key in st:
+                rebuilt[key] = st[key]
+        item_out[idx]['segs'][sdx] = rebuilt
         # Free the heavy buffers now that this segment is done.
         st['mixture'] = st['result'] = st['counter'] = None
 

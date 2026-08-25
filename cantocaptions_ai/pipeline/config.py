@@ -144,6 +144,26 @@ class PipelineConfig:
     # Reference subtitle correction
     reference_subtitle: Optional[str] = None
     reference_correction_semantic: bool = False
+    # Constant offset applied to every reference cue before use, for a reference sourced
+    # from a different release or OCR'd with a systematic lag. Affects both consumers.
+    reference_offset: float = 0.0
+
+    # Reference subtitle as ASR context (experimental). Routes the same
+    # --reference_subtitle file into Qwen3-ASR's context-biasing system prompt and,
+    # separately, into the VAD timeline. See pipeline/reference_context.py.
+    asr_context: bool = False
+    asr_context_template: str = "labelled"
+    # 'all' prompts every segment with the cues covering it; 'expanded' prompts only over
+    # audio the reference recovered that VAD missed, leaving VAD's own detections bare.
+    asr_context_scope: str = "all"
+    asr_context_neighbours: int = 0
+    # Context is a prefill cost paid per segment per batch; this caps it.
+    asr_context_max_chars: int = 400
+    asr_context_vad_expand: bool = True
+    # Seconds added either side of every reference cue before it is unioned into the VAD
+    # timeline. Every cue is included -- there is no confidence gate -- so this is the
+    # only knob controlling how much audio the reference contributes.
+    asr_context_padding: float = 0.5
 
     @classmethod
     def from_args(cls, args: dict) -> "PipelineConfig":

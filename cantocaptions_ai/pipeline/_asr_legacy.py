@@ -39,6 +39,18 @@ class QwenPipelineLegacy(QwenPipeline):
         self._language = _normalize_language(language or "yue")
         self.normalization = normalization
 
+    @staticmethod
+    def _transcribe_kwargs(segments) -> dict:
+        """Per-segment ``context`` kwarg for Qwen3ASRModel.transcribe, when any is set.
+
+        The qwen_asr package takes context as a batch-length list and builds the same
+        system-prompt shape the native backend reproduces by hand. Omitted entirely
+        when no segment carries context, so the call is unchanged for ordinary runs.
+        This path is untested -- the legacy extra is not installed in this venv.
+        """
+        contexts = [seg.get('context') or '' for seg in segments]
+        return {'context': contexts} if any(contexts) else {}
+
     def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
         """Transcribe all files in a single Qwen3ASRModel.transcribe call.
 
@@ -60,10 +72,11 @@ class QwenPipelineLegacy(QwenPipeline):
         if to_compute:
             # Qwen3ASRModel.transcribe accepts List[(np.ndarray, sample_rate)];
             # VAD segments are already 16 kHz mono float32 arrays.
-            audio_inputs = [
-                (seg['audio'], 16000) for _, item in to_compute for seg in item['vad_segments']
-            ]
-            transcriptions = self._model.transcribe(audio_inputs, language=language)
+            all_segs = [seg for _, item in to_compute for seg in item['vad_segments']]
+            audio_inputs = [(seg['audio'], 16000) for seg in all_segs]
+            transcriptions = self._model.transcribe(
+                audio_inputs, language=language, **self._transcribe_kwargs(all_segs)
+            )
 
             pos = 0
             for idx, item in to_compute:
@@ -100,7 +113,9 @@ class QwenPipelineLegacy(QwenPipeline):
         # Qwen3ASRModel.transcribe accepts List[(np.ndarray, sample_rate)].
         # VAD segments are already 16 kHz mono float32 arrays.
         audio_inputs = [(seg['audio'], 16000) for seg in input]
-        transcriptions = self._model.transcribe(audio_inputs, language=language)
+        transcriptions = self._model.transcribe(
+            audio_inputs, language=language, **self._transcribe_kwargs(input)
+        )
 
         segments: List[SingleSegment] = []
         for vad_seg, t in zip(input, transcriptions):

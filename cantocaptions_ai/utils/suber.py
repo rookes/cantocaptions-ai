@@ -4,9 +4,11 @@ import argparse
 from typing import List
 
 try:
+    import regex
     from suber.data_types import LineBreak, Subtitle, TimedWord
     from suber.file_readers import read_input_file
     from suber.hyp_to_ref_alignment import levenshtein_align_hypothesis_to_reference
+    from suber.lib_levenshtein import distance as _levenshtein_distance
     from suber.metrics.cer import calculate_character_error_rate
     from suber.metrics.suber import calculate_SubER
 except ImportError as e:
@@ -71,6 +73,36 @@ def calculate_cer(hyp_path: str, ref_path: str, metric: str = "CER") -> float:
     return calculate_character_error_rate(aligned, ref, metric=metric)
 
 
+def _document_text(path: str, cased: bool = False) -> str:
+    """Whole-file text with cue boundaries and punctuation removed."""
+    subtitles = read_input_file(path, "SRT")
+    text = "".join(w.string for sub in subtitles for w in sub.word_list)
+    text = regex.sub(r"\p{P}", "", text)
+    return text if cased else text.lower()
+
+
+def calculate_document_cer(hyp_path: str, ref_path: str, cased: bool = False) -> float:
+    """Character error rate over the concatenated file, ignoring cue boundaries.
+
+    ``calculate_cer`` pairs cues one-to-one after a Levenshtein alignment pass and then
+    scores each pair independently, so a single inserted or dropped cue misaligns every
+    later pair and inflates the score several-fold: on the Bluey fixture it reports
+    ~77% where the true character error rate is ~17%. That makes it unusable for
+    comparing two ASR configurations whose cue boundaries differ at all.
+
+    This measures transcription accuracy alone. Use it when the question is "did the
+    text get better"; use ``calculate_suber`` when the question is "did the subtitles
+    get better", since that one is *supposed* to be sensitive to segmentation.
+
+    Returned as a percentage, matching the other metrics here.
+    """
+    hyp = _document_text(hyp_path, cased)
+    ref = _document_text(ref_path, cased)
+    if not ref:
+        return 0.0 if not hyp else 100.0
+    return round(100 * _levenshtein_distance(hyp, ref) / len(ref), 3)
+
+
 def align_to_reference(
     hypothesis: AlignedTranscriptionResult,
     reference: AlignedTranscriptionResult,
@@ -114,13 +146,15 @@ if __name__ == "__main__":
     parser.add_argument("ref", help="reference SRT file")
     parser.add_argument(
         "--metric",
-        choices=["SubER", "SubER-cased", "CER", "CER-cased"],
+        choices=["SubER", "SubER-cased", "CER", "CER-cased", "docCER", "docCER-cased"],
         default="SubER",
         help="metric to compute (default: SubER)",
     )
     args = parser.parse_args()
 
-    if args.metric.startswith("CER"):
+    if args.metric.startswith("docCER"):
+        score = calculate_document_cer(args.hyp, args.ref, cased=args.metric.endswith("-cased"))
+    elif args.metric.startswith("CER"):
         score = calculate_cer(args.hyp, args.ref, metric=args.metric)
     else:
         score = calculate_suber(args.hyp, args.ref, metric=args.metric)

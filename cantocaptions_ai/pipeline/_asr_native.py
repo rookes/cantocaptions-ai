@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from cantocaptions_ai.pipeline.asr import QwenPipeline, _normalize_language
-from cantocaptions_ai.utils.audio import resolve_device
+from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
 from cantocaptions_ai.utils.model_utils import (
     partition_by_cache,
@@ -23,6 +23,14 @@ from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
+
+# Generation budget per second of audio, used to size max_new_tokens for segments that
+# exceed the ASR chunk budget. Reference-subtitle expansion deliberately lets a segment
+# run past chunk_size rather than cut mid-dialogue, and the fixed 200-token default was
+# sized for <=30s chunks: measured speech density on the Doraemon fixture is ~4.3 chars/s,
+# so a 78s segment needs ~336 characters and would silently truncate. 8 leaves headroom
+# over the densest observed speech.
+_TOKENS_PER_SECOND = 8
 
 
 def _compile_and_warmup(model, processor, language: str, batch_size: Optional[int]) -> None:
@@ -156,7 +164,8 @@ class QwenPipelineNative(QwenPipeline):
 
         def infer_fn(batch):
             wavs = [buffers[idx]['segs'][sdx]['audio'] for idx, sdx in batch]
-            texts = self._infer_batch(wavs, language)
+            contexts = [buffers[idx]['segs'][sdx].get('context') for idx, sdx in batch]
+            texts = self._infer_batch(wavs, language, contexts)
             for (idx, sdx), text in zip(batch, texts):
                 buffers[idx]['texts'][sdx] = text
 
@@ -202,7 +211,8 @@ class QwenPipelineNative(QwenPipeline):
 
         def infer_fn(batch):
             wavs = [input[i]['audio'] for i in batch]
-            for i, text in zip(batch, self._infer_batch(wavs, language)):
+            contexts = [input[i].get('context') for i in batch]
+            for i, text in zip(batch, self._infer_batch(wavs, language, contexts)):
                 texts[i] = text
 
         BatchExecutor(
@@ -216,21 +226,75 @@ class QwenPipelineNative(QwenPipeline):
         ]
         return {"segments": segments, "language": language}
 
-    def _infer_batch(self, wavs: List, language: str) -> List[str]:
+    def _build_context_prompts(self, contexts: List[Optional[str]], language: str) -> List[str]:
+        """Render the SDK's prompt shape for a batch carrying context biasing text.
+
+        ``apply_transcription_request`` cannot be reused here. It puts the *language
+        name* in the system slot (processing_qwen3_asr.py:495-540), while the chat
+        template concatenates every system text item with no separator -- so appending
+        context to it would emit "<context>Cantonese" as one run-on string.
+
+        The official SDK (qwen_asr/inference/qwen3_asr.py:448-465) and vLLM both do it
+        the other way round: system carries the context *alone*, and the language is
+        forced by prefilling the assistant turn with "language <Lang><asr_text>".
+        Because that prefill sits in the input, generated tokens are the bare
+        transcription -- ``decode(return_format="transcription_only")`` still handles
+        it (no marker => the whole string is the transcription) and still applies the
+        repetition-collapsing pass.
+        """
+        conversations = [
+            [
+                {"role": "system", "content": ctx or ""},
+                {"role": "user", "content": [{"type": "audio", "audio": ""}]},
+            ]
+            for ctx in contexts
+        ]
+        prompts = self.processor.apply_chat_template(
+            conversations, add_generation_prompt=True, tokenize=False
+        )
+        return [f"{p}language {language}<asr_text>" for p in prompts]
+
+    def _infer_batch(
+        self,
+        wavs: List,
+        language: str,
+        contexts: Optional[List[Optional[str]]] = None,
+    ) -> List[str]:
         """Run one batch of audio arrays through the model, returning parsed texts.
+
+        With no context supplied this takes the plain ``apply_transcription_request``
+        path unchanged, so runs without --asr_context are bit-identical to before.
 
         Raises RuntimeError on CUDA OOM (caught and retried at a smaller batch size by
         BatchExecutor); no shared state is mutated before the model call.
         """
-        inputs = self.processor.apply_transcription_request(audio=wavs, language=language)
+        if contexts is not None and any(contexts):
+            prompts = self._build_context_prompts(contexts, language)
+            for prompt in prompts:
+                logger.debug("[PROMPT] %s", prompt)
+            # padding_side="left" comes from Qwen3ASRProcessorKwargs._defaults, which is
+            # what makes batched generation correct on this path.
+            inputs = self.processor(text=prompts, audio=wavs, return_tensors="pt", padding=True)
+        else:
+            inputs = self.processor.apply_transcription_request(audio=wavs, language=language)
         inputs = inputs.to(self.model.device, self.model.dtype)
 
+        # Segments longer than the chunk budget need a proportionally larger generation
+        # budget or their transcription is cut off mid-sentence. Raising the cap costs
+        # nothing when generation stops at EOS -- but note it also lets a context
+        # recitation loop run longer, which is a separate defect.
+        longest_s = max(len(w) for w in wavs) / SAMPLE_RATE
+        max_new = max(self.max_new_tokens, int(longest_s * _TOKENS_PER_SECOND))
+        if max_new > self.max_new_tokens:
+            logger.debug("[BUDGET] longest=%.1fs -> max_new_tokens=%d (default %d)",
+                         longest_s, max_new, self.max_new_tokens)
+
         if self.device.type == "cuda" and self.policy.enabled:
-            _warn_vram(inputs, len(wavs), self.model, self.max_new_tokens, self.device, self.policy)
+            _warn_vram(inputs, len(wavs), self.model, max_new, self.device, self.policy)
 
         with torch.inference_mode():
             generated = self.model.generate(
-                **inputs, max_new_tokens=self.max_new_tokens, do_sample=False
+                **inputs, max_new_tokens=max_new, do_sample=False
             )
 
         # generate() returns a plain tensor by default; handle both for safety

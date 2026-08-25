@@ -6,6 +6,7 @@ import platform
 from cantocaptions_ai.pipeline.cli_config import ConfigAwareHelpFormatter, resolve_pipeline_args
 from cantocaptions_ai.pipeline.config import PipelineConfig
 from cantocaptions_ai.pipeline.model_profiles import MODEL_PROFILES
+from cantocaptions_ai.pipeline.reference_context import CONTEXT_TEMPLATES
 from cantocaptions_ai.utils.output import (LANGUAGES, TO_LANGUAGE_CODE,
                             optional_int, str2bool)
 from cantocaptions_ai.utils.log_utils import setup_logging, get_logger
@@ -121,8 +122,18 @@ def build_parser() -> argparse.ArgumentParser:
     ensemble_grp.add_argument("--llm_correction", action="store_true", default=argparse.SUPPRESS, help="run LLM-based per-segment particle correction and full-document name normalization after transcription")
     ensemble_grp.add_argument("--llm_model", type=str, default=argparse.SUPPRESS, help="HuggingFace model ID for LLM correction (used with --llm_correction)")
     ensemble_grp.add_argument("--llm_model_dir", type=str, default=argparse.SUPPRESS, help="local path to LLM weights; uses HF cache if not set")
-    ensemble_grp.add_argument("--reference_subtitle", type=str, default=argparse.SUPPRESS, metavar="SUBTITLE_FILE", help="standard Chinese subtitle file (SRT/VTT) used as reference for LLM correction; fixes homophone errors in proper nouns, idioms, etc. (requires --llm_correction)")
+    ensemble_grp.add_argument("--reference_subtitle", type=str, default=argparse.SUPPRESS, metavar="SUBTITLE_FILE", help="same-content subtitle file in another language (SRT/VTT), used as reference by --llm_correction and/or --asr_context; fixes homophone errors in proper nouns, idioms, etc. (requires one of those two)")
     ensemble_grp.add_argument("--reference_correction_semantic", action="store_true", default=argparse.SUPPRESS, help="also attempt semantic fixes from the reference subtitle (e.g. missing negations, punctuation); higher false-positive risk, requires --reference_subtitle")
+    ensemble_grp.add_argument("--reference_offset", type=float, default=argparse.SUPPRESS, metavar="SECONDS", help="shift every --reference_subtitle cue by this many seconds before use (negative = earlier); for a reference that runs consistently early or late against the audio. Use --retime instead if the offset drifts")
+
+    ctx_grp = parser.add_argument_group("asr context (experimental)")
+    ctx_grp.add_argument("--asr_context", action="store_true", default=argparse.SUPPRESS, help="feed --reference_subtitle into Qwen3-ASR's context-biasing system prompt so each VAD segment decodes with its matching reference cues as background knowledge (experimental; measure with scripts/eval_asr_context.py)")
+    ctx_grp.add_argument("--asr_context_template", type=str, default=argparse.SUPPRESS, choices=list(CONTEXT_TEMPLATES.keys()), help="how the reference text is rendered into the system prompt: 'bare' text only, 'labelled' with a short Chinese prefix, 'instruct' with an English instruction wrapper, 'none' no prompt at all (VAD expansion only -- the control for whether the prompt is doing anything)")
+    ctx_grp.add_argument("--asr_context_scope", type=str, default=argparse.SUPPRESS, choices=["all", "expanded"], help="which parts of a segment get a context prompt: 'all' every segment the reference covers, 'expanded' only the audio the reference recovered that VAD missed (requires asr_context_vad_expand)")
+    ctx_grp.add_argument("--asr_context_neighbours", type=int, default=argparse.SUPPRESS, metavar="N", help="also include N reference cues either side of the ones overlapping each VAD segment")
+    ctx_grp.add_argument("--asr_context_max_chars", type=int, default=argparse.SUPPRESS, metavar="N", help="cap each segment's context at N characters, dropping whole trailing cues; context is a per-segment prefill cost that inflates the ASR KV-cache")
+    ctx_grp.add_argument("--asr_context_vad_expand", type=str2bool, default=argparse.SUPPRESS, help="if True, union every reference cue (padded by --asr_context_padding) into the VAD timeline, so a span is kept if either VAD or the reference claims it (requires --asr_context)")
+    ctx_grp.add_argument("--asr_context_padding", type=float, default=argparse.SUPPRESS, metavar="SECONDS", help="seconds added either side of every reference cue before it is unioned into the VAD timeline; every cue is included, so this alone controls how much audio the reference contributes")
 
     align_grp = parser.add_argument_group("alignment")
     align_grp.add_argument("--align_model", default=argparse.SUPPRESS, help="Name of phoneme-level ASR model to do alignment")

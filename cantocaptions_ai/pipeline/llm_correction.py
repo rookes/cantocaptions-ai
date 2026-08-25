@@ -75,27 +75,22 @@ def _edit_distance(a: str, b: str) -> int:
 def match_reference_to_segments(
     segments: List[SingleSegment],
     reference: List[SingleSegment],
+    joiner: str = '，',
+    fallback_window: float = 2.0,
 ) -> List[str]:
     """Return one reference string per ASR segment, matched by time overlap.
 
-    Falls back to nearest midpoint within 2 s when no overlap exists.
-    Returns empty string for segments with no usable reference match.
+    Falls back to the nearest cue by midpoint within *fallback_window* seconds when no
+    overlap exists. Returns an empty string for segments with no usable match.
+
+    Thin wrapper over ``reference_context.overlapping_reference_indices`` so ASR
+    context biasing and LLM reference correction share one time-matcher; the defaults
+    preserve this stage's original behaviour.
     """
-    result = []
-    for seg in segments:
-        seg_start, seg_end = seg['start'], seg['end']
-        overlapping = [r for r in reference if r['start'] < seg_end and r['end'] > seg_start]
-        if overlapping:
-            result.append('，'.join(r['text'] for r in overlapping))
-        else:
-            if not reference:
-                result.append('')
-                continue
-            seg_mid = (seg_start + seg_end) / 2
-            nearest = min(reference, key=lambda r: abs((r['start'] + r['end']) / 2 - seg_mid))
-            ref_mid = (nearest['start'] + nearest['end']) / 2
-            result.append(nearest['text'] if abs(ref_mid - seg_mid) <= 2.0 else '')
-    return result
+    from cantocaptions_ai.pipeline.reference_context import overlapping_reference_indices
+
+    matches = overlapping_reference_indices(segments, reference, fallback_window=fallback_window)
+    return [joiner.join(reference[i]['text'] for i in idxs) for idxs in matches]
 
 
 def _detect_quantization() -> Tuple[bool, str]:

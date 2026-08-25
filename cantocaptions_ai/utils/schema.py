@@ -28,6 +28,17 @@ class VadAudioSegment(TypedDict):
     start: float
     end: float
     audio: np.ndarray
+    # Reference-subtitle text biasing this segment's ASR decode (--asr_context).
+    # Attached in transcribe.py *after* the VAD/isolation cache load, because both
+    # debug round-trips rebuild segment dicts from scratch and would drop it; it is
+    # cheap to re-derive and always is. Consumed only by the ASR backends.
+    context: NotRequired[str]
+    # Sub-spans of this segment that exist only because a reference cue was unioned into
+    # the VAD timeline -- audio VAD itself never detected (see reference_context.
+    # expansion_only_spans). Unlike 'context' this is set at VAD time and *is* persisted
+    # through the VAD/isolation manifests, because it cannot be re-derived later: the
+    # pre-expansion timeline is gone by then. Read by --asr_context_scope expanded.
+    expanded: NotRequired[List[List[float]]]
 
 
 class SingleWordSegment(TypedDict):

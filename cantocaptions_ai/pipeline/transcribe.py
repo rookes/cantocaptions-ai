@@ -18,6 +18,7 @@ from cantocaptions_ai.cantonese.text import (
     MAX_CHARS,
     is_removable,
 )
+from cantocaptions_ai.pipeline.reference_context import CONTEXT_TEMPLATES
 from cantocaptions_ai.pipeline.segmentation import assemble_cues
 from cantocaptions_ai.utils.debug import (
     _debug_stage_exists,
@@ -380,10 +381,52 @@ def validate_config(cfg) -> None:
         raise ConfigError(
             f"speaker_conflict_share must be in (0, 1], got {cfg.speaker_conflict_share}"
         )
-    if cfg.reference_subtitle and not cfg.llm_correction:
-        raise ConfigError("reference_subtitle requires llm_correction")
+    if cfg.reference_subtitle and not (cfg.llm_correction or cfg.asr_context):
+        raise ConfigError("reference_subtitle requires llm_correction or asr_context")
     if cfg.reference_correction_semantic and not cfg.reference_subtitle:
         warnings.warn("reference_correction_semantic has no effect without reference_subtitle")
+    if cfg.asr_context and not cfg.reference_subtitle:
+        raise ConfigError("asr_context requires reference_subtitle")
+    if cfg.asr_context and cfg.asr_context_template not in CONTEXT_TEMPLATES:
+        raise ConfigError(
+            f"asr_context_template must be one of {sorted(CONTEXT_TEMPLATES)}, "
+            f"got {cfg.asr_context_template!r}"
+        )
+    if cfg.asr_context and cfg.asr_context_scope not in ("all", "expanded"):
+        raise ConfigError(
+            f"asr_context_scope must be 'all' or 'expanded', got {cfg.asr_context_scope!r}"
+        )
+    if (
+        cfg.asr_context
+        and cfg.asr_context_scope == "expanded"
+        and not cfg.asr_context_vad_expand
+    ):
+        raise ConfigError(
+            "asr_context_scope 'expanded' requires asr_context_vad_expand: with no "
+            "expansion there is no recovered audio to prompt over, so no segment would "
+            "get a context"
+        )
+    if cfg.asr_context and cfg.asr_context_neighbours < 0:
+        raise ConfigError(
+            f"asr_context_neighbours must be >= 0, got {cfg.asr_context_neighbours}"
+        )
+    if cfg.reference_offset and not cfg.reference_subtitle:
+        warnings.warn("reference_offset has no effect without reference_subtitle")
+    if cfg.asr_context and cfg.retime:
+        raise ConfigError("asr_context has no effect with retime, which skips ASR entirely")
+    # The "none" template is the VAD-expansion-only control, so it is the one template
+    # that does nothing at all once expansion is also off.
+    if (
+        cfg.asr_context
+        and cfg.asr_context_template == "none"
+        and not cfg.asr_context_vad_expand
+        and not cfg.llm_correction
+    ):
+        raise ConfigError(
+            "asr_context_template 'none' with asr_context_vad_expand off uses the "
+            "reference subtitle for nothing; enable asr_context_vad_expand (the "
+            "control this template exists for) or pick another template"
+        )
 
     if cfg.language is not None:
         cfg.language = cfg.language.lower()
@@ -615,6 +658,28 @@ def _execute_pipeline(
     summary = TranscriptionSummary(enabled=cfg.print_progress)
     process_start = time.perf_counter()
 
+    # Loaded once here because two stages want it: VAD expansion (stage 1) and ASR
+    # context (stage 3), plus LLM reference correction (stage 3c) further down.
+    reference_cues = None
+    if cfg.reference_subtitle:
+        from cantocaptions_ai.pipeline.retime import load_subtitle_file
+        logger.info("Loading reference subtitle: %s", cfg.reference_subtitle)
+        reference_cues = load_subtitle_file(cfg.reference_subtitle)
+        logger.info("Loaded %d reference subtitle lines.", len(reference_cues))
+        if cfg.reference_offset:
+            from cantocaptions_ai.pipeline.reference_context import shift_cues
+            before = len(reference_cues)
+            reference_cues = shift_cues(reference_cues, cfg.reference_offset)
+            logger.info(
+                "Shifted reference subtitle by %+.3fs (%d cue(s), %d dropped before zero)",
+                cfg.reference_offset, len(reference_cues), before - len(reference_cues),
+            )
+        if cfg.asr_context and len(audio_paths) > 1:
+            warnings.warn(
+                f"asr_context is using one reference subtitle for {len(audio_paths)} audio "
+                "files; the cues can only be correct for one of them"
+            )
+
     # Stage 1: VAD
     # Files covered by a cached vocal isolation checkpoint are held back entirely
     # (see isolation_cached above); they enter stage 2 as bare carriers and get their
@@ -649,6 +714,12 @@ def _execute_pipeline(
                     chunk_size=cfg.chunk_size,
                     vad_model=vad_model,
                     use_auth_token=cfg.hf_token,
+                    reference_cues=(
+                        reference_cues
+                        if cfg.asr_context and cfg.asr_context_vad_expand
+                        else None
+                    ),
+                    reference_padding=cfg.asr_context_padding,
                 )
                 stage.mark_inference_start()
                 vad_out = vad_processor.run(vad_items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
@@ -718,6 +789,50 @@ def _execute_pipeline(
         del align_model, bert_processor
         flush_vram()
     else:
+        # Attach ASR context here rather than at VAD time: both the VAD and vocal
+        # isolation debug round-trips rebuild segment dicts from scratch and would drop
+        # the key, and this point is downstream of both cache loads. Contexts are cheap
+        # and always re-derived, so --asr_context_template edits take effect on replay.
+        if cfg.asr_context and reference_cues:
+            from cantocaptions_ai.pipeline.reference_context import build_segment_contexts
+            for item in items:
+                spans = None
+                if cfg.asr_context_scope == "expanded":
+                    # Provenance recorded at VAD time and carried through the debug
+                    # manifests; absent means this segment is entirely VAD's own find.
+                    spans = [
+                        sp for seg in item['vad_segments'] for sp in seg.get('expanded', ())
+                    ]
+                contexts = build_segment_contexts(
+                    item['vad_segments'],
+                    reference_cues,
+                    neighbours=cfg.asr_context_neighbours,
+                    template=cfg.asr_context_template,
+                    max_chars=cfg.asr_context_max_chars,
+                    restrict_to_spans=spans,
+                )
+                item['vad_segments'] = [
+                    {**seg, 'context': ctx}
+                    for seg, ctx in zip(item['vad_segments'], contexts)
+                ]
+                if cfg.asr_context_scope == "expanded" and cfg.asr_context_template != "none":
+                    logger.info(
+                        "ASR context: scope 'expanded' -- %d of %d segment(s) carry a "
+                        "context over reference-recovered audio; the rest decode bare",
+                        sum(1 for c in contexts if c), len(contexts),
+                    )
+                elif cfg.asr_context_template == "none":
+                    logger.info(
+                        "ASR context: template 'none' -- %d segment(s) decode without a "
+                        "context prompt; the reference subtitle affected the VAD "
+                        "timeline only", len(contexts),
+                    )
+                else:
+                    logger.info(
+                        "ASR context: %d of %d segment(s) biased by the reference subtitle",
+                        sum(1 for c in contexts if c), len(contexts),
+                    )
+
         # Stage 3: Transcription
         if need_asr:
             from cantocaptions_ai.pipeline.asr import load_model
@@ -770,16 +885,12 @@ def _execute_pipeline(
 
         # Stage 3c: LLM correction (optional)
         if cfg.llm_correction:
-            if cfg.reference_subtitle:
-                from cantocaptions_ai.pipeline.retime import load_subtitle_file
+            if reference_cues:
                 from cantocaptions_ai.pipeline.llm_correction import match_reference_to_segments
                 with StageTimer("Reference subtitle matching", summary, progress=progress):
-                    logger.info(f"Loading reference subtitle: {cfg.reference_subtitle}")
-                    reference_subs = load_subtitle_file(cfg.reference_subtitle)
-                    logger.info(f"Loaded {len(reference_subs)} reference subtitle lines.")
                     for item in items:
                         item['reference_texts'] = match_reference_to_segments(
-                            item['result']['segments'], reference_subs
+                            item['result']['segments'], reference_cues
                         )
 
             if need_llm:

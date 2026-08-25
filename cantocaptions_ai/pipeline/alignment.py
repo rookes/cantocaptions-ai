@@ -24,6 +24,12 @@ from cantocaptions_ai.utils.schema import (
     interpolate_nans,
 )
 from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION, PunctuationConfig, SpotCheck
+from cantocaptions_ai.pipeline.align_checks import warn_on_silent_starts, whole_file_region
+from cantocaptions_ai.pipeline.align_profiles import (
+    DEFAULT_ALIGN_PROFILE,
+    AudioPrimer,
+    get_align_profile,
+)
 
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.output import LANGUAGES_WITHOUT_SPACES
@@ -405,8 +411,19 @@ def _compute_vad_emissions_batched(
     device: str,
     batch_size: int,
     vram_checks: bool = True,
+    primer: Optional["AudioPrimer"] = None,
 ) -> List[Tuple[torch.Tensor, float]]:
     """Batch VAD segments through the HF Wav2Vec2-BERT model via BatchExecutor.
+
+    ``primer`` (from the align model's profile, ``None`` for a model without one) prepends
+    left context to each segment before the encoder sees it, and its frames are discarded
+    here so nothing downstream knows it existed — see ``align_profiles.TailPrimer`` for why
+    the current model needs it. The prefix length is deliberately *not* asked of the primer:
+    the encoder's own output length for the **unprimed** audio is measured and that many
+    frames are kept from the end, which is exact whatever the primer prepended and keeps a
+    future primer free to change shape. That costs one extra feature-extraction pass per
+    batch (cheap next to the forward) and is worth it — estimating the offset from duration
+    instead would be a frame out often enough to reintroduce the artifact it removes.
 
     bert_processor's feature extractor pads each batch to its own longest segment and returns
     an attention_mask, whose per-row sum is the segment's real length **in input feature
@@ -445,11 +462,20 @@ def _compute_vad_emissions_batched(
 
     model_dtype = next(model.parameters()).dtype
 
+    def _emission_lens(wavs) -> torch.Tensor:
+        features = bert_processor(
+            wavs, sampling_rate=SAMPLE_RATE, return_tensors="pt", return_attention_mask=True,
+        )
+        # Feature frames -> emission frames (see docstring); identity without an adapter.
+        return model._get_feat_extract_output_lengths(features["attention_mask"].sum(dim=-1))
+
     def infer_fn(batch: List[int]) -> None:
         wavs = [vad_segments[i]["audio"] for i in batch]
+        model_inputs = [primer(w, SAMPLE_RATE) for w in wavs] if primer is not None else wavs
         with torch.inference_mode():
             features = bert_processor(
-                wavs, sampling_rate=SAMPLE_RATE, return_tensors="pt", return_attention_mask=True,
+                model_inputs, sampling_rate=SAMPLE_RATE, return_tensors="pt",
+                return_attention_mask=True,
             )
             input_features = features["input_features"].to(device, dtype=model_dtype)
             attention_mask = features["attention_mask"].to(device)
@@ -458,9 +484,10 @@ def _compute_vad_emissions_batched(
             emissions = torch.log_softmax(
                 model(input_features, attention_mask=attention_mask).logits, dim=-1
             )
-        # Feature frames -> emission frames (see docstring); identity without an adapter.
-        valid_lens = features["attention_mask"].sum(dim=-1)
-        emission_lens = model._get_feat_extract_output_lengths(valid_lens)
+            valid_lens = features["attention_mask"].sum(dim=-1)
+            emission_lens = model._get_feat_extract_output_lengths(valid_lens)
+            # How many frames the segment alone is worth; the rest of the row is primer.
+            plain_lens = _emission_lens(wavs) if primer is not None else emission_lens
         for row, i in enumerate(batch):
             real_len = int(emission_lens[row].item())
             if real_len > emissions.shape[1]:
@@ -470,7 +497,14 @@ def _compute_vad_emissions_batched(
                     f"emission-frame conversion does not match this align model; timestamps "
                     f"would silently compress. Check the model's adapter config."
                 )
-            emission = emissions[row, :real_len, :].cpu().detach()
+            keep = int(plain_lens[row].item())
+            if keep > real_len:
+                raise RuntimeError(
+                    f"Primed alignment emission is shorter than the unprimed segment it "
+                    f"contains ({real_len} < {keep} frames). The primer must return its "
+                    f"prefix followed by the original audio unchanged."
+                )
+            emission = emissions[row, real_len - keep:real_len, :].cpu().detach()
             vad_duration = vad_segments[i]["end"] - vad_segments[i]["start"]
             frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
             results[i] = (emission, frame_rate)
@@ -504,28 +538,43 @@ def _compute_vad_emissions(
     device: str,
     batch_size: int = 4,
     vram_checks: bool = True,
+    primer: Optional["AudioPrimer"] = None,
 ) -> List[Tuple[torch.Tensor, float]]:
     """Run inference on each full VAD segment. Returns (log_softmax_emission, frame_rate) per segment.
 
     Logs before/after regardless of which path runs below, so a slow pass (a file
     with many/long VAD segments) is visibly explained rather than looking like a
     hang — this ran with no progress feedback at all before batching was added.
+
+    ``primer`` reaches only the batched path. The sequential fallback exists for model
+    types this pipeline doesn't exercise (torchaudio bundles, plain HF wav2vec2), none of
+    which carry a profile primer today; priming there would need the same exact
+    frame-length bookkeeping for no current caller, so it warns instead of half-doing it.
     """
     if not vad_segments:
         return []
     start = time.perf_counter()
     logger.info("Computing alignment emissions for %d VAD segments...", len(vad_segments))
     if model_type == "huggingface" and bert_processor is not None:
-        results = _compute_vad_emissions_batched(vad_segments, model, bert_processor, device, batch_size, vram_checks=vram_checks)
+        results = _compute_vad_emissions_batched(
+            vad_segments, model, bert_processor, device, batch_size,
+            vram_checks=vram_checks, primer=primer,
+        )
     else:
+        if primer is not None:
+            logger.warning(
+                "Align model profile configures an audio primer, but this model runs the "
+                "sequential path, which does not apply it. First-character timings may be "
+                "pinned to each segment's start."
+            )
         results = _compute_vad_emissions_sequential(vad_segments, model, model_type, bert_processor, device)
     logger.info("Alignment emissions computed in %.1fs", time.perf_counter() - start)
     return results
 
 
-def compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size: int = 4, vram_checks: bool = True):
+def compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size: int = 4, vram_checks: bool = True, primer=None):
     """Public wrapper around _compute_vad_emissions for use by the retime pipeline."""
-    return _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size, vram_checks=vram_checks)
+    return _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size, vram_checks=vram_checks, primer=primer)
 
 
 def _get_emission_for_segment(
@@ -813,7 +862,14 @@ def load_align_model(
         align_model = guard_model_load("alignment", _ALIGN_REMEDIATION, lambda: align_model.to(device, dtype=dtype))
         align_dictionary = {char.lower(): code for char, code in processor.tokenizer.get_vocab().items()}
 
-    align_metadata = {"language": language_code, "dictionary": align_dictionary, "type": pipeline_type}
+    align_metadata = {
+        "language": language_code,
+        "dictionary": align_dictionary,
+        "type": pipeline_type,
+        # Resolved once here rather than in align(), which then has no idea which model it
+        # is holding. Unknown models get the all-no-op default.
+        "profile": get_align_profile(model_name),
+    }
     return align_model, align_metadata
 
 
@@ -877,11 +933,16 @@ def align(
     model_dictionary = align_model_metadata["dictionary"]
     model_lang = align_model_metadata["language"]
     model_type = align_model_metadata["type"]
+    # .get so hand-built metadata dicts (tests, callers predating align_profiles) still work.
+    profile = align_model_metadata.get("profile") or DEFAULT_ALIGN_PROFILE
     blank_id = _get_blank_id(model_dictionary)
     spacing_char_id = blank_id # model_dictionary['！']
 
     vad_seg_emissions = (
-        _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size, vram_checks=vram_checks)
+        _compute_vad_emissions(
+            vad_segments, model, model_type, bert_processor, device, batch_size,
+            vram_checks=vram_checks, primer=profile.primer,
+        )
         if vad_segments is not None
         else None
     )
@@ -950,6 +1011,14 @@ def align(
 
         for seg, new_end in zip(aligned_segments, ends):
             seg["end"] = float(new_end)
+
+    # --- Validate. Model-agnostic and always on: a cue start sitting on silence is wrong
+    # whichever align model produced it. Runs on final timings, after the release/trim
+    # pass, so it judges what the rest of the pipeline will actually consume.
+    warn_on_silent_starts(
+        aligned_segments,
+        vad_segments if vad_segments is not None else whole_file_region(audio, MAX_DURATION),
+    )
 
     # --- Collect word segments ---
     word_segments: List[SingleWordSegment] = [w for seg in aligned_segments for w in seg["words"]]

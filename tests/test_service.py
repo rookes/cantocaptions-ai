@@ -41,6 +41,36 @@ class TestValidateConfig(unittest.TestCase):
     def test_valid_config_passes(self):
         validate_config(PipelineConfig())  # defaults must be valid
 
+    def test_reference_subtitle_accepted_for_asr_context(self):
+        # asr_context is the second consumer of the same file, so it satisfies the
+        # requirement that used to be llm_correction-only.
+        validate_config(PipelineConfig(reference_subtitle="ref.srt", asr_context=True))
+
+    def test_asr_context_requires_reference_subtitle(self):
+        with self.assertRaises(ConfigError):
+            validate_config(PipelineConfig(asr_context=True))
+
+    def test_asr_context_rejects_unknown_template(self):
+        cfg = PipelineConfig(
+            reference_subtitle="ref.srt", asr_context=True, asr_context_template="nope"
+        )
+        with self.assertRaises(ConfigError):
+            validate_config(cfg)
+
+    def test_asr_context_rejects_negative_neighbours(self):
+        cfg = PipelineConfig(
+            reference_subtitle="ref.srt", asr_context=True, asr_context_neighbours=-1
+        )
+        with self.assertRaises(ConfigError):
+            validate_config(cfg)
+
+    def test_asr_context_conflicts_with_retime(self):
+        cfg = PipelineConfig(
+            reference_subtitle="ref.srt", asr_context=True, retime="in.srt"
+        )
+        with self.assertRaises(ConfigError):
+            validate_config(cfg)
+
 
 class TestRenderResult(unittest.TestCase):
     RESULT = {

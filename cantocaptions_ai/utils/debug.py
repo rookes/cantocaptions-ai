@@ -36,6 +36,12 @@ def _stage_dir(audio_path: str, stage: str, debug_dir: str) -> str:
     return path
 
 
+# Segment keys carried through the VAD / vocal-isolation manifests alongside the audio.
+# An explicit allowlist rather than a blanket passthrough: segment dicts also hold numpy
+# arrays and other non-JSON values, so copying everything would break json.dump.
+_PERSISTED_SEGMENT_KEYS = ("expanded",)
+
+
 def _write_audio_segments(segments: List[VadAudioSegment], stage_dir: str) -> list:
     try:
         import soundfile as sf
@@ -50,12 +56,16 @@ def _write_audio_segments(segments: List[VadAudioSegment], stage_dir: str) -> li
         if not isinstance(audio, np.ndarray):
             audio = np.array(audio)
         sf.write(filepath, audio, SAMPLE_RATE, subtype="PCM_16")
-        segment_records.append({
+        record = {
             "index": i,
             "start": seg["start"],
             "end": seg["end"],
             "file": filename,
-        })
+        }
+        for key in _PERSISTED_SEGMENT_KEYS:
+            if key in seg:
+                record[key] = seg[key]
+        segment_records.append(record)
     return segment_records
 
 
@@ -135,7 +145,11 @@ def _load_audio_segments(stage_dir: str) -> Optional[List[VadAudioSegment]]:
     for rec in manifest["segments"]:
         wav_path = os.path.join(stage_dir, rec["file"])
         audio, _ = sf.read(wav_path, dtype="float32")
-        segments.append({"start": rec["start"], "end": rec["end"], "audio": audio})
+        seg = {"start": rec["start"], "end": rec["end"], "audio": audio}
+        for key in _PERSISTED_SEGMENT_KEYS:
+            if key in rec:
+                seg[key] = rec[key]
+        segments.append(seg)
     return segments
 
 
