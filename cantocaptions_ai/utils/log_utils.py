@@ -1,3 +1,4 @@
+import contextvars
 import itertools
 import logging
 import sys
@@ -198,6 +199,20 @@ class ProgressReporter:
         self._timer._advance(n)
 
 
+# The StageTimer currently "in scope" on this thread, so code nested arbitrarily deep inside
+# a stage (e.g. a model download in model_utils.py) can quiet that stage's spinner for the
+# duration of its own output without every intervening call site threading a StageTimer
+# reference through. Set in __enter__/reset in __exit__; unset (None) outside any stage.
+_active_stage_timer: "contextvars.ContextVar[Optional[StageTimer]]" = contextvars.ContextVar(
+    "_active_stage_timer", default=None
+)
+
+
+def get_active_stage_timer() -> "Optional[StageTimer]":
+    """The innermost StageTimer currently open on this thread, or None outside any stage."""
+    return _active_stage_timer.get()
+
+
 class StageTimer:
     """Context manager that times a pipeline stage and drives a tqdm progress bar."""
 
@@ -218,8 +233,10 @@ class StageTimer:
         self._reporter: "ProgressReporter" = ProgressReporter(self)
         self._spinner_stop: threading.Event = threading.Event()
         self._spinner_thread: Optional[threading.Thread] = None
+        self._cv_token: "Optional[contextvars.Token]" = None
 
     def __enter__(self) -> "StageTimer":
+        self._cv_token = _active_stage_timer.set(self)
         # Notify the out-of-band sink regardless of console-summary state so a
         # headless caller still sees stage boundaries with print_progress=False.
         if self._progress is not None:
@@ -231,6 +248,10 @@ class StageTimer:
             return self
 
         self._start = time.perf_counter()
+        self._start_spinner()
+        return self
+
+    def _start_spinner(self) -> None:
         self._spinner_stop.clear()
         self._bar = tqdm(
             desc=self._label,
@@ -241,7 +262,25 @@ class StageTimer:
         )
         self._spinner_thread = threading.Thread(target=self._spin, daemon=True)
         self._spinner_thread.start()
-        return self
+
+    def pause_spinner(self) -> None:
+        """Stop the indeterminate spinner so other output (e.g. a model download's own
+        progress lines) doesn't render interleaved with it. No-op once the stage has
+        moved to a determinate bar, console output is off, or it's already paused."""
+        if not self._summary.enabled or self._determinate or self._bar is None:
+            return
+        self._spinner_stop.set()
+        if self._spinner_thread is not None:
+            self._spinner_thread.join(timeout=0.5)
+        self._bar.leave = False
+        self._bar.close()
+        self._bar = None
+
+    def resume_spinner(self) -> None:
+        """Restart the spinner after pause_spinner(), continuing the same stage label."""
+        if not self._summary.enabled or self._determinate or self._bar is not None:
+            return
+        self._start_spinner()
 
     def _spin(self) -> None:
         for char in itertools.cycle(r'\|/-'):
@@ -253,6 +292,8 @@ class StageTimer:
             self._spinner_stop.wait(0.12)
 
     def __exit__(self, *_: object) -> None:
+        if self._cv_token is not None:
+            _active_stage_timer.reset(self._cv_token)
         end = time.perf_counter()
         vram_peak_mb = (
             torch.cuda.max_memory_allocated() / 1e6

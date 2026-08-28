@@ -1,13 +1,16 @@
 import gc
 import os
+import time
 import torch
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Callable, Dict, Generator, Generic, List, Optional, Tuple, TypeVar
 
+from tqdm import tqdm as _TqdmBase
+
 from cantocaptions_ai.utils.schema import ProgressCallback
-from cantocaptions_ai.utils.log_utils import get_logger
+from cantocaptions_ai.utils.log_utils import get_active_stage_timer, get_logger
 
 logger = get_logger(__name__)
 
@@ -462,6 +465,80 @@ def guard_model_load(stage: str, remediation: str, load_fn: Callable[[], _ModelT
         ) from e
 
 
+class _DownloadProgressLogger(_TqdmBase):
+    """Bridges huggingface_hub's byte-progress callbacks to periodic logger.info() calls.
+
+    huggingface_hub already tracks real download progress — including through the hf_xet
+    backend, which reports chunk-level bytes via a Rust extension entirely outside Python's
+    HTTP stack — via this tqdm-shaped ``tqdm_class`` hook. Its default rendering writes bare
+    ``\\r``-terminated updates to ``sys.stderr`` with no newline until the bar closes; once
+    ``--log_file`` reassigns ``sys.stderr`` to a line-buffered file handle, none of that ever
+    reaches disk while a download is in progress, so a live transfer and a dead one both look
+    like total silence. This suppresses tqdm's own rendering and instead logs a real, flushed
+    line at most once per ``_LOG_INTERVAL_S`` — a gap longer than that in the log means the
+    transfer has actually stalled, not that output is buffered somewhere.
+
+    Passed as ``snapshot_download(..., tqdm_class=...)``: huggingface_hub uses one instance of
+    this as the aggregate byte-progress bar across every file in the snapshot (see
+    ``_AggregatedTqdm`` in ``huggingface_hub._snapshot_download``), fed by each file's real
+    download callback regardless of backend.
+    """
+
+    class _NullWriter:
+        """Swallows every write tqdm makes: not just display(), but also clear()/moveto()
+        (called on *other* bars from _decr_instances when this one closes) which write to
+        ``self.fp`` directly, bypassing any override of display() alone."""
+
+        def write(self, *_args, **_kwargs) -> None: pass
+        def flush(self) -> None: pass
+        def isatty(self) -> bool: return False
+
+    _LOG_INTERVAL_S = 20.0
+
+    def __init__(self, *args, **kwargs):
+        kwargs["file"] = self._NullWriter()
+        super().__init__(*args, **kwargs)
+        self._last_log_t = 0.0
+
+    def update(self, n=1):
+        result = super().update(n)
+        if self.n == 0:
+            # Nothing has arrived yet (still resolving/connecting) — the caller's own
+            # "Downloading ..." line already marks the start; logging a 0% heartbeat here
+            # would just repeat on every connection-setup callback (observed every ~15s
+            # against a real repo) before any byte has actually moved. Once n > 0 the
+            # periodic heartbeat below resumes, so a stall *after* real progress began —
+            # the failure mode this class exists to catch — still shows up as silence.
+            return result
+        now = time.monotonic()
+        done = self.total is not None and self.n >= self.total
+        if done or now - self._last_log_t >= self._LOG_INTERVAL_S:
+            self._last_log_t = now
+            size = self.format_sizeof(self.n) + "B"
+            if self.total:
+                pct = f"{100 * self.n / self.total:.0f}%"
+                total_size = self.format_sizeof(self.total) + "B"
+                logger.info("%s: %s / %s (%s)", self.desc, size, total_size, pct)
+            else:
+                logger.info("%s: %s", self.desc, size)
+        return result
+
+
+@contextmanager
+def _quiet_stage_spinner() -> Generator[None, None, None]:
+    """Pause the enclosing StageTimer's cosmetic "<Stage> \\|/-" spinner (if any) for the
+    duration of the block, so a model download's own progress lines don't render
+    interleaved with an unrelated spinner still cycling on the same console/log line."""
+    stage = get_active_stage_timer()
+    if stage is not None:
+        stage.pause_spinner()
+    try:
+        yield
+    finally:
+        if stage is not None:
+            stage.resume_spinner()
+
+
 def ensure_hf_model_downloaded(repo_id: str, cache_dir=None, local_files_only: bool = False) -> None:
     """Download a full HF Hub repo snapshot to the local cache if not already present.
 
@@ -480,20 +557,21 @@ def ensure_hf_model_downloaded(repo_id: str, cache_dir=None, local_files_only: b
         return
     from huggingface_hub import snapshot_download, try_to_load_from_cache
 
-    if try_to_load_from_cache(repo_id, "config.json", cache_dir=cache_dir) is not None:
-        logger.debug("Verifying cached snapshot of %r against HuggingFace Hub", repo_id)
-        snapshot_download(repo_id, cache_dir=cache_dir)
-        return
+    with _quiet_stage_spinner():
+        if try_to_load_from_cache(repo_id, "config.json", cache_dir=cache_dir) is not None:
+            logger.debug("Verifying cached snapshot of %r against HuggingFace Hub", repo_id)
+            snapshot_download(repo_id, cache_dir=cache_dir, tqdm_class=_DownloadProgressLogger)
+            return
 
-    try:
-        import hf_xet  # noqa: F401
-        xet_hint = ""
-    except ImportError:
-        xet_hint = " (tip: pip install hf_xet for faster downloads)"
+        try:
+            import hf_xet  # noqa: F401
+            xet_hint = ""
+        except ImportError:
+            xet_hint = " (tip: pip install hf_xet for faster downloads)"
 
-    logger.info("Downloading %r from HuggingFace Hub%s", repo_id, xet_hint)
-    snapshot_download(repo_id, cache_dir=cache_dir)
-    logger.info("Download complete: %r", repo_id)
+        logger.info("Downloading %r from HuggingFace Hub%s", repo_id, xet_hint)
+        snapshot_download(repo_id, cache_dir=cache_dir, tqdm_class=_DownloadProgressLogger)
+        logger.info("Download complete: %r", repo_id)
 
 
 def ensure_hf_file_downloaded(repo_id: str, filename: str, cache_dir=None, local_files_only: bool = False) -> None:
@@ -510,9 +588,10 @@ def ensure_hf_file_downloaded(repo_id: str, filename: str, cache_dir=None, local
     if probe is not None:
         return
 
-    logger.info("Downloading %r from HuggingFace Hub", f"{repo_id}/{filename}")
-    hf_hub_download(repo_id=repo_id, filename=filename, cache_dir=cache_dir)
-    logger.info("Download complete: %r", f"{repo_id}/{filename}")
+    with _quiet_stage_spinner():
+        logger.info("Downloading %r from HuggingFace Hub", f"{repo_id}/{filename}")
+        hf_hub_download(repo_id=repo_id, filename=filename, cache_dir=cache_dir, tqdm_class=_DownloadProgressLogger)
+        logger.info("Download complete: %r", f"{repo_id}/{filename}")
 
 
 # ---------------------------------------------------------------------------

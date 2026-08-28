@@ -162,17 +162,26 @@ class TestEnsureHfModelDownloaded(unittest.TestCase):
             ensure_hf_model_downloaded("some/repo", **kwargs)
         return snap
 
+    # cache_dir is asserted via call_args rather than assert_called_once_with(...) so this
+    # doesn't also pin unrelated kwargs (e.g. tqdm_class, used for download progress logging).
+
     def test_downloads_when_nothing_cached(self):
         snap = self._run(None)
-        snap.assert_called_once_with("some/repo", cache_dir=None)
+        snap.assert_called_once()
+        self.assertEqual(snap.call_args.args, ("some/repo",))
+        self.assertIsNone(snap.call_args.kwargs["cache_dir"])
 
     def test_still_downloads_when_probe_finds_a_cached_file(self):
         snap = self._run("/cache/some--repo/snapshots/abc/config.json")
-        snap.assert_called_once_with("some/repo", cache_dir=None)
+        snap.assert_called_once()
+        self.assertEqual(snap.call_args.args, ("some/repo",))
+        self.assertIsNone(snap.call_args.kwargs["cache_dir"])
 
     def test_cache_dir_is_forwarded(self):
         snap = self._run(None, cache_dir="/models")
-        snap.assert_called_once_with("some/repo", cache_dir="/models")
+        snap.assert_called_once()
+        self.assertEqual(snap.call_args.args, ("some/repo",))
+        self.assertEqual(snap.call_args.kwargs["cache_dir"], "/models")
 
     def test_local_files_only_skips_the_hub_entirely(self):
         snap = self._run(None, local_files_only=True)
