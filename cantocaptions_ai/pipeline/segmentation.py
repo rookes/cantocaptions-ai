@@ -312,6 +312,7 @@ def assemble_cues(
     max_chars: int = MAX_CHARS,
     rescue_max_chars: Optional[int] = None,
     is_noise: Optional[Callable[[str], bool]] = None,
+    merge: bool = True,
 ) -> List[SingleAlignedSegment]:
     """Turn aligned subsegments into displayable cues (passes A-D; see module docstring).
 
@@ -322,6 +323,14 @@ def assemble_cues(
     will simply be broken over two lines. ``is_noise`` decides pass B and is skipped when None.
 
     ``min_cue_duration=0`` reduces this to pass A alone.
+
+    ``merge=False`` turns off the two passes that *join* cues (A and B's rescue sibling C),
+    leaving only the noise drop and the duration floor. Use it when the incoming cue
+    boundaries are authoritative rather than an artifact of over-splitting -- under
+    --realign the boundaries come from the source transcript's own line breaks, so there is
+    nothing to glue back together, and a merge pass would instead destroy them. Note that
+    such a transcript is typically punctuated too sparsely for pass A's mergeable-boundary
+    test to hold anything back, so leaving it on would fuse most of the file.
     """
     if not segments:
         return []
@@ -334,18 +343,22 @@ def assemble_cues(
     leading_markers = frozenset(segmentation.leading_markers) if min_cue_duration > 0 else frozenset()
 
     vetoes = _MergeVetoLog()
-    cues = _adjacency_merge(
-        segments, punctuation, align_merge_distance, align_padding, max_chars,
-        leading_markers, min_cue_duration, vetoes,
-    )
+    if merge:
+        cues = _adjacency_merge(
+            segments, punctuation, align_merge_distance, align_padding, max_chars,
+            leading_markers, min_cue_duration, vetoes,
+        )
+    else:
+        cues = [dict(seg) for seg in segments]
 
     if min_cue_duration > 0:
         if is_noise is not None:
             cues = _drop_noise(cues, is_noise, min_cue_duration)
-        cues = _rescue_short_cues(
-            cues, punctuation, segmentation, min_cue_duration, merge_gap, rescue_max_chars,
-            vetoes,
-        )
+        if merge:
+            cues = _rescue_short_cues(
+                cues, punctuation, segmentation, min_cue_duration, merge_gap, rescue_max_chars,
+                vetoes,
+            )
         cues = _apply_duration_floor(cues, min_cue_duration, align_padding)
 
     vetoes.report()

@@ -55,9 +55,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(formatter_class=formatter_class)
     parser.add_argument("audio", nargs="*", type=str, help="audio file(s) to transcribe")
     parser.add_argument("--language", type=str, default=argparse.SUPPRESS, choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio, specify None to perform language detection")
-    parser.add_argument("--retime", type=str, default=argparse.SUPPRESS, metavar="SUBTITLE_FILE", help="subtitle file to retime against the audio (SRT, VTT, etc.). Skips ASR; updates timings only, text is preserved.")
     parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {importlib.metadata.version('cantocaptions-ai')}", help="Show cantocaptions-ai version information and exit")
     parser.add_argument("--python-version", "-P", action="version", version=f"Python {platform.python_version()} ({platform.python_implementation()})", help="Show python version information and exit")
+
+    transcript_grp = parser.add_argument_group("existing transcript")
+    transcript_grp.add_argument("--retime", type=str, default=argparse.SUPPRESS, metavar="SUBTITLE_FILE", help="subtitle file to retime against the audio (SRT only, despite the format-agnostic name). Skips ASR and updates timings only, searching for each cue near its existing timestamp -- so it needs a subtitle that is already roughly in sync. For a transcript with no timings at all, use --realign.")
+    transcript_grp.add_argument("--realign", type=str, default=argparse.SUPPRESS, metavar="TRANSCRIPT", help="line-delimited transcript (or an SRT, whose timings are discarded) to align against the audio from scratch. One cue per line; the line breaks are treated as the authoritative cue boundaries, so punctuation does not split or merge them. Skips ASR by default and runs text cleaning as usual.")
+    transcript_grp.add_argument("--realign_anchor", type=str, default=argparse.SUPPRESS, choices=["acoustic", "asr"], help="how --realign finds where each line sits. 'acoustic' slides a free-end Viterbi over the audio with no ASR pass (fast, and the default). 'asr' transcribes first and matches the two character streams, which costs an ASR pass but copes far better when the transcript contains lines the recording does not.")
+    transcript_grp.add_argument("--realign_window", type=float, default=argparse.SUPPRESS, metavar="SECONDS", help="seconds of audio each --realign placement window sees")
+    transcript_grp.add_argument("--realign_commit_margin", type=float, default=argparse.SUPPRESS, metavar="SECONDS", help="lines ending within this far of a --realign window's far edge are held back for the next window, since a line straddling the edge has only been half seen")
+    transcript_grp.add_argument("--realign_min_score", type=float, default=argparse.SUPPRESS, help="mean CTC path score below which a placed line is logged as weakly supported; purely diagnostic, but a run of them means the transcript and the audio have diverged")
 
     config_grp = parser.add_argument_group("config file")
     config_grp.add_argument("--cfg", type=str, default=argparse.SUPPRESS, metavar="NAME", help="load config/NAME.cfg instead of the auto-created config/default.cfg (see config/cpu.cfg for a commented example); its values act as a layer beneath stage-preset and explicit CLI flags")
@@ -93,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     audio_grp = parser.add_argument_group("audio")
     audio_grp.add_argument("--audio_start", type=float, default=argparse.SUPPRESS, help="seconds of audio to skip before processing")
     audio_grp.add_argument("--audio_end", type=float, default=argparse.SUPPRESS, help="seconds of audio to cut from the ending")
+    audio_grp.add_argument("--audio_downmix", type=str, default=argparse.SUPPRESS, choices=["mix", "center"], help="how to reduce a multichannel track to mono. 'center' takes the front-center channel alone, which on a 5.1 film soundtrack is largely the dialogue stem and is close to free vocal isolation; layouts with no centre channel fall back to a full downmix.")
 
     vad_grp = parser.add_argument_group("vad")
     vad_grp.add_argument("--vad_method", type=str, default=argparse.SUPPRESS, choices=["pyannote"], help="VAD method to be used")
@@ -147,6 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
     align_grp.add_argument("--merge_gap", type=float, default=argparse.SUPPRESS, help="the maximum silence (seconds) a too-short subtitle may be merged across; doubled for the discourse markers listed in the ASR model's profile")
     align_grp.add_argument("--align_batch_size", default=argparse.SUPPRESS, type=int, help="number of VAD segments the alignment model processes per batch")
     align_grp.add_argument("--align_compute_type", default=argparse.SUPPRESS, type=str, choices=["float32", "float16"], help="compute type (weight dtype) for the alignment model; float16 lowers VRAM usage but may reduce forced-alignment accuracy (falls back to float32 off CUDA)")
+    align_grp.add_argument("--align_char_substitution", default=argparse.SUPPRESS, type=str, choices=["off", "variant", "homophone", "near"], help="substitute an in-vocabulary character when the align model has no token for one in the transcript, so it can be timed at all: 'variant' folds Simplified/variant forms, 'homophone' also accepts the same Jyutping reading (default), 'near' also accepts the same syllable on a different tone. The subtitle text is unchanged; only the token used for alignment differs")
+    align_grp.add_argument("--align_substitutions", default=argparse.SUPPRESS, type=str, help="TOML file with a [substitutions] table of hand-picked character substitutions, which beat every automatic choice (an empty value leaves that character alone)")
     align_grp.add_argument("--align", "-a", choices=["fast", "quality"], default=argparse.SUPPRESS, help="shorthand for --align_compute_type (fast=float16, quality=float32). Does NOT affect --align_batch_size (no benchmarked safe bump exists for the 'fast' tier — see scripts/bench_alignment_batching.py). The granular --align_compute_type flag always wins if both are given.")
 
     subtitle_grp = parser.add_argument_group("subtitle formatting")

@@ -11,6 +11,34 @@ class Vad:
     def preprocess_audio(audio):
         pass
 
+    @staticmethod
+    def cover_chunks(segments, chunk_size, duration):
+        """Partition ``[0, duration]`` into contiguous chunks of at most ``chunk_size``.
+
+        The opposite contract to ``merge_chunks``: VAD is used only to choose *where* to cut,
+        never to decide what to keep, so the emitted chunks tile the whole file with no gaps.
+        Required by --realign, where a transcript line exists for speech VAD may well score
+        below threshold (sung, shouted, music-bedded), and dropping that audio would leave
+        forced alignment nothing to align the line against.
+        """
+        raise NotImplementedError(
+            f"{type(segments).__name__} VAD backend does not implement cover_chunks; "
+            "contiguous chunking is required by --realign."
+        )
+
+    @staticmethod
+    def speech_regions(segments, **kwargs):
+        """The binarized speech turns, before any grouping into chunks.
+
+        ``merge_chunks`` groups these and ``cover_chunks`` ignores them; this returns them
+        raw. --realign runs in split-only mode, so its chunks say nothing about where inside
+        them anyone is speaking, and the ASR anchor needs exactly that to place a character
+        stream in time. See ``realign._hypothesis_stream``.
+        """
+        raise NotImplementedError(
+            f"{type(segments).__name__} VAD backend does not implement speech_regions."
+        )
+
     # keep merge_chunks as static so it can be also used by manually assigned vad_model (see 'load_model')
     @staticmethod
     def merge_chunks(segments, chunk_size):

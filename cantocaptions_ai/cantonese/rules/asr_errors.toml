@@ -497,8 +497,28 @@ pattern = '黑人爭'
 replace = '乞人憎'
 
 [[rules]]
+pattern = '都無'
+replace = '都冇'
+
+[[rules]]
 pattern = '[冇無]([\u4e00-\u9fff])[冇無]([^\1，、！？：…])'
 replace = '無\1無\2'
+
+[[rules]]
+pattern = '無理乎'
+replace = '冇你符'
+
+[[rules]]
+pattern = '無錯'
+replace = '冇錯'
+
+[[rules]]
+pattern = '冇([謂罪恥])'
+replace = '無\1'
+
+[[rules]]
+pattern = '冇情白事'
+replace = '無情白事'
 
 [[rules]]
 pattern = '準唔準(?!備)'
@@ -525,18 +545,6 @@ pattern = '企頂'
 replace = '企定'
 
 [[rules]]
-pattern = '無理乎'
-replace = '冇你符'
-
-[[rules]]
-pattern = '冇([謂罪恥])'
-replace = '無\1'
-
-[[rules]]
-pattern = '冇情白事'
-replace = '無情白事'
-
-[[rules]]
 pattern = '紅波波'
 replace = '紅卜卜'
 
@@ -559,3 +567,8 @@ replace = '大難臨頭'
 [[rules]]
 pattern = '摘花'
 replace = '紮花'
+
+[[rules]]
+pattern = '既時候'
+replace = '嘅時候'
+

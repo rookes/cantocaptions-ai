@@ -1,4 +1,5 @@
 import bisect
+import math
 import os
 from typing import Optional, Union
 
@@ -246,6 +247,65 @@ class Pyannote(Vad):
     @staticmethod
     def preprocess_audio(audio):
         return torch.from_numpy(audio).unsqueeze(0)
+
+    @staticmethod
+    def cover_chunks(segments, chunk_size, duration):
+        """Contiguous chunking: cut ``[0, duration]`` at quiet frames, keep every sample.
+
+        Reuses stage 3 of Binarize -- and *only* stage 3. Hysteresis and smoothing are what
+        decide which audio is speech, so skipping them is the whole point: the single region
+        [0, duration] is handed straight to the min-cut, which recursively splits at the
+        lowest-scoring frame in the second half of each over-long window. Because a split
+        timestamp both ends one piece and starts the next, the result tiles the file exactly.
+
+        Each piece is between ``chunk_size / 2`` and ``chunk_size`` seconds (the last one may
+        be shorter), and cuts land in the quietest frame available, so a chunk boundary
+        rarely falls mid-word.
+        """
+        assert chunk_size > 0
+        num_frames = segments.data.shape[0]
+        frames = segments.sliding_window
+        timestamps = [frames[i].middle for i in range(num_frames)]
+        # Column 0 is the max-aggregated speech probability (see the pre-aggregation hook in
+        # load_vad_model); the same curve Binarize thresholds on.
+        k_scores = segments.data[:, 0]
+
+        binarize = Binarize(max_duration=chunk_size)
+        regions = binarize._split_long([(0.0, duration)], timestamps, k_scores)
+        # _split_long bails out of its loop when no candidate frame exists in the search
+        # window (a duration shorter than the frame grid, say), which can leave a piece over
+        # budget. Fall back to an even split there rather than handing alignment a chunk it
+        # cannot hold in memory.
+        out = []
+        for start, end in regions:
+            if end - start <= chunk_size:
+                out.append((start, end))
+                continue
+            n = int(math.ceil((end - start) / chunk_size))
+            step = (end - start) / n
+            out.extend((start + i * step, start + (i + 1) * step) for i in range(n))
+            out[-1] = (out[-1][0], end)
+        return [{"start": s, "end": e, "segments": [(s, e)]} for s, e in out]
+
+    @staticmethod
+    def speech_regions(segments,
+                       onset: float = 0.5,
+                       offset: Optional[float] = None,
+                       pad_onset: float = 0.0,
+                       pad_offset: float = 0.0,
+                       min_duration_off: float = 0.0,
+                       min_duration_on: float = 0.0,
+                       ):
+        """Binarized speech turns as ``[(start, end)]``, ungrouped and uncapped.
+
+        Stages 1 and 2 of Binarize only: no ``max_duration``, because nothing is being
+        budgeted here -- the caller wants to know where the speech *is*, not how to cut it up.
+        """
+        binarize = Binarize(
+            onset=onset, offset=offset, pad_onset=pad_onset, pad_offset=pad_offset,
+            min_duration_off=min_duration_off, min_duration_on=min_duration_on,
+        )
+        return [(turn.start, turn.end) for turn in binarize(segments).get_timeline()]
 
     @staticmethod
     def merge_chunks(segments,

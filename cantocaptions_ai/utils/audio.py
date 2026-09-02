@@ -8,7 +8,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.output import exact_div
+
+logger = get_logger(__name__)
 
 # hard-coded audio hyperparameters
 SAMPLE_RATE = 16000
@@ -99,6 +102,51 @@ def select_cantonese_track(streams: List[dict]) -> int:
         if _is_chinese_track(stream):
             return i
     return 0
+
+
+# ffmpeg channel layouts that carry a discrete front-center channel. On a mixed
+# soundtrack FC is the dialogue stem, so extracting it alone is close to free vocal
+# isolation -- the reason --audio_downmix center exists. Layouts absent from this set
+# (stereo, 2.1, quad) have no FC to take, and an unknown layout is not guessed at.
+_LAYOUTS_WITH_CENTER = frozenset({
+    "mono",
+    "3.0", "3.0(back)", "4.0",
+    "5.0", "5.0(side)", "5.1", "5.1(side)",
+    "6.0", "6.0(front)", "6.1", "6.1(back)", "6.1(front)",
+    "7.0", "7.0(front)", "7.1", "7.1(wide)", "7.1(wide-side)",
+    "hexagonal", "octagonal",
+})
+
+
+def _downmix_ffmpeg_args(file: str, audio_track: int, downmix: str) -> list:
+    """Return the ffmpeg filter args implementing *downmix*, or [] for a plain downmix.
+
+    ``center`` isolates the front-center channel. It is applied only when ffprobe reports
+    a layout known to have one; anything else (stereo, an unnamed layout) falls back to
+    the ordinary all-channel downmix with a warning rather than risking a filter error
+    partway through decoding a feature-length file.
+    """
+    if downmix == "mix":
+        return []
+    if downmix != "center":
+        raise ValueError(f"Unknown downmix mode: {downmix!r} (expected 'mix' or 'center')")
+
+    streams = probe_audio_tracks(file)
+    stream = streams[audio_track] if audio_track < len(streams) else None
+    layout = (stream or {}).get("channel_layout", "")
+    channels = int((stream or {}).get("channels", 0) or 0)
+
+    if layout == "mono" or channels == 1:
+        return []  # already the center channel; nothing to extract
+    if layout in _LAYOUTS_WITH_CENTER:
+        return ["-af", "pan=mono|c0=FC"]
+
+    logger.warning(
+        "--audio_downmix center: track %d has layout %r (%d channel(s)) with no front-center "
+        "channel to extract; falling back to a full downmix.",
+        audio_track, layout or "unknown", channels,
+    )
+    return []
 
 
 def _clip_ffmpeg_args(audio_start: Optional[float], audio_end: Optional[float]) -> tuple:
@@ -192,7 +240,8 @@ def load_audio(file: str,
                sr: int = SAMPLE_RATE,
                audio_track: int = 0,
                audio_start: Optional[float] = None,
-               audio_end: Optional[float] = None
+               audio_end: Optional[float] = None,
+               downmix: str = "mix",
                ) -> np.ndarray:
     """
     Open an audio file and read as mono waveform, resampling as necessary
@@ -214,16 +263,23 @@ def load_audio(file: str,
     audio_end: float
         End of the clip to read, in seconds (None = to the end)
 
+    downmix: str
+        How to reduce a multichannel track to mono. "mix" (default) lets ffmpeg
+        downmix every channel; "center" takes the front-center channel alone, which
+        on a film soundtrack is largely the dialogue stem.
+
     Returns
     -------
     A NumPy array containing the audio waveform, in float32 dtype.
     """
     pre_input, post_input = _clip_ffmpeg_args(audio_start, audio_end)
+    filter_args = _downmix_ffmpeg_args(file, audio_track, downmix)
     try:
         cmd = ["ffmpeg", "-nostdin", "-threads", "0", *pre_input, "-i", file]
         if audio_track != 0:
             cmd += ["-map", f"0:a:{audio_track}"]
-        cmd += [*post_input, "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), "-"]
+        cmd += [*post_input, *filter_args,
+                "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), "-"]
         out = subprocess.run(cmd, capture_output=True, check=True).stdout
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
@@ -239,6 +295,7 @@ def extract_clip_to_wav(
     audio_end: Optional[float] = None,
     audio_track: int = 0,
     sr: int = SAMPLE_RATE,
+    downmix: str = "mix",
 ) -> str:
     """Write a 16 kHz mono WAV of ``src``'s [audio_start, audio_end) clip to ``dst``.
 
@@ -250,10 +307,11 @@ def extract_clip_to_wav(
     source timeline. Returns ``dst``.
     """
     pre_input, post_input = _clip_ffmpeg_args(audio_start, audio_end)
+    filter_args = _downmix_ffmpeg_args(src, audio_track, downmix)
     cmd = ["ffmpeg", "-nostdin", "-y", "-threads", "0", *pre_input, "-i", src]
     if audio_track != 0:
         cmd += ["-map", f"0:a:{audio_track}"]
-    cmd += [*post_input, "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), dst]
+    cmd += [*post_input, *filter_args, "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), dst]
     try:
         subprocess.run(cmd, capture_output=True, check=True)
     except subprocess.CalledProcessError as e:

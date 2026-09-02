@@ -496,5 +496,41 @@ class TestSpeakerVetoLogging(unittest.TestCase):
         )
 
 
+class TestMergeDisabled(unittest.TestCase):
+    """merge=False: the incoming cue boundaries are authoritative (--realign)."""
+
+    def _cues(self):
+        # Two touching cues with a punctuation-clean boundary -- pass A would join them --
+        # plus a third that is too short to read.
+        return [
+            seg(1.0, 2.0, "你好"),
+            seg(2.04, 3.0, "嗎"),
+            seg(3.04, 3.14, "好呀"),
+        ]
+
+    def test_boundaries_survive_a_join_pass_a_would_have_made(self):
+        merged = assemble_cues(self._cues(), min_cue_duration=0.0)
+        kept = assemble_cues(self._cues(), min_cue_duration=0.0, merge=False)
+        self.assertLess(len(merged), 3, "pass A should merge these when it is enabled")
+        self.assertEqual(texts(kept), ["你好", "嗎", "好呀"])
+
+    def test_the_duration_floor_still_applies(self):
+        kept = assemble_cues(self._cues(), min_cue_duration=0.5, merge=False)
+        self.assertEqual(len(kept), 3, "no cue should have been merged away")
+        self.assertGreaterEqual(kept[-1]["end"] - kept[-1]["start"], 0.5 - 1e-6)
+
+    def test_noise_is_still_dropped(self):
+        cues = self._cues() + [seg(4.0, 4.1, "嗯")]
+        kept = assemble_cues(
+            cues, min_cue_duration=0.5, merge=False, is_noise=lambda t: t == "嗯",
+        )
+        self.assertNotIn("嗯", texts(kept))
+
+    def test_the_input_segments_are_not_mutated(self):
+        cues = self._cues()
+        assemble_cues(cues, min_cue_duration=0.5, merge=False)
+        self.assertEqual(cues[-1]["end"], 3.14)
+
+
 if __name__ == "__main__":
     unittest.main()

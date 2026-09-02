@@ -81,6 +81,35 @@ The VAD model (`pyannote/segmentation`) may require accepting its terms of use o
 uv run cantocaptions_ai audio.wav --hf_token hf_...
 ```
 
+### Aligning an existing transcript
+
+If you already have the words and only need the timings, you can skip ASR entirely:
+
+```bash
+uv run cantocaptions movie.mp4 --realign transcript.txt
+```
+
+`transcript.txt` is line-delimited — one subtitle cue per line, no timestamps. Those line
+breaks are treated as the authoritative cue boundaries, so the output has one cue per line
+(interjection-only lines aside, which the cleaning rules drop). Text cleaning and the
+acoustic particle spot-checks (喇/啦, 呀/啊/吖, 咁/噉) run as they do on ASR output.
+
+An SRT works too, in which case its timings are discarded and re-derived from scratch. That
+is the difference from `--retime`, which *keeps* a subtitle's timings and nudges them, and so
+needs one that is already roughly in sync.
+
+* `--realign_anchor asr` — transcribe first and match the two texts, instead of searching
+  acoustically. Slower, but it can leave a line unmatched rather than forcing it somewhere,
+  which is what you want if the transcript may contain lines the recording does not.
+* `--realign_min_score [SCORE]` — report lines with weak acoustic support. This detects a
+  transcript that disagrees with the recording; it is **not** a check that the timings are
+  right (see `CLAUDE.md`).
+* `--audio_downmix center` — on a 5.1 source, align against the front-centre channel alone,
+  which is largely the dialogue stem.
+
+Measure a change to any of this with `scripts/eval_realign.py`, which strips the timings off a
+known-good SRT, realigns its text, and reports how far each cue landed from where it belongs.
+
 ### Custom options
 
 You can update default command line arguments by editing the file `config/default.cfg`. Additionally, you can run using any config file's arguments by using its filename with the `--cfg` option (e.g. `--cfg cpu` to use the configuration in `config/cpu.cfg`).
@@ -101,7 +130,8 @@ Current updates planned for the near future:
 - [x] Add Cantonese standardization and cleaning scripts (adapted from [rookes/canto-subtitle-cleaner](https://github.com/rookes/canto-subtitle-cleaner))
 - [x] Add [SubER](https://github.com/apptek/SubER) metric calculation compatibility, and use its Levenshtein distance algorithm to parallelize ensemble subs
 - [ ] Add more performant options for vocal isolation
-- [ ] Implement the "retime" feature to accurately run alignment on existing subtitles (IN PROGRESS)
+- [x] Implement the "realign" feature to run alignment on an existing untimed transcript
+- [ ] Finish the "retime" feature for subtitles that already carry (roughly correct) timings (IN PROGRESS)
 - [ ] Add an option to use Qwen LLM to do error-correction based on a reference standard Chinese subtitle file (IN PROGRESS)
 - [ ] Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
 - [ ] Add better multilingual recognition for Mandarin and English

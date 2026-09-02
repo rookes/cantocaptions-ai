@@ -13,6 +13,7 @@ import numpy as np
 from cantocaptions_ai.pipeline.align_checks import (
     FRAME_SECONDS,
     MIN_GAP_FRAMES,
+    find_gapped_cues,
     find_silent_starts,
     frame_dbfs,
     whole_file_region,
@@ -143,6 +144,63 @@ class TestWholeFileRegion(unittest.TestCase):
                 region = whole_file_region(candidate, 3.0)
                 hits = find_silent_starts([{"start": 0.0, "text": "x"}], region)
                 self.assertEqual(len(hits), 1)
+
+
+class TestGappedCues(unittest.TestCase):
+    """A cue holding a silence between two of its own adjacent characters.
+
+    CTC must place every token it is given, so a cue whose text contains something not said
+    where the cue sits gets those characters put wherever scores least badly. On test/bluey,
+    ASR emitted 爸爸， once for what the reference has as two separate calls: the first 爸
+    landed 3.35 s before the second, and the subtitle appeared that far ahead of the speech.
+    """
+
+    def _cue(self, *spans):
+        return {"start": spans[0][1], "end": spans[-1][2], "text": "".join(s[0] for s in spans),
+                "words": [{"word": w, "start": a, "end": b, "score": 0.9} for w, a, b in spans]}
+
+    def test_a_hole_between_two_characters_is_found(self):
+        cue = self._cue(("爸", 56.44, 56.60), ("爸", 59.80, 59.84))
+        hits = find_gapped_cues([cue])
+        self.assertEqual(len(hits), 1)
+        self.assertAlmostEqual(hits[0].gap, 3.20, places=2)
+        self.assertEqual((hits[0].before, hits[0].after), ("爸", "爸"))
+
+    def test_a_continuous_cue_is_not(self):
+        cue = self._cue(("你", 1.0, 1.2), ("好", 1.2, 1.4), ("嗎", 1.4, 1.7))
+        self.assertEqual(find_gapped_cues([cue]), [])
+
+    def test_a_pause_a_punctuation_mark_holds_is_not_a_hole(self):
+        # Punctuation is mapped to blank precisely so it can absorb a pause, and it holds it
+        # by *spanning* it -- so the mark is contiguous with both neighbours and there is no
+        # gap to find. The check is immune to a clause break by construction, with or
+        # without split_chars; this is why it can be left on for every model.
+        cue = self._cue(("好", 1.0, 1.2), ("，", 1.2, 4.0), ("係", 4.0, 4.2))
+        self.assertEqual(find_gapped_cues([cue], split_chars="，。？！"), [])
+        self.assertEqual(find_gapped_cues([cue]), [])
+
+    def test_split_chars_covers_a_mark_that_sits_apart_from_its_neighbours(self):
+        # The residual case: the mark did not span the pause, it sits inside it.
+        cue = self._cue(("好", 1.0, 1.2), ("，", 2.5, 2.6), ("係", 4.0, 4.2))
+        self.assertEqual(len(find_gapped_cues([cue])), 1)
+        self.assertEqual(find_gapped_cues([cue], split_chars="，。？！"), [],
+                         "with the mark discounted, 好 and 係 are not adjacent characters")
+
+    def test_only_the_worst_gap_in_a_cue_is_reported(self):
+        cue = self._cue(("a", 0.0, 0.1), ("b", 1.5, 1.6), ("c", 4.0, 4.1))
+        hits = find_gapped_cues([cue])
+        self.assertEqual(len(hits), 1)
+        self.assertAlmostEqual(hits[0].gap, 2.4, places=2)
+
+    def test_an_untimed_character_is_skipped_not_treated_as_zero(self):
+        cue = {"start": 0.0, "end": 1.0, "text": "ab",
+               "words": [{"word": "a"}, {"word": "b", "start": 0.9, "end": 1.0}]}
+        self.assertEqual(find_gapped_cues([cue]), [])
+
+    def test_the_hit_names_its_cue(self):
+        cues = [self._cue(("你", 1.0, 1.2), ("好", 1.2, 1.4)),
+                self._cue(("爸", 56.44, 56.60), ("爸", 59.80, 59.84))]
+        self.assertEqual([h.index for h in find_gapped_cues(cues)], [1])
 
 
 if __name__ == "__main__":

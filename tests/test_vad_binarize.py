@@ -11,7 +11,7 @@ import unittest
 import numpy as np
 from pyannote.core import SlidingWindow, SlidingWindowFeature
 
-from cantocaptions_ai.pipeline.vads.pyannote import Binarize
+from cantocaptions_ai.pipeline.vads.pyannote import Binarize, Pyannote
 
 FRAME = 0.02  # seconds per score frame
 
@@ -115,6 +115,43 @@ class TestClamping(unittest.TestCase):
                        max_duration=28)(scores_from([(6.0, 9.95)], 10.0))
         for start, end in regions(out):
             self.assertLessEqual(end, 10.0 + 1e-6)
+
+
+class TestCoverChunks(unittest.TestCase):
+    """Split-only chunking for --realign: VAD picks the cuts, but keeps every sample."""
+
+    def _cover(self, spans, duration, chunk_size):
+        return Pyannote.cover_chunks(scores_from(spans, duration), chunk_size, duration)
+
+    def test_chunks_tile_the_whole_file(self):
+        chunks = self._cover([(2.0, 8.0), (40.0, 55.0)], 100.0, 30)
+        self.assertAlmostEqual(chunks[0]["start"], 0.0, places=6)
+        self.assertAlmostEqual(chunks[-1]["end"], 100.0, places=6)
+        for a, b in zip(chunks, chunks[1:]):
+            # Contiguous, not merely non-overlapping: a gap here is discarded audio.
+            self.assertAlmostEqual(a["end"], b["start"], places=6)
+
+    def test_every_chunk_is_within_the_budget(self):
+        for duration, chunk_size in ((100.0, 30), (100.0, 10), (7.0, 30), (61.0, 20)):
+            chunks = self._cover([(2.0, 8.0)], duration, chunk_size)
+            self.assertTrue(chunks, f"{duration}s/{chunk_size}s produced nothing")
+            for chunk in chunks:
+                self.assertLessEqual(chunk["end"] - chunk["start"], chunk_size + 1e-6)
+                self.assertGreater(chunk["end"], chunk["start"])
+
+    def test_silence_only_audio_still_gets_covered(self):
+        # merge_chunks returns nothing here; cover_chunks must still hand back the audio,
+        # because a transcript line may exist for speech VAD scored below threshold.
+        chunks = self._cover([], 70.0, 30)
+        self.assertAlmostEqual(sum(c["end"] - c["start"] for c in chunks), 70.0, places=6)
+
+    def test_cuts_prefer_the_quiet_frames(self):
+        # Speech either side of a silent trough; the only cut should land in the trough.
+        chunks = self._cover([(0.0, 24.0), (26.0, 50.0)], 50.0, 30)
+        cuts = [c["start"] for c in chunks[1:]]
+        self.assertEqual(len(cuts), 1)
+        self.assertGreaterEqual(cuts[0], 24.0)
+        self.assertLessEqual(cuts[0], 26.0)
 
 
 class TestNoSpeech(unittest.TestCase):

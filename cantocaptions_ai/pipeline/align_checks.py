@@ -6,6 +6,10 @@ entry. That is possible because the checks read only the aligned timings and the
 never the emission tensor, the blank id, or the model's vocabulary — so they stay correct
 for any model that produces ``{start, end, text}``.
 
+There are two of them. ``find_gapped_cues`` reads the timings alone and needs no audio;
+``find_silent_starts`` needs the waveform. Neither repairs anything -- both say which cues
+to distrust, which is the thing a 2000-cue file cannot be used without.
+
 ``find_silent_starts`` catches a cue whose start time lands on audio where nothing is
 being said. Alignment placing a character over silence is always wrong, whatever produced
 it; the failure that motivated the check was ``alvanlii/wav2vec2-BERT-cantonese`` pinning
@@ -20,7 +24,7 @@ over music beds and room tone, which are speechless but not silent. Treat a clea
 """
 
 from dataclasses import dataclass
-from typing import Iterable, List, Mapping, Sequence
+from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -53,6 +57,96 @@ MIN_SEPARATION_DB = 30.0
 # on correct cues; at 6 it only catches gross failures.
 MIN_GAP_FRAMES = 4
 
+# The least silence between two adjacent characters of one cue that says the cue is not a
+# single continuous utterance. Well clear of an ordinary breath or an unvoiced onset, which
+# is where find_silent_starts' 4-frame threshold sits; a whole second between two characters
+# that are written next to each other means one of them was placed somewhere it was not said.
+MAX_INTERNAL_GAP = 1.0
+
+
+@dataclass(frozen=True)
+class GappedCue:
+    """A cue holding a silence between two of its own adjacent characters."""
+
+    index: int
+    gap: float
+    at: float
+    before: str
+    after: str
+
+
+def find_gapped_cues(
+    segments: Sequence[Mapping],
+    max_gap: float = MAX_INTERNAL_GAP,
+    split_chars: Iterable[str] = (),
+) -> List[GappedCue]:
+    """Cues whose characters are not one continuous utterance.
+
+    CTC must place every token it is given, so when a cue's text contains something that was
+    not said where the cue sits, the extra characters are put wherever scores least badly --
+    typically seconds away, leaving a hole in the middle of the cue. On `test/bluey`, ASR
+    emitted 爸爸， once for what the reference has as two separate calls: the first 爸 landed
+    at 56.44 s and the second at 59.80 s, so the subtitle went on screen **3.35 s** before
+    anybody spoke (the reference cue starts at 59.790).
+
+    Only *directly adjacent* characters are compared, which is what makes this safe to leave
+    on. A punctuation mark is mapped to blank precisely so it can absorb a pause, and it does
+    so by *spanning* it -- the mark is contiguous with both neighbours, so an ordinary clause
+    break produces no gap at all. ``split_chars`` covers only the residual case where the mark
+    itself sits inside the silence rather than filling it. Measured on the two ASR fixtures,
+    every gap found is between two real characters with nothing between them.
+
+    **This is a report, not a repair, and that is deliberate.** 45% of the cues it flags are
+    still within half a second of the reference, so trimming or splitting on it would hurt
+    about as often as it helped; and which side of the gap to keep has no general answer
+    (realign's ``_trim_detached_edges`` resolves that tie towards the opening, which is right
+    for a whole transcript line and wrong for a two-character cue). What it is good at is
+    saying *which* cues to distrust, and it is much better at that than the CTC score:
+
+    | cues | n | median start error | within 0.5 s |
+    |---|---|---|---|
+    | with a gap over 1 s | 12 | 1.25-3.35 s | 0-45% |
+    | without | 545 | 0.05-0.09 s | 76-79% |
+    """
+    split = set(split_chars)
+    hits: List[GappedCue] = []
+    for index, segment in enumerate(segments):
+        words = [w for w in (segment.get("words") or [])
+                 if w.get("start") is not None and w.get("end") is not None]
+        worst: Optional[GappedCue] = None
+        for before, after in zip(words, words[1:]):
+            if before["word"] in split or after["word"] in split:
+                continue
+            gap = float(after["start"]) - float(before["end"])
+            if gap > max_gap and (worst is None or gap > worst.gap):
+                worst = GappedCue(index, round(gap, 3), round(float(before["end"]), 3),
+                                  before["word"], after["word"])
+        if worst is not None:
+            hits.append(worst)
+    return hits
+
+
+def warn_on_gapped_cues(
+    segments: Sequence[Mapping],
+    max_gap: float = MAX_INTERNAL_GAP,
+    split_chars: Iterable[str] = (),
+) -> List[GappedCue]:
+    """find_gapped_cues, with a line per hit at debug and a count at info."""
+    hits = find_gapped_cues(segments, max_gap, split_chars)
+    for hit in hits:
+        logger.debug(
+            "Cue %d holds %.2fs of silence between %r and %r at %.3fs: %r",
+            hit.index, hit.gap, hit.before, hit.after, hit.at,
+            str(segments[hit.index].get("text", ""))[:40],
+        )
+    if hits:
+        logger.info(
+            "%d cue(s) contain a silence over %.1fs between two of their own characters; "
+            "their timings are the least trustworthy in the file (see notes.srt)",
+            len(hits), max_gap,
+        )
+    return hits
+
 
 @dataclass(frozen=True)
 class SilentStart:
@@ -65,6 +159,8 @@ class SilentStart:
     """Seconds from that start to the nearest audio energy."""
     dbfs: float
     floor_dbfs: float
+    index: int = -1
+    """Position of the cue in the list that was checked, so a caller can annotate it."""
 
 
 def frame_dbfs(
@@ -147,6 +243,7 @@ def find_silent_starts(
             hits.append(SilentStart(
                 time=float(t),
                 text=str(aligned_segments[i].get("text", "")),
+                index=i,
                 gap=float(gaps[idx] * frame_seconds),
                 dbfs=float(db[idx]),
                 floor_dbfs=float(floor),
@@ -184,6 +281,35 @@ def warn_on_silent_starts(
     if len(hits) > max_examples:
         logger.info("  ...and %d more", len(hits) - max_examples)
     return hits
+
+
+def region_levels(
+    regions: Iterable[Mapping],
+    sample_rate: int = SAMPLE_RATE,
+    frame_seconds: float = FRAME_SECONDS,
+) -> List[Tuple[float, np.ndarray]]:
+    """Per-frame dBFS for each region, as (region start, levels), sorted by start.
+
+    Levels only -- no thresholds and no verdict. Callers decide what quiet means, because the
+    right comparison depends on the question.
+
+    Be careful what you ask of it. Trimming a cue back off "silence" by level was tried and
+    does not work on real material: inside the Police Story 2 cues that sit through a pause,
+    the pause is continuous room tone about 12 dB under the dialogue and the first frame above
+    any sane threshold is the cue's own first frame. What perceptually reads as silence is not
+    silence to an envelope. The dwell those cues came from is visible in the *emission*
+    instead -- see _align_segment's MAX_CHAR_DWELL_SECONDS.
+    """
+    out = []
+    for region in regions:
+        audio = region.get("audio")
+        if audio is None:
+            continue
+        db = frame_dbfs(audio, sample_rate, frame_seconds)
+        if db.size:
+            out.append((float(region["start"]), db))
+    out.sort(key=lambda item: item[0])
+    return out
 
 
 def whole_file_region(audio, duration: float) -> List[dict]:

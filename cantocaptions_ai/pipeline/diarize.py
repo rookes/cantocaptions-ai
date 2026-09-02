@@ -127,7 +127,12 @@ class FileDiarization(_BaseDiarization):
     scope = "file"
 
     @staticmethod
-    def _extract(item): return load_audio(item['audio_path'], audio_track=item.get('audio_track', 0))
+    def _extract(item):
+        return load_audio(
+            item['audio_path'],
+            audio_track=item.get('audio_track', 0),
+            downmix=item.get('audio_downmix', 'mix'),
+        )
 
     def process(
         self, input: np.ndarray, *, progress_callback: ProgressCallback = None

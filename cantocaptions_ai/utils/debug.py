@@ -1,7 +1,8 @@
 import json
 import os
+from collections import Counter
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 import numpy as np
 
@@ -39,7 +40,7 @@ def _stage_dir(audio_path: str, stage: str, debug_dir: str) -> str:
 # Segment keys carried through the VAD / vocal-isolation manifests alongside the audio.
 # An explicit allowlist rather than a blanket passthrough: segment dicts also hold numpy
 # arrays and other non-JSON values, so copying everything would break json.dump.
-_PERSISTED_SEGMENT_KEYS = ("expanded",)
+_PERSISTED_SEGMENT_KEYS = ("expanded", "speech")
 
 
 def _write_audio_segments(segments: List[VadAudioSegment], stage_dir: str) -> list:
@@ -316,6 +317,169 @@ def load_diarization_debug(audio_path: str, debug_dir: str) -> Optional[Diarizat
         f"{len(result['turns'])} turns, scope: {result.get('scope', 'file')}) from {json_path}"
     )
     return result
+
+
+def write_realign_debug(
+    audio_path: str, transcript_path: str, timings: list, lines: list, debug_dir: str,
+) -> None:
+    """Write the coarse --realign placements to {debug_dir}/{stem}/realign/result.json.
+
+    This is the expensive, loadable half of realign: the sliding search that decides where
+    each transcript line sits. Everything after it -- regrouping into chunks, forced
+    alignment, cleaning -- is cheap or wants to re-run anyway, so a replay reuses these
+    placements while still picking up edits to chunking, rules and thresholds.
+
+    The per-line score is written out because it is the only view into how well the
+    transcript matched the recording, and reading it back is much easier than re-running the
+    search to find out which lines the aligner was unsure about.
+    """
+    stage_dir = _stage_dir(audio_path, "realign", debug_dir)
+    by_index = {line.index: line.text for line in lines}
+    output = {
+        "audio_path": os.path.abspath(audio_path),
+        "transcript_path": os.path.abspath(transcript_path),
+        "num_lines": len(timings),
+        "num_unplaced": sum(1 for t in timings if not t.placed),
+        "lines": [
+            {
+                "index": t.index,
+                "start": round(t.start, 3),
+                "end": round(t.end, 3),
+                "score": None if t.score != t.score else round(t.score, 4),  # NaN -> null
+                "placed": t.placed,
+                "reason": t.reason,
+                "text": by_index.get(t.index, ""),
+            }
+            for t in timings
+        ],
+    }
+    json_path = os.path.join(stage_dir, "result.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    logger.info(
+        f"Realign debug output written to {json_path} "
+        f"({output['num_lines']} lines, {output['num_unplaced']} unplaced)"
+    )
+
+
+def write_labelled_srt(path: str, rows: Iterable[tuple]) -> int:
+    """Write an SRT of labelled cues from ``(start, end, labels, text)`` rows.
+
+    The shared renderer behind every "here are the cues worth looking at" debug file. Each
+    cue is prefixed with its labels in brackets, so the file can be loaded in a player beside
+    the video and stepped through -- which is the difference between "31 cues need review"
+    and being able to do anything about it. Same idea as the diarization debug SRT.
+
+    Ends are clamped forward of their starts: a zero-length or inverted cue makes the whole
+    file invalid, and a debug artefact that a player refuses to open is worse than useless.
+    """
+    from cantocaptions_ai.utils.output import format_timestamp
+
+    count = 0
+    with open(path, "w", encoding="utf-8") as f:
+        for start, end, labels, text in rows:
+            count += 1
+            stamp_a = format_timestamp(start, always_include_hours=True, decimal_marker=",")
+            stamp_b = format_timestamp(max(end, start), always_include_hours=True,
+                                       decimal_marker=",")
+            prefix = "".join(f"[{label}] " for label in labels)
+            body = str(text or "").replace("\n", " ")
+            f.write(f"{count}\n{stamp_a} --> {stamp_b}\n{prefix}{body}\n\n")
+    return count
+
+
+def write_realign_suspects(
+    audio_path: str, segments: List[SingleAlignedSegment], debug_dir: str,
+) -> int:
+    """Write the doubtful cues to {debug_dir}/{stem}/realign/suspect.srt. Returns the count.
+
+    Only the cues carrying a ``realign_reason`` -- a positive statement that this timing is
+    not to be trusted. Cue ``notes`` are deliberately *not* included: they are informational
+    and far more numerous (one substituted character can touch a hundred cues), and mixing
+    them in would drown the handful of lines that actually need checking. They get their own
+    file; see write_segment_notes.
+    """
+    suspects = [s for s in segments if isinstance(s.get("realign_reason"), str)
+                and s["realign_reason"]]
+
+    def labelled(seg):
+        reason = seg["realign_reason"]
+        detail = seg.get("realign_detail")
+        return f"{reason}: {detail}" if detail else reason
+
+    path = os.path.join(_stage_dir(audio_path, "realign", debug_dir), "suspect.srt")
+    write_labelled_srt(
+        path,
+        ((s["start"], s["end"], [labelled(s)], s.get("text", "")) for s in suspects),
+    )
+    if suspects:
+        logger.info(
+            "realign: %d cue(s) worth checking written to %s (%s)",
+            len(suspects), path,
+            ", ".join(sorted({s["realign_reason"] for s in suspects})),
+        )
+    return len(suspects)
+
+
+def write_segment_notes(
+    audio_path: str, segments: List[SingleAlignedSegment], debug_dir: str,
+) -> int:
+    """Write every annotated cue to {debug_dir}/{stem}/notes/notes.srt. Returns the count.
+
+    The general channel: any stage that wants to say "this cue is worth a look, here is why"
+    calls ``schema.add_note`` and lands here, with no new field and no new writer. Written
+    on every run that sets a debug dir, not only under --realign, and skipped entirely when
+    nothing annotated anything.
+    """
+    annotated = [s for s in segments if s.get("notes")]
+    if not annotated:
+        return 0
+    path = os.path.join(_stage_dir(audio_path, "notes", debug_dir), "notes.srt")
+    write_labelled_srt(
+        path,
+        ((s["start"], s["end"], s["notes"], s.get("text", "")) for s in annotated),
+    )
+    kinds = Counter(note.split(":", 1)[0] for s in annotated for note in s["notes"])
+    logger.info(
+        "%d annotated cue(s) written to %s (%s)", len(annotated), path,
+        ", ".join(f"{n} {kind}" for kind, n in kinds.most_common()),
+    )
+    return len(annotated)
+
+
+def load_realign_debug(audio_path: str, transcript_path: str, debug_dir: str) -> Optional[list]:
+    """Load coarse realign placements from a previous debug run, or None if unusable.
+
+    A checkpoint written for a *different* transcript is refused rather than reused: the
+    placements are indexed by line number, so replaying them against edited text would
+    silently attach every cue to the wrong span.
+    """
+    stem = _stem(audio_path)
+    json_path = os.path.join(debug_dir, stem, "realign", "result.json")
+    if not os.path.isfile(json_path):
+        return None
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("transcript_path") != os.path.abspath(transcript_path):
+        logger.warning(
+            "Ignoring realign checkpoint at %s: it was written for a different transcript "
+            "(%s), and its placements are indexed by line number.",
+            json_path, data.get("transcript_path"),
+        )
+        return None
+    from cantocaptions_ai.pipeline.realign import REASON_UNREADABLE, LineTiming
+    timings = [
+        LineTiming(
+            index=row["index"], start=row["start"], end=row["end"],
+            score=float("nan") if row.get("score") is None else row["score"],
+            # Checkpoints written before reasons existed carry only the bool; map it onto the
+            # vaguest reason rather than silently claiming the line was placed cleanly.
+            reason=row.get("reason") or (None if row.get("placed", True) else REASON_UNREADABLE),
+        )
+        for row in data["lines"]
+    ]
+    logger.info(f"Loaded {len(timings)} realign line placement(s) from {json_path}")
+    return timings
 
 
 def _assignment_label(segment: SingleAlignedSegment) -> str:

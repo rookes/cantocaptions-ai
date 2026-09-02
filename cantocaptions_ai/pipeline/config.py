@@ -99,7 +99,15 @@ class PipelineConfig:
     min_cue_duration: float = 0.5
     merge_gap: float = 0.25
     align_batch_size: int = 4
-    align_compute_type: str = "float32"
+    align_compute_type: str = "float16"
+    # Substitute an in-vocabulary character for one the align model has no token for, so the
+    # trellis can see it at all. "homophone" (same Jyutping reading) is the default because a
+    # dropped character contributes no evidence whatsoever; "near" also accepts the same
+    # syllable on another tone, "variant" folds Simplified forms only, "off" disables it.
+    # See pipeline/align_vocab.py.
+    align_char_substitution: str = "homophone"
+    # TOML file of hand-curated substitutions that beat every automatic tier.
+    align_substitutions: Optional[str] = None
 
     # Subtitle formatting
     max_line_width: Optional[int] = 18
@@ -140,6 +148,27 @@ class PipelineConfig:
 
     # Retime
     retime: Optional[str] = None
+
+    # Realign: put an untimed transcript on the audio timeline. See pipeline/realign.py.
+    realign: Optional[str] = None
+    # 'acoustic' places lines with a sliding free-end Viterbi and no ASR; 'asr' runs the
+    # normal ASR stage and matches the two character streams, which is slower but degrades
+    # gracefully when the transcript and the recording disagree.
+    realign_anchor: str = "acoustic"
+    # Seconds of audio each placement window sees. Larger windows give the search more
+    # context to resynchronise in; the cost is quadratic only in the trellis, which is cheap.
+    realign_window: float = 120.0
+    # Lines ending within this far of the window's far edge are held for the next window,
+    # since a line straddling the edge has only been seen in part.
+    realign_commit_margin: float = 10.0
+    # Mean CTC path score below which a placed line is reported as weakly supported. This is
+    # a diagnostic only -- nothing is dropped or retimed on the strength of it.
+    realign_min_score: float = 0.35
+
+    # How a multichannel source is reduced to mono. "center" takes the front-center
+    # channel alone, which on a film soundtrack is largely the dialogue stem; it falls
+    # back to a full downmix for any layout without one. See utils/audio.py.
+    audio_downmix: str = "mix"
 
     # Reference subtitle correction
     reference_subtitle: Optional[str] = None

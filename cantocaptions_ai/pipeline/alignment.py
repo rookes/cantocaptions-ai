@@ -2,10 +2,11 @@
 Forced Alignment with Whisper
 C. Max Bain
 """
+import bisect
 from dataclasses import dataclass
 import math
 import time
-from typing import Iterable, Mapping, Optional, Union, List, Tuple
+from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Union, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,14 +22,25 @@ from cantocaptions_ai.utils.schema import (
     SegmentData,
     ProgressCallback,
     VadAudioSegment,
+    add_note,
     interpolate_nans,
 )
 from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION, PunctuationConfig, SpotCheck
-from cantocaptions_ai.pipeline.align_checks import warn_on_silent_starts, whole_file_region
+from cantocaptions_ai.pipeline.align_checks import (
+    warn_on_gapped_cues,
+    warn_on_silent_starts,
+    whole_file_region,
+)
 from cantocaptions_ai.pipeline.align_profiles import (
     DEFAULT_ALIGN_PROFILE,
     AudioPrimer,
     get_align_profile,
+)
+from cantocaptions_ai.pipeline.align_vocab import (
+    LEVEL_HOMOPHONE,
+    VocabRepair,
+    filter_spotchecks,
+    substitution_notes,
 )
 
 from cantocaptions_ai.utils.log_utils import get_logger
@@ -128,7 +140,17 @@ class Segment:
 # --- Low-level CTC alignment ---
 # source: https://docs.pytorch.org/audio/stable/tutorials/forced_alignment_tutorial.html
 
-def get_trellis(emission, tokens, blank_id=0):
+def get_trellis(emission, tokens, blank_id=0, free_end: bool = False):
+    """Forced-alignment trellis over *emission* for *tokens*.
+
+    ``free_end`` must match the value later passed to ``backtrack``. It drops the
+    ``trellis[-num_tokens:, 0] = +inf`` sentinel, which exists purely to terminate the
+    backward walk of a *forced* alignment. That +inf propagates diagonally through the
+    recurrence, so by the final row it has flooded every token column but the last -- which
+    would leave a free-end search with only one column to "choose", silently turning it back
+    into a forced walk. A partial walk does not need the sentinel: it enters at a column the
+    forward pass actually reached, so it has the frames to walk back to the start.
+    """
     num_frame = emission.size(0)
     num_tokens = len(tokens)
 
@@ -139,7 +161,8 @@ def get_trellis(emission, tokens, blank_id=0):
     trellis[0, 0] = 0
     trellis[1:, 0] = torch.cumsum(emission[:, blank_id], 0)
     trellis[0, -num_tokens:] = -float("inf")
-    trellis[-num_tokens:, 0] = float("inf")
+    if not free_end:
+        trellis[-num_tokens:, 0] = float("inf")
 
     for t in range(num_frame):
         trellis[t + 1, 1:] = torch.maximum(
@@ -151,7 +174,20 @@ def get_trellis(emission, tokens, blank_id=0):
     return trellis
 
 
-def backtrack(trellis, emission, tokens, blank_id=0):
+def backtrack(trellis, emission, tokens, blank_id=0, free_end: bool = False):
+    """Walk the trellis back to token 0, returning the best monotonic path.
+
+    Without ``free_end`` (the default) the path must consume *every* token: it enters at the
+    last token column and finds the frame that best completes it. That is right when the
+    text is known to correspond to exactly this audio.
+
+    With ``free_end=True`` the path instead enters at the *last frame* and takes whichever
+    token column scores best there, so it consumes only as many tokens as the audio
+    actually explains. --realign uses this to slide a window over a long recording and ask
+    "how much of the remaining transcript fits in here?" without knowing the answer up
+    front; see pipeline/realign.py. The trellis must have been built with the same
+    ``free_end``, and is checked for it rather than being allowed to answer wrongly.
+    """
     # Note:
     # j and t are indices for trellis, which has extra dimensions
     # for time and tokens at the beginning.
@@ -159,8 +195,20 @@ def backtrack(trellis, emission, tokens, blank_id=0):
     # the corresponding index in emission is `T-1`.
     # Similarly, when referring to token index `J` in trellis,
     # the corresponding index in transcript is `J-1`.
-    j = trellis.size(1) - 1
-    t_start = torch.argmax(trellis[:, j]).item()
+    if free_end:
+        t_start = trellis.size(0) - 1
+        row = trellis[t_start, 1:]
+        if bool(torch.isposinf(row).any()):
+            raise ValueError(
+                "backtrack(free_end=True) needs a trellis built with get_trellis("
+                "free_end=True); the forced-walk sentinel makes every column but the last "
+                "infinite, which would silently reduce the search to a forced alignment."
+            )
+        # Column 0 is the start state -- entering there means nothing was consumed.
+        j = 1 + torch.argmax(row).item()
+    else:
+        j = trellis.size(1) - 1
+        t_start = torch.argmax(trellis[:, j]).item()
 
     path = []
     for t in range(t_start, 0, -1):
@@ -283,8 +331,15 @@ def _get_sentence_spans(text: str, model_lang: str, punctuation: PunctuationConf
 def _preprocess_segment(
     text: str, model_lang: str, model_dictionary: dict,
     punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
+    spans: Optional[List[Tuple[int, int]]] = None,
 ) -> SegmentData:
-    """Clean text and produce per-segment alignment metadata."""
+    """Clean text and produce per-segment alignment metadata.
+
+    ``spans`` lets a caller declare the cue boundaries as inclusive (start, end) index
+    pairs into ``text`` instead of having them derived from punctuation. Alignment treats
+    them as opaque, so the only requirement is that they index ``text``. Used by --realign,
+    whose input arrives pre-split into cues; see utils/schema.py SingleSegment.cue_spans.
+    """
     num_leading = len(text) - len(text.lstrip())
     num_trailing = len(text) - len(text.rstrip())
 
@@ -310,7 +365,10 @@ def _preprocess_segment(
         "clean_char": clean_char,
         "clean_cdx": clean_cdx,
         "clean_wdx": clean_wdx,
-        "sentence_spans": _get_sentence_spans(text, model_lang, punctuation),
+        "sentence_spans": (
+            list(spans) if spans is not None
+            else _get_sentence_spans(text, model_lang, punctuation)
+        ),
     }
 
 def _preprocess_transcript(
@@ -324,7 +382,10 @@ def _preprocess_transcript(
     total = len(transcript)
     segment_data = {}
     for sdx, segment in enumerate(transcript):
-        segment_data[sdx] = _preprocess_segment(segment["text"], model_lang, model_dictionary, punctuation)
+        segment_data[sdx] = _preprocess_segment(
+            segment["text"], model_lang, model_dictionary, punctuation,
+            spans=segment.get("cue_spans"),
+        )
     return segment_data
 
 
@@ -577,6 +638,110 @@ def compute_vad_emissions(vad_segments, model, model_type, bert_processor, devic
     return _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size, vram_checks=vram_checks, primer=primer)
 
 
+class EmissionTimeline:
+    """The file's emissions as one timeline, sliceable by time across chunk boundaries.
+
+    The chunks are contiguous and gap-free (``Vad.cover_chunks``), so a slice spanning a join
+    is exactly as valid as one inside a single chunk: the tear exists because the encoder
+    cannot take a whole film at once, not because anything changes in the audio there.
+
+    That matters more than it sounds. Before this, a transcript segment could only be aligned
+    against the *one* chunk holding its start (``alignment._get_emission_for_segment``), so
+    ``build_align_input`` had to re-cut the file to keep every line inside a single chunk --
+    and a coarse guess a second or two out could then put the boundary *in front of* the line
+    it was meant to contain, handing forced alignment a chunk that does not hold the line at
+    all. On the Police Story 2 head that produced a 0.2 s cue at score 0.000 for a line whose
+    speech had ended 1.5 s before the chunk began. Measured across the fixtures, 22-44% of the
+    spans this module wants to align in one piece cross a chunk join, so the old constraint
+    was not a corner case.
+
+    Frame times come from each chunk's *own* frame count rather than from one global rate:
+    ``_compute_vad_emissions_batched`` reports up to 2% variation between chunks, and a single
+    rate would smear a cross-join slice at every boundary.
+
+    Emissions are held as float16 and upcast per slice. Two hours is then about 1 GB against
+    the 2 GB float32 copy ``align()`` holds today, and the same copy serves both the placement
+    search and the final alignment -- one encoder pass over the file instead of two.
+    """
+
+    def __init__(
+        self,
+        vad_segments: Sequence[VadAudioSegment],
+        compute_fn: Callable[[List[VadAudioSegment]], List[Tuple[torch.Tensor, float]]],
+    ):
+        self._segments = list(vad_segments)
+        self._compute = compute_fn
+        self._emissions: List[Optional[np.ndarray]] = [None] * len(self._segments)
+        self._times: List[Optional[np.ndarray]] = [None] * len(self._segments)
+        self._starts = [float(s["start"]) for s in self._segments]
+        self._ends = [float(s["end"]) for s in self._segments]
+        self.computed = 0
+
+    @property
+    def file_start(self) -> float:
+        return self._starts[0] if self._starts else 0.0
+
+    @property
+    def file_end(self) -> float:
+        return self._ends[-1] if self._ends else 0.0
+
+    def chunk_range(self, t0: float, t1: float) -> Tuple[int, int]:
+        """The half-open range of chunks covering [t0, t1]."""
+        lo = max(0, bisect.bisect_right(self._starts, t0) - 1)
+        hi = bisect.bisect_right(self._starts, t1)
+        return lo, max(hi, lo + 1)
+
+    def ensure(self, lo: int, hi: int) -> None:
+        missing = [i for i in range(lo, min(hi, len(self._segments)))
+                   if self._emissions[i] is None]
+        if not missing:
+            return
+        results = self._compute([self._segments[i] for i in missing])
+        for i, (emission, _rate) in zip(missing, results):
+            arr = emission.detach().cpu().numpy().astype(np.float16, copy=False)
+            self._emissions[i] = arr
+            n = arr.shape[0]
+            step = (self._ends[i] - self._starts[i]) / n if n else 0.0
+            self._times[i] = self._starts[i] + np.arange(n, dtype=np.float64) * step
+        self.computed += len(missing)
+
+    def slice(self, t0: float, t1: float) -> Tuple[torch.Tensor, np.ndarray]:
+        """(emission[frames, vocab] as float32, absolute start time of each frame)."""
+        lo, hi = self.chunk_range(t0, t1)
+        self.ensure(lo, hi)
+        ems, ts = [], []
+        for i in range(lo, min(hi, len(self._segments))):
+            times = self._times[i]
+            if times is None or not len(times):
+                continue
+            a = int(np.searchsorted(times, t0, side="left"))
+            b = int(np.searchsorted(times, t1, side="right"))
+            if b > a:
+                ems.append(self._emissions[i][a:b])
+                ts.append(times[a:b])
+        if not ems:
+            # A request narrower than one frame. Give back the frame covering t0 so no caller
+            # has to special-case an empty emission.
+            i = min(max(lo, 0), len(self._segments) - 1)
+            self.ensure(i, i + 1)
+            times = self._times[i]
+            if times is None or not len(times):
+                return torch.zeros((0, 0)), np.empty(0, dtype=np.float64)
+            k = min(max(int(np.searchsorted(times, t0, side="right")) - 1, 0), len(times) - 1)
+            ems, ts = [self._emissions[i][k:k + 1]], [times[k:k + 1]]
+        emission = ems[0] if len(ems) == 1 else np.concatenate(ems)
+        frame_times = ts[0] if len(ts) == 1 else np.concatenate(ts)
+        return torch.from_numpy(np.asarray(emission, dtype=np.float32)), frame_times
+
+    @classmethod
+    def from_computed(cls, vad_segments, results):
+        """Wrap emissions that have already been computed, so nothing is encoded twice."""
+        by_start = {float(s["start"]): r for s, r in zip(vad_segments, results)}
+        timeline = cls(vad_segments, lambda segs: [by_start[float(s["start"])] for s in segs])
+        timeline.ensure(0, len(vad_segments))
+        return timeline
+
+
 def _get_emission_for_segment(
     t1: float,
     t2: float,
@@ -587,8 +752,19 @@ def _get_emission_for_segment(
     model_type: str,
     bert_processor,
     device: str,
-) -> Optional[torch.Tensor]:
-    """Return the emission tensor for one segment, or None if no VAD match is found."""
+    timeline=None,
+) -> Optional[Tuple[torch.Tensor, Optional[np.ndarray]]]:
+    """Return (emission, frame times) for one segment, or None if no audio matches.
+
+    With a ``timeline`` (see ``realign.EmissionTimeline``) the emission is cut straight out of
+    the file's timeline and may span chunk joins, and the exact absolute time of every frame
+    comes back with it. Without one the old behaviour stands: the segment is sliced out of the
+    single VAD chunk containing ``t1``, and the caller derives times from the segment's own
+    duration. Frame times are ``None`` in that case.
+    """
+    if timeline is not None:
+        emission, frame_times = timeline.slice(t1, t2)
+        return (emission, frame_times) if emission.size(0) else None
     if vad_seg_emissions is not None:
         vad_idx = _find_vad_segment_idx(vad_segments, t1)
         if vad_idx is None:
@@ -599,7 +775,7 @@ def _get_emission_for_segment(
         t2_local = t2 - vad_seg["start"]
         e1 = int(t1_local * frame_rate)
         e2 = max(int(t2_local * frame_rate), e1 + 1)
-        return full_emission[e1:e2, :]
+        return full_emission[e1:e2, :], None
 
     f1 = int(t1 * SAMPLE_RATE)
     f2 = int(t2 * SAMPLE_RATE)
@@ -612,7 +788,64 @@ def _get_emission_for_segment(
     else:
         lengths = None
     emissions = _run_model_inference(model, model_type, waveform_segment, bert_processor, device, lengths=lengths)
-    return emissions[0].cpu().detach()
+    return emissions[0].cpu().detach(), None
+
+
+# How long a character's aligned span may run before it is read as a dwell rather than a
+# character.
+#
+# CTC is peaky: a character fires on a frame or two and the path then sits on it, emitting
+# blank, until whatever comes next arrives. merge_repeats reports that whole wait as the
+# character's span, and where the wait is long the span swallows it. Measured on Police
+# Story 2:
+#
+#     我@330.26-344.19  覺@344.19-344.35  得@344.35-344.47  ...
+#
+# Thirteen seconds on the first character and a tenth of a second on each one after it, which
+# put that subtitle on screen fourteen seconds before anyone spoke. The same shape at the far
+# edge gave 「唔該警察叔叔」 an 11.8 s cue whose last nine seconds are a pause.
+#
+# No guard that compares *consecutive* characters can see this -- there is no gap between
+# characters anywhere in those cues -- and neither can an energy envelope, because the pause
+# is room tone a dozen dB under the dialogue rather than actual silence. The emission says it
+# plainly: within the dwell, the character's own token peaks on one frame and is negligible on
+# the rest.
+#
+# A real syllable, even drawn out, does not hold the CTC path for a second.
+MAX_CHAR_DWELL_SECONDS = 1.0
+
+
+def _reseat_dwelling_chars(char_segments, emission, tokens, blank_id, seconds_per_frame):
+    """Move any character that merely waited onto the frame its own token peaks at.
+
+    Its replacement span is the median length of the segment's other characters, so the
+    character keeps a plausible duration instead of collapsing to a single frame, and it is
+    clipped against the next character so the sequence stays ordered. See
+    MAX_CHAR_DWELL_SECONDS.
+    """
+    if len(char_segments) != len(tokens) or seconds_per_frame <= 0:
+        return 0
+    limit = max(int(round(MAX_CHAR_DWELL_SECONDS / seconds_per_frame)), 2)
+    lengths = [cs.end - cs.start for cs in char_segments]
+    typical = max(int(np.median(lengths)), 1)
+    moved = 0
+    for idx, cs in enumerate(char_segments):
+        if cs.end - cs.start <= limit or tokens[idx] == blank_id:
+            continue
+        window = emission[cs.start:cs.end, tokens[idx]]
+        if window.numel() == 0:
+            continue
+        peak = cs.start + int(torch.argmax(window).item())
+        ceiling = char_segments[idx + 1].start if idx + 1 < len(char_segments) else cs.end
+        cs.start = peak
+        cs.end = max(min(peak + typical, max(ceiling, peak + 1), cs.end), peak + 1)
+        moved += 1
+    if moved:
+        logger.debug(
+            "Re-seated %d character(s) that held the alignment path for more than %.1fs onto "
+            "the frame their own token peaks at", moved, MAX_CHAR_DWELL_SECONDS,
+        )
+    return moved
 
 
 def _align_segment(
@@ -629,8 +862,16 @@ def _align_segment(
     return_char_alignments: bool,
     spotchecks: Mapping[str, SpotCheck],
     punctuation: PunctuationConfig,
+    frame_times: Optional[np.ndarray] = None,
 ) -> List[dict]:
-    """Align one transcript segment against its emission, returning subsegment dicts."""
+    """Align one transcript segment against its emission, returning subsegment dicts.
+
+    ``frame_times`` gives the absolute time of each emission frame. When present it is used
+    verbatim, which is what makes an emission spanning several VAD chunks correct: those
+    chunks can differ in frame rate by a couple of percent, and stretching one rate across the
+    join would smear every timestamp after it. Without it the old assumption holds -- the
+    emission covers exactly [t1, t2] at a constant rate.
+    """
     text = segment["text"]
     avg_logprob = segment.get("avg_logprob")
 
@@ -700,9 +941,28 @@ def _align_segment(
         logger.warning(f'Failed to align segment ("{text}"): backtrack failed, resorting to original')
         return [base_seg]
 
+    seconds_per_frame = (
+        float(frame_times[1] - frame_times[0])
+        if frame_times is not None and len(frame_times) > 1
+        else (t2 - t1) / max(trellis.size(0) - 1, 1)
+    )
     char_segments = merge_repeats(path, text_clean)
-    duration = t2 - t1
-    ratio = duration / (trellis.size(0) - 1)
+    _reseat_dwelling_chars(char_segments, emission, tokens, blank_id, seconds_per_frame)
+    if frame_times is not None and len(frame_times):
+        # merge_repeats reports an *exclusive* end, so the map needs one entry past the last
+        # frame; extend by the final step rather than clamping, which would collapse the last
+        # character to zero length.
+        step = float(frame_times[-1] - frame_times[-2]) if len(frame_times) > 1 else 0.04
+        edges = np.append(np.asarray(frame_times, dtype=np.float64), frame_times[-1] + step)
+        last = len(edges) - 1
+
+        def _at(frame: float) -> float:
+            return float(edges[min(max(int(round(frame)), 0), last)])
+    else:
+        ratio = (t2 - t1) / max(trellis.size(0) - 1, 1)
+
+        def _at(frame: float) -> float:
+            return frame * ratio + t1
 
     char_segments_arr = []
     word_idx = 0
@@ -710,8 +970,8 @@ def _align_segment(
         start, end, score = None, None, None
         if cdx in seg_data["clean_cdx"]:
             char_seg = char_segments[seg_data["clean_cdx"].index(cdx)]
-            start = round(char_seg.start * ratio + t1, 3)
-            end = round(char_seg.end * ratio + t1, 3)
+            start = round(_at(char_seg.start), 3)
+            end = round(_at(char_seg.end), 3)
             score = round(char_seg.score, 3)
         char_segments_arr.append({"char": char, "start": start, "end": end, "score": score, "word-idx": word_idx})
         if model_lang in LANGUAGES_WITHOUT_SPACES:
@@ -767,6 +1027,12 @@ def _align_segment(
             "words": sentence_words,
             "release_from": release_from,
         }
+        # A caller that declared its own cue spans may also say why a cue is doubtful
+        # (--realign). Carry it onto the finished cue: the reason is known before alignment
+        # runs and there is nothing downstream that could reconstruct it.
+        cue_reasons = segment.get("cue_reasons")
+        if cue_reasons and sdx2 < len(cue_reasons) and cue_reasons[sdx2]:
+            subsegment["realign_reason"] = cue_reasons[sdx2]
         if avg_logprob is not None:
             subsegment["avg_logprob"] = avg_logprob
         aligned_subsegments.append(subsegment)
@@ -784,7 +1050,10 @@ def _align_segment(
     aligned_subsegments["end"] = interpolate_nans(aligned_subsegments["end"], method=interpolate_method)
 
     # Concatenate sentences with same timestamps
-    agg_dict = {"text": " ".join, "words": "sum", "release_from": "first"}
+    if "realign_reason" not in aligned_subsegments.columns:
+        aligned_subsegments["realign_reason"] = None
+    agg_dict = {"text": " ".join, "words": "sum", "release_from": "first",
+                "realign_reason": "first"}
     if model_lang in LANGUAGES_WITHOUT_SPACES:
         agg_dict["text"] = "".join
     if return_char_alignments:
@@ -793,7 +1062,13 @@ def _align_segment(
         agg_dict["avg_logprob"] = "first"
 
     aligned_subsegments = aligned_subsegments.groupby(["start", "end"], as_index=False).agg(agg_dict)
-    return aligned_subsegments.to_dict("records")
+    records = aligned_subsegments.to_dict("records")
+    for row in records:
+        # A column of Nones comes back from groupby as NaN, and NaN is *truthy* -- test the
+        # type, not the value, or every cue in the file ends up carrying a float "reason".
+        if not isinstance(row.get("realign_reason"), str) or not row["realign_reason"]:
+            row.pop("realign_reason", None)
+    return records
 
 
 # --- Public functions ---
@@ -802,6 +1077,8 @@ def load_align_model(
     language_code: str, device: str, device_index: int = 0, model_name: Optional[str] = None,
     model_dir=None, model_cache_only: bool = False, compute_type: str = "float32",
     vram_checks: bool = True,
+    char_substitution: str = LEVEL_HOMOPHONE,
+    substitution_overrides: Optional[Mapping[str, str]] = None,
 ):
     """Load the phoneme-alignment model.
 
@@ -866,6 +1143,12 @@ def load_align_model(
         "language": language_code,
         "dictionary": align_dictionary,
         "type": pipeline_type,
+        # Built here, next to the dictionary it edits, so every stage that tokenises text
+        # against this model shares one vocabulary. Resolves nothing until a caller hands it
+        # some text -- see align_vocab.VocabRepair.
+        "vocab_repair": VocabRepair(
+            align_dictionary, char_substitution, substitution_overrides,
+        ),
         # Resolved once here rather than in align(), which then has no idea which model it
         # is holding. Unknown models get the all-no-op default.
         "profile": get_align_profile(model_name),
@@ -907,12 +1190,17 @@ def align(
     vram_checks: bool = True,
     spotchecks: Optional[Mapping[str, SpotCheck]] = None,
     punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
+    timeline=None,
 ) -> AlignedTranscriptionResult:
     """Align phoneme recognition predictions to known transcription.
 
     ``spotchecks`` and ``punctuation`` come from the ASR model's profile (see
     ``pipeline/model_profiles.py``); their defaults (no spot checks, standard
     punctuation) keep alignment independent of any specific model.
+
+    ``timeline`` (``realign.EmissionTimeline``) replaces the per-chunk emission set: segments
+    are then cut out of one continuous timeline, so a segment may span chunk joins and the
+    encoder is not run a second time over audio the caller has already encoded.
     """
     spotchecks = spotchecks or {}
 
@@ -938,17 +1226,33 @@ def align(
     blank_id = _get_blank_id(model_dictionary)
     spacing_char_id = blank_id # model_dictionary['！']
 
-    vad_seg_emissions = (
-        _compute_vad_emissions(
-            vad_segments, model, model_type, bert_processor, device, batch_size,
-            vram_checks=vram_checks, primer=profile.primer,
+    # One timeline for the file whichever way we got here. --realign's acoustic anchor hands
+    # one in (already populated, so the encoder does not run twice over the same audio);
+    # otherwise the emissions are computed here and wrapped. Either way a transcript segment
+    # can be cut across chunk joins, which is what stops a boundary landing in front of the
+    # line it was meant to contain.
+    if timeline is None and vad_segments is not None:
+        timeline = EmissionTimeline.from_computed(
+            vad_segments,
+            _compute_vad_emissions(
+                vad_segments, model, model_type, bert_processor, device, batch_size,
+                vram_checks=vram_checks, primer=profile.primer,
+            ),
         )
-        if vad_segments is not None
-        else None
-    )
+    vad_seg_emissions = None
 
     # --- Preprocess transcript ---
     transcript = list(transcript)
+    # Before anything reads the dictionary: give it a token for the characters it has none
+    # for, so _preprocess_segment keeps them instead of dropping them. Idempotent, so under
+    # --realign (where the coarse search already ran this over the same transcript against
+    # the same dictionary) this is a no-op and the two passes cannot disagree.
+    repair = align_model_metadata.get("vocab_repair")
+    if repair is not None:
+        repair.augment(segment.get("text", "") for segment in transcript)
+        # A substituted character's token is some homophone's, so it cannot be asked which
+        # of two particles the audio supports. Never fires for the shipped profiles.
+        spotchecks = filter_spotchecks(spotchecks, repair.substitutions)
     segment_data = _preprocess_transcript(transcript, model_lang, model_dictionary, punctuation, print_progress)
 
     # --- Align each segment ---
@@ -971,10 +1275,11 @@ def align(
             aligned_segments.append(base_seg)
             continue
 
-        emission = _get_emission_for_segment(
+        found = _get_emission_for_segment(
             t1, t2, audio, vad_segments, vad_seg_emissions,
-            model, model_type, bert_processor, device,
+            model, model_type, bert_processor, device, timeline=timeline,
         )
+        emission, frame_times = found if found is not None else (None, None)
         if emission is None:
             logger.warning(f'Failed to align segment ("{text}"): no VAD segment found for start time {t1}, skipping')
             aligned_segments.append(base_seg)
@@ -984,7 +1289,7 @@ def align(
             segment, segment_data[sdx], emission,
             model_dictionary, model_lang, blank_id, spacing_char_id,
             t1, t2, interpolate_method, return_char_alignments,
-            spotchecks, punctuation,
+            spotchecks, punctuation, frame_times=frame_times,
         )
         aligned_segments += subsegments
 
@@ -1015,10 +1320,34 @@ def align(
     # --- Validate. Model-agnostic and always on: a cue start sitting on silence is wrong
     # whichever align model produced it. Runs on final timings, after the release/trim
     # pass, so it judges what the rest of the pipeline will actually consume.
-    warn_on_silent_starts(
+    silent = warn_on_silent_starts(
         aligned_segments,
         vad_segments if vad_segments is not None else whole_file_region(audio, MAX_DURATION),
     )
+    # Land the finding on the cue rather than only printing it: a warning that names no cue
+    # cannot be acted on across a 2000-line file. setdefault so a reason set at placement
+    # time ("no audio for this line") outranks a symptom of it.
+    for hit in silent:
+        if 0 <= hit.index < len(aligned_segments):
+            aligned_segments[hit.index].setdefault("realign_reason", "silent_start")
+
+    # ...and the same question asked of the timings alone: a cue holding a silence between
+    # two of its own adjacent characters is not one utterance, and its edges are the least
+    # trustworthy in the file. A note rather than a reason or a repair -- see
+    # align_checks.find_gapped_cues for why it is deliberately not fixed here.
+    for gapped in warn_on_gapped_cues(aligned_segments, split_chars=punctuation.split_chars):
+        add_note(aligned_segments[gapped.index],
+                 f"internal_gap:{gapped.gap:.1f}s after {gapped.before}")
+
+    # Record on each cue which of its characters the model could not read as written. Done
+    # here rather than at substitution time because a substitution is per *character* over
+    # the whole file, while what a reader wants to see is the handful of cues it touched.
+    if repair is not None and (repair.substitutions or repair.unresolved):
+        for seg in aligned_segments:
+            for note in substitution_notes(
+                seg.get("text", ""), repair.substitutions, repair.unresolved,
+            ):
+                add_note(seg, note)
 
     # --- Collect word segments ---
     word_segments: List[SingleWordSegment] = [w for seg in aligned_segments for w in seg["words"]]

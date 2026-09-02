@@ -29,6 +29,7 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
         vad_min_duration_off: float = 0.0,
         reference_cues: Optional[List[SingleSegment]] = None,
         reference_padding: float = 0.5,
+        cover_all: bool = False,
     ):
         self.vad_model = vad_model
         self.vad_onset = vad_onset
@@ -39,6 +40,10 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
         self.vad_min_duration_off = vad_min_duration_off
         self.reference_cues = reference_cues
         self.reference_padding = reference_padding
+        # Emit a gap-free partition of the file instead of speech-only regions; see
+        # Vad.cover_chunks. Reference expansion is meaningless here (nothing is dropped for
+        # it to recover) and is skipped.
+        self.cover_all = cover_all
 
     @staticmethod
     def read_debug(audio_path, debug_dir): return load_vad_debug(audio_path, debug_dir)
@@ -47,13 +52,20 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
     def write_debug(audio_path, result, debug_dir): write_vad_debug(audio_path, result, debug_dir)
 
     @staticmethod
-    def _extract(item): return load_audio(item['audio_path'], audio_track=item.get('audio_track', 0))
+    def _extract(item):
+        return load_audio(
+            item['audio_path'],
+            audio_track=item.get('audio_track', 0),
+            downmix=item.get('audio_downmix', 'mix'),
+        )
 
     @staticmethod
     def _pack(item, result):
         out = {'audio_path': item['audio_path'], 'vad_segments': result}
         if 'audio_track' in item:
             out['audio_track'] = item['audio_track']
+        if 'audio_downmix' in item:
+            out['audio_downmix'] = item['audio_downmix']
         return out
 
     def process(self, input: np.ndarray, *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
@@ -62,26 +74,59 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
         if issubclass(type(self.vad_model), Vad):
             waveform = self.vad_model.preprocess_audio(input)
             merge_chunks = self.vad_model.merge_chunks
+            cover_chunks = self.vad_model.cover_chunks
+            speech_regions = self.vad_model.speech_regions
         else:
             waveform = Pyannote.preprocess_audio(input)
             merge_chunks = Pyannote.merge_chunks
+            cover_chunks = Pyannote.cover_chunks
+            speech_regions = Pyannote.speech_regions
 
+        duration = len(input) / SAMPLE_RATE
         raw_segments = self.vad_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
-        merged = merge_chunks(
-            raw_segments,
-            self.chunk_size,
-            onset=self.vad_onset,
-            offset=self.vad_offset,
-            pad_onset=self.vad_pad_onset,
-            pad_offset=self.vad_pad_offset,
-            min_duration_off=self.vad_min_duration_off,
-        )
+        speech_spans: list = []
+        if self.cover_all:
+            # Split-only mode: VAD picks the cut points, but nothing is discarded. See
+            # Vad.cover_chunks for why --realign cannot use the speech-only timeline.
+            merged = cover_chunks(raw_segments, self.chunk_size, duration)
+            logger.info(
+                "Contiguous chunking: %d chunk(s) covering %.1fs (no audio discarded)",
+                len(merged), duration,
+            )
+            # Split-only chunks keep every sample, which is the point, but it also means a
+            # chunk says nothing about where inside itself anyone is speaking. Record the
+            # speech turns separately: nothing is filtered by them, but the ASR anchor needs
+            # them to turn a character stream into times (realign._hypothesis_stream), and
+            # they cannot be recovered downstream once the score curve is gone.
+            speech_spans = speech_regions(
+                raw_segments,
+                onset=self.vad_onset,
+                offset=self.vad_offset,
+                pad_onset=self.vad_pad_onset,
+                pad_offset=self.vad_pad_offset,
+                min_duration_off=self.vad_min_duration_off,
+            )
+            heard = sum(e - s for s, e in speech_spans)
+            logger.info(
+                "  ...of which %.1fs (%.0f%%) is speech, across %d region(s)",
+                heard, 100 * heard / duration if duration else 0.0, len(speech_spans),
+            )
+        else:
+            merged = merge_chunks(
+                raw_segments,
+                self.chunk_size,
+                onset=self.vad_onset,
+                offset=self.vad_offset,
+                pad_onset=self.vad_pad_onset,
+                pad_offset=self.vad_pad_offset,
+                min_duration_off=self.vad_min_duration_off,
+            )
 
         # Reference-cue expansion runs here -- after the timeline exists, before any
         # audio is sliced -- so the recovered regions are ordinary VAD segments to
         # everything downstream and land inside this stage's debug checkpoint.
         expanded_spans: list = []
-        if self.reference_cues:
+        if self.reference_cues and not self.cover_all:
             from cantocaptions_ai.pipeline.reference_context import (
                 expand_intervals_to_reference, expansion_only_spans,
             )
@@ -127,6 +172,13 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
             ]
             if overlap:
                 out['expanded'] = overlap
+            heard = [
+                [max(sp[0], seg['start']), min(sp[1], seg['end'])]
+                for sp in speech_spans
+                if sp[0] < seg['end'] and sp[1] > seg['start']
+            ]
+            if heard:
+                out['speech'] = heard
             segments.append(out)
         if expanded_spans:
             recovered = sum(e - s for s, e in expanded_spans)
@@ -150,6 +202,7 @@ def load_vad(
     vad_min_duration_off: float = 0.25,
     reference_cues: Optional[List[SingleSegment]] = None,
     reference_padding: float = 0.5,
+    cover_all: bool = False,
 ) -> VadProcessor:
     """Load a VAD model and return a VadProcessor for audio segmentation."""
     if vad_model is not None:
@@ -176,4 +229,5 @@ def load_vad(
         vad_min_duration_off=vad_min_duration_off,
         reference_cues=reference_cues,
         reference_padding=reference_padding,
+        cover_all=cover_all,
     )
