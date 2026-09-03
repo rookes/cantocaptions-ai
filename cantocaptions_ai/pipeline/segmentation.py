@@ -335,6 +335,16 @@ def assemble_cues(
     if not segments:
         return []
 
+    # A cue with no text can never be displayed, and leaving one in corrupts its neighbours
+    # rather than merely wasting a line: pass A finds no punctuation at the join, reads it as
+    # a clean boundary, and glues the cues on either side into one cue spanning the silence
+    # between them. Dropped here rather than in pass B because that pass only drops a cue
+    # *shorter* than min_cue_duration -- deliberately, since a long cue whose text is noisy
+    # may still be speech -- and an empty one is commonly the longest cue in the file.
+    segments = [seg for seg in segments if str(seg.get("text", "")).strip()]
+    if not segments:
+        return []
+
     if rescue_max_chars is None:
         rescue_max_chars = max_chars
 

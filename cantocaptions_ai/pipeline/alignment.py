@@ -1257,12 +1257,26 @@ def align(
 
     # --- Align each segment ---
     aligned_segments: List[SingleAlignedSegment] = []
+    untranscribed = 0
 
     for sdx, segment in enumerate(transcript):
         t1 = segment["start"]
         t2 = segment["end"]
         text = segment["text"]
         avg_logprob = segment.get("avg_logprob")
+
+        # A segment ASR returned nothing for is not a cue and must not become one. Left in,
+        # it is an empty cue covering that whole VAD segment, and cue assembly then treats it
+        # as an ordinary neighbour: its blank text has no punctuation, so pass A reads the
+        # join as clean and glues the cues on either side of it into one spanning the
+        # silence. Note the test is the *text*, not whether anything aligned -- a segment
+        # whose characters are all out of the align vocabulary keeps its cue and its text
+        # (see align_vocab), it simply has no word timings.
+        if not str(text).strip():
+            untranscribed += 1
+            if progress_callback is not None:
+                progress_callback.advance(1)
+            continue
 
         base_seg: SingleAlignedSegment = {"start": t1, "end": t2, "text": text, "words": [], "chars": None}
         if avg_logprob is not None:
@@ -1348,6 +1362,11 @@ def align(
                 seg.get("text", ""), repair.substitutions, repair.unresolved,
             ):
                 add_note(seg, note)
+
+    if untranscribed:
+        logger.info(
+            "%d segment(s) carried no transcribed text and produced no cue", untranscribed,
+        )
 
     # --- Collect word segments ---
     word_segments: List[SingleWordSegment] = [w for seg in aligned_segments for w in seg["words"]]

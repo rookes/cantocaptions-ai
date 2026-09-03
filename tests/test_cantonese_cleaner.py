@@ -173,14 +173,18 @@ class TestFormatAcronyms(unittest.TestCase):
 
 class TestChineseNumbers(unittest.TestCase):
 
-    def test_round_numbers_not_converted(self):
-        self.assertEqual(convert_chinese_numbers("一百"), "一百")
-        self.assertEqual(convert_chinese_numbers("一千"), "一千")
-        self.assertEqual(convert_chinese_numbers("一萬"), "一萬")
+    def test_round_numbers_converted(self):
+        # Below 萬 a round number is no harder to read in digits than any other.
+        self.assertEqual(convert_chinese_numbers("一百"), "100")
+        self.assertEqual(convert_chinese_numbers("一千"), "1000")
+        self.assertEqual(convert_chinese_numbers("二十"), "20")
+        self.assertEqual(convert_chinese_numbers("四十"), "40")
+        self.assertEqual(convert_chinese_numbers("三千一百"), "3100")
 
     def test_uncertain_words_not_converted(self):
         self.assertEqual(convert_chinese_numbers("幾十個"), "幾十個")
         self.assertEqual(convert_chinese_numbers("十幾個"), "十幾個")
+        self.assertEqual(convert_chinese_numbers("四十幾"), "四十幾")
 
     def test_digit_strings_not_converted(self):
         self.assertEqual(convert_chinese_numbers("一零一"), "一零一")
@@ -190,20 +194,91 @@ class TestChineseNumbers(unittest.TestCase):
         self.assertEqual(convert_chinese_numbers("五千零一十"), "5010")
         self.assertEqual(convert_chinese_numbers("一百零八歲"), "108歲")
 
+    def test_trailing_digit_takes_the_next_place_down(self):
+        # 三百五 is 350, not 305; the 零 in 五十五萬零一 is what forces the ones place.
+        self.assertEqual(convert_chinese_numbers("三百五"), "350")
+        self.assertEqual(convert_chinese_numbers("五十五萬一"), "551,000")
+        self.assertEqual(convert_chinese_numbers("五十五萬一千"), "551,000")
+        self.assertEqual(convert_chinese_numbers("五十五萬零一"), "550,001")
+
+    def test_big_unit_applies_to_everything_in_front_of_it(self):
+        self.assertEqual(convert_chinese_numbers("二十五萬蚊"), "二十五萬蚊")
+        self.assertEqual(convert_chinese_numbers("二十五萬一千蚊"), "251,000蚊")
+        self.assertEqual(convert_chinese_numbers("三億五千萬"), "350,000,000")
+
+    def test_trailing_big_unit_not_converted(self):
+        # 萬/億 last means the unit covers the whole number: the Chinese form is
+        # already the compact one.
+        self.assertEqual(convert_chinese_numbers("一萬"), "一萬")
+        self.assertEqual(convert_chinese_numbers("十萬"), "十萬")
+        self.assertEqual(convert_chinese_numbers("二十五萬"), "二十五萬")
+        self.assertEqual(convert_chinese_numbers("五十五萬"), "五十五萬")
+        self.assertEqual(convert_chinese_numbers("一百二十七億"), "一百二十七億")
+        self.assertEqual(convert_chinese_numbers("三百三十二億"), "三百三十二億")
+
+    def test_colloquial_tens_not_converted(self):
+        self.assertEqual(convert_chinese_numbers("廿一"), "廿一")
+        self.assertEqual(convert_chinese_numbers("卅五個"), "卅五個")
+        self.assertEqual(convert_chinese_numbers("廿五萬一千"), "廿五萬一千")
+
     def test_small_numbers_not_converted(self):
         self.assertEqual(convert_chinese_numbers("三個"), "三個")
-        self.assertEqual(convert_chinese_numbers("十"), "十")
-        self.assertEqual(convert_chinese_numbers("五號"), "五號")
 
-    def test_dates(self):
+    def test_bare_units_not_converted(self):
+        # A quantifier with no digit written is not a written-out number.
+        self.assertEqual(convert_chinese_numbers("十"), "十")
+        self.assertEqual(convert_chinese_numbers("十分好"), "十分好")
+
+    def test_dates_and_numeric_names(self):
         self.assertEqual(convert_chinese_numbers("十一月二十三號"), "11月23號")
         self.assertEqual(convert_chinese_numbers("一月二十三號"), "1月23號")
+        self.assertEqual(convert_chinese_numbers("五號"), "5號")
+        self.assertEqual(convert_chinese_numbers("五月"), "5月")
+        self.assertEqual(convert_chinese_numbers("十幾號"), "十幾號")
+
+    def test_numerals_on_both_sides_of_a_point(self):
+        # A number either side of 點 fixes the reading, so both convert whatever
+        # they are -- as a clock time, or as a point/degree of the same shape.
+        self.assertEqual(convert_chinese_numbers("八點三十分"), "8點30分")
+        self.assertEqual(convert_chinese_numbers("八點六十分"), "8點60分")
+        self.assertEqual(convert_chinese_numbers("三十六點五度"), "36點5度")
+        self.assertEqual(convert_chinese_numbers("二十五點三十分"), "25點30分")
+        self.assertEqual(convert_chinese_numbers("三點五"), "3點5")
+
+    def test_clock_face_minute_is_padded(self):
+        # ...but only where the pair really could be a clock time.
+        self.assertEqual(convert_chinese_numbers("我八點零五分返嚟"), "我8點05分返嚟")
+        self.assertEqual(convert_chinese_numbers("十二點五分"), "12點05分")
+        self.assertEqual(convert_chinese_numbers("零點五分"), "0點5分")
+
+    def test_bare_hours_not_converted(self):
+        self.assertEqual(convert_chinese_numbers("五點"), "五點")
+        self.assertEqual(convert_chinese_numbers("十二點"), "十二點")
+        self.assertEqual(convert_chinese_numbers("五點半"), "五點半")
+
+    def test_bare_point_above_twelve_is_not_an_hour(self):
+        # 點 is also "point" / "degree", and past the 12-hour clock that is the
+        # only reading left.
+        self.assertEqual(convert_chinese_numbers("十九點"), "19點")
+        self.assertEqual(convert_chinese_numbers("二十三點"), "23點")
+        self.assertEqual(convert_chinese_numbers("一百點"), "100點")
+
+    def test_point_constructs_the_reader_hedged(self):
+        # A hedge, a colloquial ten, or the 個字 quarter-hour count suppresses the
+        # whole construct -- neither half converts.
+        self.assertEqual(convert_chinese_numbers("十二點幾分鐘"), "十二點幾分鐘")
+        self.assertEqual(convert_chinese_numbers("十九點幾"), "十九點幾")
+        self.assertEqual(convert_chinese_numbers("十幾點"), "十幾點")
+        self.assertEqual(convert_chinese_numbers("十點四個字"), "十點四個字")
+        self.assertEqual(convert_chinese_numbers("十二點四個字"), "十二點四個字")
+        self.assertEqual(convert_chinese_numbers("廿三點"), "廿三點")
+        self.assertEqual(convert_chinese_numbers("廿三點五分"), "廿三點五分")
 
     def test_years_digit_by_digit(self):
         self.assertEqual(convert_chinese_numbers("一二三四年"), "1234年")
 
     def test_compound(self):
-        self.assertEqual(convert_chinese_numbers("四萬五千零一十蚊"), "45010蚊")
+        self.assertEqual(convert_chinese_numbers("四萬五千零一十蚊"), "45,010蚊")
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +355,11 @@ class TestCleanSubtitle(unittest.TestCase):
         self.assertEqual(self.clean("一月二十三號"), "1月23號")
         self.assertEqual(self.clean("你二十三歲？一二三四五六七八九十"), "你23歲？一二三四五六七八九十")
         self.assertEqual(self.clean("一二三四年果陣佢計咗數，「一二三」"), "1234年嗰陣佢計咗數，「一二三」")
-        self.assertEqual(self.clean("加埋一齊係四萬五千零一十蚊"), "加埋一齊係45010蚊")
+        # The grouping comma survives cleaning: punctuation.toml's ,->， rule runs
+        # before the numeral step, and nothing after it touches half-width commas.
+        self.assertEqual(self.clean("加埋一齊係四萬五千零一十蚊"), "加埋一齊係45,010蚊")
         self.assertEqual(self.clean("會活到一百零八歲"), "會活到108歲")
+        self.assertEqual(self.clean("我哋八點三十分見"), "我哋8點30分見")
 
     def test_㗎嘛(self):
         # Actual legacy behavior: 㗎嘛 -> 𠺢嘛 (the stale legacy test expected 㗎咩).

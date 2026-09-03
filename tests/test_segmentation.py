@@ -532,5 +532,52 @@ class TestMergeDisabled(unittest.TestCase):
         self.assertEqual(cues[-1]["end"], 3.14)
 
 
+class TestEmptyCuesAreRefused(unittest.TestCase):
+    """A cue with no text corrupts its neighbours rather than merely wasting a line.
+
+    ASR returns nothing for some VAD segments (a music-only stretch, say), and alignment used
+    to turn each into an empty cue covering that whole segment. Pass A then finds no
+    punctuation at the join, reads the boundary as clean, and glues the cues on either side
+    into one cue spanning the silence between them. Text cleaning drops the empty cue at the
+    very end, so the damage is invisible in the output -- and survives --no_clean_text.
+    """
+
+    def _cue(self, start, end, text):
+        return {"start": start, "end": end, "text": text, "words": [], "chars": None}
+
+    def test_an_empty_cue_does_not_bridge_its_neighbours(self):
+        with_empty = assemble_cues(
+            [self._cue(1.0, 1.4, "你好"), self._cue(1.44, 3.0, ""), self._cue(3.04, 3.5, "嗎")],
+            min_cue_duration=0.5, merge_gap=0.25)
+        without = assemble_cues(
+            [self._cue(1.0, 1.4, "你好"), self._cue(3.04, 3.5, "嗎")],
+            min_cue_duration=0.5, merge_gap=0.25)
+        self.assertEqual([(c["start"], c["end"], c["text"]) for c in with_empty],
+                         [(c["start"], c["end"], c["text"]) for c in without])
+        self.assertEqual(len(with_empty), 2, "the two lines are separate utterances")
+
+    def test_a_whitespace_only_cue_counts_as_empty(self):
+        out = assemble_cues([self._cue(1.0, 1.4, "你好"), self._cue(1.44, 3.0, "  \n ")],
+                            min_cue_duration=0.5, merge_gap=0.25)
+        self.assertEqual([c["text"] for c in out], ["你好"])
+
+    def test_a_long_empty_cue_is_dropped_although_pass_b_would_keep_it(self):
+        # Pass B only drops a cue *shorter* than min_cue_duration, deliberately: a long cue
+        # with noisy text may still be speech. An empty one is different, and is commonly the
+        # longest cue in the file (20.2s on test/bluey).
+        out = assemble_cues([self._cue(1.0, 1.4, "你好"), self._cue(5.0, 25.0, "")],
+                            min_cue_duration=0.5, merge_gap=0.25)
+        self.assertEqual([c["text"] for c in out], ["你好"])
+
+    def test_all_empty_input_yields_nothing(self):
+        self.assertEqual(assemble_cues([self._cue(1.0, 2.0, ""), self._cue(2.0, 3.0, " ")],
+                                       min_cue_duration=0.5), [])
+
+    def test_ordinary_cues_are_untouched(self):
+        cues = [self._cue(1.0, 1.4, "你好，"), self._cue(5.0, 5.8, "再見。")]
+        out = assemble_cues([dict(c) for c in cues], min_cue_duration=0.5, merge_gap=0.25)
+        self.assertEqual([c["text"] for c in out], ["你好，", "再見。"])
+
+
 if __name__ == "__main__":
     unittest.main()
