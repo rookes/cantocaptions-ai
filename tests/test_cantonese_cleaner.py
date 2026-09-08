@@ -23,8 +23,12 @@ from cantocaptions_ai.cantonese.text import is_removable
 
 
 def _cleaner() -> SubtitleCleaner:
-    # Legacy expectations assume a 21-char two-line layout.
-    return SubtitleCleaner(line_max_length=21, max_line_count=2)
+    # Legacy expectations assume a 21-char two-line layout, and were ported from the full
+    # canto_subtitle_cleaner chain -- which is now `pipeline_qwen.toml`, not the default
+    # manifest. Pin it explicitly so these stay tests of that chain.
+    return SubtitleCleaner(
+        line_max_length=21, max_line_count=2, manifest="pipeline_qwen.toml"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -35,12 +39,85 @@ class TestRuleLoader(unittest.TestCase):
 
     def test_all_builtin_rule_files_load(self):
         toml_files = sorted(BUILTIN_RULES_DIR.glob("*.toml"))
-        self.assertGreater(len(toml_files), 9)  # 9 rule files + pipeline.toml
+        self.assertGreater(len(toml_files), 9)  # 9 rule files + the step manifests
         for path in toml_files:
-            if path.name == "pipeline.toml":
+            if path.name.startswith("pipeline"):  # a step manifest, not a ruleset
                 continue
             rules = load_ruleset(path)
             self.assertGreater(len(rules), 0, f"{path.name} loaded no rules")
+
+    def test_every_manifest_step_resolves(self):
+        """Both shipped manifests name only real rule files and known builtins."""
+        for name in ("pipeline.toml", "pipeline_qwen.toml"):
+            with self.subTest(manifest=name):
+                cleaner = SubtitleCleaner(manifest=name, max_line_count=2)
+                self.assertGreater(len(cleaner._steps), 0)
+
+    def test_default_manifest_is_the_conservative_subset(self):
+        """The default manifest holds exactly these steps, in pipeline_qwen order.
+
+        Guards two ordering constraints documented in pipeline.toml: comma_conjunctions
+        matches the full-width punctuation that punctuation.toml normalizes to, and
+        chinese_numbers must come after punctuation.toml (see the half-width comma test
+        below).
+        """
+        cleaner = SubtitleCleaner(max_line_count=2)
+        self.assertEqual(
+            [name for name, _ in cleaner._steps],
+            [
+                "punctuation.toml",
+                "chars_hk.toml",
+                "comma_conjunctions.toml",
+                "chinese_numbers",
+                "interjection_noise.toml",
+                "repeated_speech.toml",
+            ],
+        )
+
+    def test_grouped_number_commas_survive_the_default_chain(self):
+        """A converted value >= 10,000 keeps its half-width commas.
+
+        punctuation.toml rewrites ',' -> '，', so it has to run *before* chinese_numbers
+        and nothing after may touch a half-width comma. CLAUDE.md records this as an
+        ordering constraint for a custom --clean_rules_dir; it applies to both manifests.
+        """
+        default = SubtitleCleaner(line_max_length=21, max_line_count=2)
+        qwen = SubtitleCleaner(
+            line_max_length=21, max_line_count=2, manifest="pipeline_qwen.toml"
+        )
+        for text, expected in [
+            ("四萬五千零一十個", "45,010個"),
+            ("五十五萬一千", "551,000"),
+            ("一月二十三號", "1月23號"),
+            ("十分好", "十分好"),      # a bare quantifier is not a number
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(default.clean(text), expected)
+                self.assertEqual(qwen.clean(text), expected)
+
+    def test_line_final_repeats_collapse_in_both_manifests(self):
+        """repeated_speech.toml must not depend on another step adding a trailing comma.
+
+        Its multi-character rules consume a trailing [，…] as part of the repeat, which
+        only question_post.toml supplied -- so a line-final repeat survived any manifest
+        without that step. The `$`-anchored rules make the file self-contained; both
+        chains must agree.
+        """
+        default = SubtitleCleaner(line_max_length=21, max_line_count=2)
+        qwen = SubtitleCleaner(
+            line_max_length=21, max_line_count=2, manifest="pipeline_qwen.toml"
+        )
+        for text, expected in [
+            ("係咁多啦…係咁多啦", "係咁多啦…"),   # multi-char, line-final
+            ("唔該…唔該…唔該", "唔該…"),        # multi-char, three repeats
+            ("喂，喂，喂", "喂…"),              # single-char, separated
+            ("我，我，我", "我…"),
+            ("喂喂喂", "喂…"),                 # adjacent: worked before, must still
+            ("係咁多啦…係咁多啦，唔該", "係咁多啦…唔該"),  # mid-line: unchanged
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(default.clean(text), expected)
+                self.assertEqual(qwen.clean(text), expected)
 
     def test_order_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -299,7 +376,9 @@ class TestCleanSubtitle(unittest.TestCase):
                          "雖然話大家係親戚，不過\n我哋其實只係遠房親戚，而佢哋就負責輪流照顧我")
 
     def test_linebreak_skipped_for_single_line_output(self):
-        single = SubtitleCleaner(line_max_length=21, max_line_count=1)
+        single = SubtitleCleaner(
+            line_max_length=21, max_line_count=1, manifest="pipeline_qwen.toml"
+        )
         self.assertNotIn("\n", single.clean("雖然話大家係親戚,不過,我哋其實只係遠房親戚,而佢哋就負責輪流照顧我。"))
 
     def test_repeating_phrases(self):

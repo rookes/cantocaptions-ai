@@ -1,0 +1,55 @@
+# Hand-picked character substitutions for alvanlii/wav2vec2-BERT-cantonese.
+#
+# The align model has no token for these characters, so alignment would drop them and they
+# would contribute no evidence at all (see pipeline/align_vocab.py). Each entry names an
+# in-vocabulary character to align *in their place*; the subtitle text is never changed.
+#
+# This file is deliberately short. It holds only what the automatic tiers cannot reach or
+# get wrong -- everything else is better derived per transcript, where it is reported and
+# can be inspected. Do not paste the output of `scripts/report_align_vocab.py --toml` in
+# here wholesale: those are the automatic choices, they are already made without this file,
+# and freezing them would hide them from the report.
+#
+# Your own --align_substitutions file is merged over this one, entry by entry, so you can
+# override a single character without restating the rest. An empty value ("") switches one
+# character off and leaves it unaligned.
+
+[substitutions]
+
+# --- no such syllable in the vocabulary ------------------------------------------------
+#
+# 爹 (de1) and 嗲 (de2) are common -- 爹哋 "daddy", 收嗲 "shut up" -- and *no* character in
+# the 2680-entry vocabulary reads de at any tone, so neither the homophone tier nor the
+# tone-relaxed tier can find anything.
+#
+# Normalized testing against the alignment model for the 爹 syllable reports correlation without
+# the following candidate homophones: 特 dak6, 弟 dai6, 電 din6, 地 dei6, 典 din2, all around z = 3.1
+# to 3.3.
+#
+# 弟 over 地 to avoid 地哋 competing for the same frames.
+"爹" = "弟"
+"嗲" = "弟"
+"摷" = "抄"
+"𠸏" = "嘅"
+"吔" = "也"
+"艾" = "捱" 
+"膩" = "泥" 
+"𠺻" = "級"
+"柚" = "油"
+
+# --- sentence-final particles the automatic tiers cannot reach -------------------------
+#
+# Both are contrast-set strict forms (rules/standardization.toml, sets "aa" and "zek"), so
+# they are concentrated in exactly the hand-standardized material a dataset build most wants
+# to keep -- 229 and 228 occurrences in the CantoCaptions corpus, the two largest unresolved
+# misses left after the homophone tier.
+#
+# 𠻺 is aa6 and no in-vocabulary character reads aa6, so the homophone tier finds nothing.
+# 呀 (aa3/aa4) is the same syllable at a different tone: the `near` tier would propose it,
+# but naming it here gets it at the homophone level without relaxing every other character.
+"𠻺" = "呀"
+#
+# 唧 is zek1. 啫 is ze1 -- same initial and nucleus, missing the -k coda -- so it is not a
+# homophone and no tier will offer it. Hand-picked as the closest available: the vocabulary
+# holds nothing reading zek at any tone.
+"唧" = "啫"

@@ -82,9 +82,27 @@ class SegmentationConfig:
     leading_markers: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class CleaningConfig:
+    """Which cleaning step manifest this model's output should be folded through.
+
+    ``manifest`` names a file in the rules directory (the packaged ``cantonese/rules/``,
+    or a ``--clean_rules_dir`` override). The default manifest is conservative --
+    character variants, punctuation, and noise -- because a model fine-tuned to emit
+    the target convention already writes what the heavier rules exist to impose.
+
+    A model that writes generic Mandarin-flavoured output needs the full legacy chain
+    instead (``pipeline_qwen.toml``): question particles, ASR error repair, numeral
+    conversion and particle conventions on top. Like every other model-profile field,
+    the default is the no-op-ish one and a model opts *in* to more work.
+    """
+    manifest: str = "pipeline.toml"
+
+
 DEFAULT_NORMALIZATION = TextNormalization()
 DEFAULT_PUNCTUATION = PunctuationConfig()
 DEFAULT_SEGMENTATION = SegmentationConfig()
+DEFAULT_CLEANING = CleaningConfig()
 
 
 @lru_cache(maxsize=None)

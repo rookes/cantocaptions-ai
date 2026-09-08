@@ -11,7 +11,11 @@ alignment output for every model, including ones with no profile here.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional
+
+# Bundled hand-picked substitution tables, one per align model; see AlignProfile.
+SUBSTITUTIONS_DIR = Path(__file__).parent / "align_substitutions"
 
 import numpy as np
 
@@ -74,12 +78,21 @@ class AlignProfile:
     """Per-model alignment behaviour. Every field defaults to a no-op."""
 
     primer: Optional[AudioPrimer] = None
+    # Filename under SUBSTITUTIONS_DIR holding hand-picked character substitutions for this
+    # model'"'"'s vocabulary. A substitution only means anything relative to one vocabulary --
+    # 爹 -> 弟 is only useful because *this* model has 弟 and not 爹 -- so the table belongs
+    # to the model, not to the pipeline. Loaded by align_vocab.bundled_substitutions and
+    # merged *under* the caller'"'"'s --align_substitutions file; see pipeline/align_vocab.py.
+    substitutions: Optional[str] = None
 
 
 DEFAULT_ALIGN_PROFILE = AlignProfile()
 
 ALIGN_PROFILES: Dict[str, AlignProfile] = {
-    "alvanlii/wav2vec2-BERT-cantonese": AlignProfile(primer=TailPrimer()),
+    "alvanlii/wav2vec2-BERT-cantonese": AlignProfile(
+        primer=TailPrimer(),
+        substitutions="wav2vec2-bert-cantonese.toml",
+    ),
 }
 
 

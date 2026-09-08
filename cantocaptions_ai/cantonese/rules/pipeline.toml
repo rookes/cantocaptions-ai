@@ -1,15 +1,29 @@
-# Cleaning step sequence, applied in order to each subtitle line.
+# Default cleaning step sequence, applied in order to each subtitle line.
 #
 #   type = "rules"    applies the ordered regex rules in `file` (same directory)
 #   type = "builtin"  runs a coded step from SubtitleCleaner.BUILTIN_STEPS:
 #                     acronyms, question_particles, chinese_numbers, linebreak, trim
 #
-# This order mirrors the legacy canto_subtitle_cleaner clean_subtitle() chain and
-# is load-bearing: rules assume the transformations of every step before them.
-
-[[steps]]
-type = "builtin"
-name = "acronyms"
+# This is what a model gets when its profile names no other manifest -- the right
+# starting point for a checkpoint fine-tuned to emit the target convention, which
+# already writes the particles, question forms and numerals the heavier steps exist
+# to impose. It keeps only the work that is about *presentation* rather than about
+# correcting a model's dialect: character variants, punctuation, and noise.
+#
+# Vanilla Qwen3-ASR needs the full legacy chain instead; see pipeline_qwen.toml,
+# selected via the model profile's `cleaning` field.
+#
+# The order below is the relative order these same steps hold in pipeline_qwen.toml,
+# and is load-bearing for the same reason: comma_conjunctions matches against the
+# full-width punctuation that punctuation.toml normalizes to, and chinese_numbers has
+# to follow punctuation.toml because it groups values >= 10,000 with *half-width*
+# commas (45,010) and punctuation.toml rewrites ',' -> '，'. Nothing after it here
+# touches a half-width comma, which is what lets that grouping reach the subtitle.
+#
+# repeated_speech used to need a trailing comma that only question_post.toml supplied,
+# which made a line-final repeat ("係咁多啦…係咁多啦") pass through this manifest
+# untouched. That dependency now lives in repeated_speech.toml itself as a pair of
+# `$`-anchored rules, so this chain collapses the same runs the Qwen one does.
 
 [[steps]]
 type = "rules"
@@ -20,32 +34,12 @@ type = "rules"
 file = "chars_hk.toml"
 
 [[steps]]
-type = "builtin"
-name = "question_particles"
-
-[[steps]]
-type = "rules"
-file = "question_post.toml"
-
-[[steps]]
 type = "rules"
 file = "comma_conjunctions.toml"
 
 [[steps]]
-type = "rules"
-file = "misc_conventions.toml"
-
-[[steps]]
-type = "rules"
-file = "asr_errors.toml"
-
-[[steps]]
 type = "builtin"
 name = "chinese_numbers"
-
-[[steps]]
-type = "rules"
-file = "particle_conventions.toml"
 
 [[steps]]
 type = "rules"
@@ -54,11 +48,3 @@ file = "interjection_noise.toml"
 [[steps]]
 type = "rules"
 file = "repeated_speech.toml"
-
-[[steps]]
-type = "builtin"
-name = "linebreak"
-
-[[steps]]
-type = "builtin"
-name = "trim"

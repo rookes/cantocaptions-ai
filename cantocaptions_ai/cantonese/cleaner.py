@@ -1,9 +1,15 @@
 """Manifest-driven Cantonese subtitle text cleaner.
 
-``SubtitleCleaner`` folds each subtitle line through the step sequence declared in
-``rules/pipeline.toml``: TOML regex rule files interleaved with coded builtin steps
-(question-aware particle fixes, Chinese numeral conversion, line breaking, trimming).
-Point ``rules_dir`` at a directory with its own ``pipeline.toml`` to swap rule sets.
+``SubtitleCleaner`` folds each subtitle line through the step sequence declared in a
+manifest: TOML regex rule files interleaved with coded builtin steps (question-aware
+particle fixes, Chinese numeral conversion, line breaking, trimming).
+
+Which manifest is a per-model decision, since it depends on how much the model's raw
+output already follows the target convention -- the ASR model's profile supplies it
+(``pipeline/model_profiles.py``, ``ModelProfile.cleaning``). ``pipeline.toml`` is the
+conservative default; ``pipeline_qwen.toml`` is the full legacy chain vanilla
+Qwen3-ASR needs. Point ``rules_dir`` at a directory with its own manifest to swap
+rule sets entirely.
 
 Cleaning may return an empty string (noise-only lines); callers should drop those
 subtitles (see ``text.is_removable``).
@@ -27,6 +33,10 @@ from cantocaptions_ai.cantonese.rules import (
     get_builtin_ruleset,
     load_ruleset,
 )
+from cantocaptions_ai.cantonese.text import DEFAULT_CLEANING
+from cantocaptions_ai.utils.log_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class SubtitleCleaner:
@@ -45,8 +55,10 @@ class SubtitleCleaner:
         rules_dir: Optional[str] = None,
         line_max_length: int = 18,
         max_line_count: Optional[int] = 1,
+        manifest: str = DEFAULT_CLEANING.manifest,
     ) -> None:
         self.rules_dir = Path(rules_dir) if rules_dir is not None else BUILTIN_RULES_DIR
+        self.manifest = manifest
         self.line_max_length = line_max_length
         self.max_line_count = max_line_count
         # Fails fast on a missing/invalid manifest, rule file, or regex so problems
@@ -54,7 +66,18 @@ class SubtitleCleaner:
         self._steps = self._load_steps()
 
     def _load_steps(self) -> List[Tuple[str, Callable[[str], str]]]:
-        manifest_path = self.rules_dir / "pipeline.toml"
+        manifest_path = self.rules_dir / self.manifest
+        # An override directory supplies whatever rule set the caller wrote and need not
+        # know which manifest the chosen model asks for, so fall back to the documented
+        # `pipeline.toml` contract rather than failing on a model-specific name.
+        if not manifest_path.is_file() and self.manifest != DEFAULT_CLEANING.manifest:
+            fallback = self.rules_dir / DEFAULT_CLEANING.manifest
+            if fallback.is_file():
+                logger.info(
+                    "Cleaning manifest %r not found in %s; using %s",
+                    self.manifest, self.rules_dir, DEFAULT_CLEANING.manifest,
+                )
+                manifest_path = fallback
         if not manifest_path.is_file():
             raise ValueError(f"Cleaning manifest not found: {manifest_path}")
 

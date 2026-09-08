@@ -1,6 +1,17 @@
 # Collapse repeated speech, e.g. 喂喂喂 -> 喂… (legacy clean_interjections)
 # Rules are applied in order, top to bottom, one re.sub pass each.
 # Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+#
+# Most rules below consume a trailing [，…] as part of the repeat. That made the file
+# depend on something else having put a comma at the end of the line first -- in the Qwen
+# chain, question_post.toml's particle-comma rule, which runs seven steps earlier and is
+# not about deduplication at all. A manifest without that step (the default
+# pipeline.toml) left every line-final repeat uncollapsed.
+#
+# The `$`-anchored rules below express that end-of-line case directly, so this file
+# stands on its own in any manifest. Each sits immediately before the rule it mirrors,
+# because the looser rules further down would otherwise half-collapse the run first
+# (喂，喂，喂 -> 喂…喂) and leave nothing for it to match.
 
 [[rules]]
 pattern = '([\u4e00-\u9fff]{2,})\1+[，…]*'
@@ -23,11 +34,19 @@ pattern = '([\u4e00-\u9fff])([，…]\1){2,}[，…]+$'
 replace = '\1…'
 
 [[rules]]
+pattern = '([\u4e00-\u9fff])([，…]\1){2,}$'
+replace = '\1…'
+
+[[rules]]
 pattern = '([\u4e00-\u9fff])([，…]\1){2,}'
 replace = '\1…\1'
 
 [[rules]]
 pattern = '(?<![\u4e00-\u9fff])([\u4e00-\u9fff])[，…](\1[，…$])+'
+replace = '\1…'
+
+[[rules]]
+pattern = '(?<![\u4e00-\u9fff])([\u4e00-\u9fff]{2,})([，…]\1)+$'
 replace = '\1…'
 
 [[rules]]

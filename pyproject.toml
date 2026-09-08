@@ -71,7 +71,7 @@ build-backend = "setuptools.build_meta"
 packages = { find = { where = ["."], include = ["cantocaptions_ai*"] } }
 
 [tool.setuptools.package-data]
-cantocaptions_ai = ["cantonese/opencc/*", "cantonese/rules/*.toml", "assets/*"]
+cantocaptions_ai = ["cantonese/opencc/*", "cantonese/rules/*.toml", "assets/*", "pipeline/align_substitutions/*.toml"]
 
 # torchcodec (transitive dep of pyannote-audio >=4) has no wheels for Windows, macOS, or Linux aarch64.
 # Only Linux x86_64 has torchcodec wheels; everywhere else we override it away.

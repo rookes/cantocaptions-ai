@@ -29,6 +29,8 @@ from cantocaptions_ai.pipeline.align_vocab import (
     reading_of,
     substitution_notes,
 )
+from cantocaptions_ai.pipeline.align_profiles import SUBSTITUTIONS_DIR, get_align_profile
+from cantocaptions_ai.pipeline.align_vocab import bundled_substitutions, merge_substitutions
 from cantocaptions_ai.utils.schema import add_note, merge_segments
 
 PAD = "[PAD]"
@@ -349,6 +351,54 @@ class TestSpotcheckGuard(unittest.TestCase):
         repair.augment(["".join(sorted(chars))])
         self.assertEqual(repair.substitutions, {})
         self.assertIs(filter_spotchecks(checks, repair.substitutions), checks)
+
+
+class TestBundledSubstitutions(unittest.TestCase):
+    """The align model ships its own table of hand-picked substitutions.
+
+    A substitution only means anything relative to one vocabulary -- 爹 → 弟 is useful only
+    because *this* model holds 弟 and not 爹 -- so the table belongs to the align profile,
+    not to the pipeline, and the caller's --align_substitutions file merges over it.
+    """
+
+    PROFILE = "alvanlii/wav2vec2-BERT-cantonese"
+
+    def test_the_shipped_profile_names_a_table_that_exists(self):
+        profile = get_align_profile(self.PROFILE)
+        self.assertTrue(profile.substitutions)
+        self.assertTrue((SUBSTITUTIONS_DIR / profile.substitutions).is_file())
+
+    def test_an_unknown_model_gets_no_table(self):
+        self.assertIsNone(get_align_profile("some/other-model").substitutions)
+
+    def test_the_table_covers_the_de_syllable(self):
+        # 爹/嗲 are the case the automatic tiers provably cannot reach: no character in the
+        # vocabulary reads de at any tone, so both the homophone and the tone-relaxed tier
+        # come up empty. If they ever resolve automatically this entry is redundant.
+        table = bundled_substitutions(get_align_profile(self.PROFILE).substitutions)
+        self.assertEqual(table.get("爹"), "弟")
+        self.assertEqual(table.get("嗲"), "弟")
+
+    def test_a_missing_table_is_a_warning_not_a_crash(self):
+        self.assertEqual(bundled_substitutions("no-such-model.toml"), {})
+
+    def test_a_user_entry_wins_over_the_bundled_one(self):
+        bundled = {"爹": "弟", "脅": "協"}
+        merged = merge_substitutions(bundled, {"爹": "地"})
+        self.assertEqual(merged["爹"], "地", "the caller's file is the outer layer")
+        self.assertEqual(merged["脅"], "協", "...and need not restate the rest")
+
+    def test_merging_ignores_empty_layers(self):
+        self.assertEqual(merge_substitutions(None, {"a": "b"}, None), {"a": "b"})
+
+    def test_a_bundled_entry_reaches_the_repair_as_an_override(self):
+        vocab = dictionary("弟", "哋")
+        repair = VocabRepair(vocab, LEVEL_NEAR,
+                             merge_substitutions(bundled_substitutions(
+                                 get_align_profile(self.PROFILE).substitutions), None))
+        report = repair.augment(["爹哋"])
+        self.assertEqual(report.substitutions["爹"].kind, KIND_OVERRIDE)
+        self.assertEqual(vocab["爹"], vocab["弟"])
 
 
 if __name__ == "__main__":

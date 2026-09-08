@@ -39,7 +39,9 @@ from cantocaptions_ai.pipeline.align_profiles import (
 from cantocaptions_ai.pipeline.align_vocab import (
     LEVEL_HOMOPHONE,
     VocabRepair,
+    bundled_substitutions,
     filter_spotchecks,
+    merge_substitutions,
     substitution_notes,
 )
 
@@ -1139,6 +1141,7 @@ def load_align_model(
         align_model = guard_model_load("alignment", _ALIGN_REMEDIATION, lambda: align_model.to(device, dtype=dtype))
         align_dictionary = {char.lower(): code for char, code in processor.tokenizer.get_vocab().items()}
 
+    profile = get_align_profile(model_name)
     align_metadata = {
         "language": language_code,
         "dictionary": align_dictionary,
@@ -1146,12 +1149,20 @@ def load_align_model(
         # Built here, next to the dictionary it edits, so every stage that tokenises text
         # against this model shares one vocabulary. Resolves nothing until a caller hands it
         # some text -- see align_vocab.VocabRepair.
+        #
+        # The model's own bundled table sits *under* whatever the caller passed, merged per
+        # character, so --align_substitutions can correct one entry without restating the
+        # rest. Both beat every automatic tier.
         "vocab_repair": VocabRepair(
-            align_dictionary, char_substitution, substitution_overrides,
+            align_dictionary, char_substitution,
+            merge_substitutions(
+                bundled_substitutions(profile.substitutions) if profile.substitutions else None,
+                substitution_overrides,
+            ),
         ),
         # Resolved once here rather than in align(), which then has no idea which model it
         # is holding. Unknown models get the all-no-op default.
-        "profile": get_align_profile(model_name),
+        "profile": profile,
     }
     return align_model, align_metadata
 

@@ -789,6 +789,9 @@ def _execute_pipeline(
             rules_dir=cfg.clean_rules_dir,
             line_max_length=cfg.max_line_width or 21,
             max_line_count=cfg.max_line_count,
+            # How much cleaning the text needs depends on how the model writes it, so the
+            # step manifest comes from the profile like every other output convention.
+            manifest=profile.cleaning.manifest,
         )
         if cfg.highlight_words:
             warnings.warn(

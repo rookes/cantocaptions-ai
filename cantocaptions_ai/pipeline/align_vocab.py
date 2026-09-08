@@ -405,6 +405,30 @@ def filter_spotchecks(spotchecks: Mapping, substituted: Iterable[str]) -> Mappin
     return out
 
 
+@lru_cache(maxsize=None)
+def bundled_substitutions(filename: str) -> Mapping[str, str]:
+    """A substitution table shipped with the align model's profile, or empty if absent.
+
+    Cached: the file is small and is read once per process, not once per file aligned.
+    """
+    from cantocaptions_ai.pipeline.align_profiles import SUBSTITUTIONS_DIR
+
+    path = SUBSTITUTIONS_DIR / filename
+    if not path.is_file():
+        logger.warning("Align profile names a substitution table that is missing: %s", path)
+        return {}
+    return load_substitution_overrides(str(path))
+
+
+def merge_substitutions(*layers: Optional[Mapping[str, str]]) -> Dict[str, str]:
+    """Later layers win per character, so a user file need not restate the bundled ones."""
+    merged: Dict[str, str] = {}
+    for layer in layers:
+        if layer:
+            merged.update(layer)
+    return merged
+
+
 def substitution_notes(
     text: str,
     substitutions: Mapping[str, Substitution],

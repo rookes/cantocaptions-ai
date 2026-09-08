@@ -2,19 +2,21 @@
 
 A ``ModelProfile`` ties an ASR model name to the downstream behavior that depends on
 how that particular model writes its output: post-ASR text normalization (OpenCC /
-HK-variant rewriting), the punctuation set used for sentence splitting, and the
-alignment "spot checks" that swap interchangeable particles.
+HK-variant rewriting), the punctuation set used for sentence splitting, the alignment
+"spot checks" that swap interchangeable particles, and which text-cleaning manifest the
+finished subtitles are folded through.
 
 Every field defaults to a no-op, so:
   * a model **not** in ``MODEL_PROFILES`` (or a new entry that omits fields) runs no
-    OpenCC, uses the default punctuation, and performs no spot checks — the right
-    starting point for a freshly fine-tuned model that already outputs the target
-    convention;
+    OpenCC, uses the default punctuation, performs no spot checks and cleans through
+    the conservative default manifest — the right starting point for a freshly
+    fine-tuned model that already outputs the target convention;
   * adding a model means adding one ``MODEL_PROFILES`` entry — no edits to the ASR or
     alignment code.
 
 This replaces the former ``_MODEL_IDS`` dict in ``_asr_native.py``. The value objects
-themselves (``TextNormalization``, ``PunctuationConfig``, ``SpotCheck``) live in
+themselves (``TextNormalization``, ``PunctuationConfig``, ``SpotCheck``,
+``CleaningConfig``) live in
 ``cantonese/text.py`` so that module stays free of any ``pipeline`` import.
 """
 import os
@@ -22,8 +24,10 @@ from dataclasses import dataclass, field
 from typing import Dict, Mapping
 
 from cantocaptions_ai.cantonese.text import (
+    DEFAULT_CLEANING,
     DEFAULT_PUNCTUATION,
     DEFAULT_SEGMENTATION,
+    CleaningConfig,
     PunctuationConfig,
     SegmentationConfig,
     SpotCheck,
@@ -43,6 +47,7 @@ class ModelProfile:
     punctuation: PunctuationConfig = DEFAULT_PUNCTUATION
     spotchecks: Mapping[str, SpotCheck] = field(default_factory=dict)
     segmentation: SegmentationConfig = DEFAULT_SEGMENTATION
+    cleaning: CleaningConfig = DEFAULT_CLEANING
 
 
 # Vanilla Qwen3-ASR outputs Simplified characters and generic particles, so it needs the
@@ -62,6 +67,11 @@ _QWEN_SPOTCHECKS: Mapping[str, SpotCheck] = {
     "啫": SpotCheck(("咋", "啫")),
     "咁": SpotCheck(("咁", "噉"), weights={"噉": 0.8}),
 }
+
+# Qwen's raw output is Mandarin-flavoured and Simplified-derived, with generic final
+# particles and Chinese numerals written out, so it needs the full legacy cleaning chain
+# rather than the conservative default manifest a fine-tuned checkpoint gets.
+_QWEN_CLEANING = CleaningConfig(manifest="pipeline_qwen.toml")
 
 # Qwen punctuates leading discourse markers off as their own clause ("嗱，你知啦，" -> "嗱，"
 # + "你知啦，"), so alignment gives them a standalone subsegment that CTC then squeezes to a
@@ -87,16 +97,19 @@ def _build_profiles() -> Dict[str, ModelProfile]:
             normalization=_QWEN_NORMALIZATION,
             spotchecks=_QWEN_SPOTCHECKS,
             segmentation=_QWEN_SEGMENTATION,
+            cleaning=_QWEN_CLEANING,
         ),
         "Qwen3-ASR-0.6B": ModelProfile(
             hf_id="Qwen/Qwen3-ASR-0.6B-hf",
             normalization=_QWEN_NORMALIZATION,
             spotchecks=_QWEN_SPOTCHECKS,
             segmentation=_QWEN_SEGMENTATION,
+            cleaning=_QWEN_CLEANING,
         ),
     }
     # Fine-tuned checkpoint: already emits HK-traditional text and custom final particles,
-    # so it takes all defaults — no OpenCC, default punctuation, no spot checks. Copy this
+    # so it takes all defaults — no OpenCC, default punctuation, no spot checks, and the
+    # conservative default cleaning manifest rather than Qwen's full chain. Copy this
     # entry as the template when adding a new model. Registered only when the env var points
     # at a local merged-weights directory; otherwise --model Qwen3-ASR-lora is simply not a
     # valid choice (clean argparse error) rather than a broken hardcoded path.
