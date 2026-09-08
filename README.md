@@ -2,15 +2,13 @@
 
 An end-to-end speech pipeline for generating high-quality, timed written Cantonese (粵文) subtitles. 
 
-*This repository is currently in an early stage of development. Please be patient as new features are rolled out.*
-
 ## How it Works
 
-You can use this tool via command line to generate a subtitle file (default format: SRT) for a given Cantonese audio/video file.
+You can use this tool via command line to generate a subtitle file (default format: SRT) for a given Cantonese audio/video file. There are also several other modes for text alignment, diarizatin, and more.
 
 This project is modeled after the [WhisperX ASR library](https://github.com/m-bain/whisperx), and shares some of the same [basic architecture](https://raw.githubusercontent.com/m-bain/whisperX/refs/heads/main/figures/pipeline.png). However, `cantocaptions_ai` uses Alibaba Cloud's [Qwen3-ASR models](https://github.com/QwenLM/Qwen3-ASR) for the transcription step, alvanlii's [wav2vec2-BERT-Cantonese model](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese) for the alignment step, and adds a wide array of subtitling improvements designed specifically for written Cantonese.
 
-This library is currently designed to run locally on consumer hardware. I may implement some optional LLM API usage in the future, but for now the goal is to provide users with fully open access to generate their own Cantonese subtitles.
+`cantocaptions-ai` is currently designed to run locally on consumer hardware. For the time being, the goal is to provide users with fully open access to generate their own Cantonese subtitles, so no LLM APIs are queried. Once you download the model weights, you can run this completely offline.
 
 ## Prerequisites
 
@@ -43,35 +41,6 @@ uv run cantocaptions_ai audio.wav
 ```
 
 This produces `audio.srt` in the current directory. Note that the first run will take a while, as it downloads model weights automatically (~6 GB).
-
-### Library / server use
-
-Besides the CLI, the pipeline exposes a programmatic entry point that returns results
-in memory and raises catchable exceptions instead of exiting the process — suitable
-for a web server or batch job:
-
-```python
-from cantocaptions_ai.pipeline.config import PipelineConfig
-from cantocaptions_ai.service import run_pipeline, PipelineService
-
-cfg = PipelineConfig(output_format="srt", vocal_isolation_method="none")
-result = run_pipeline("audio.wav", cfg)          # raises ConfigError / InputError
-print(result.subtitle_text)                       # rendered SRT string
-print(result.num_segments, result.empty)          # empty=True if no speech found
-
-# For a long-lived worker, PipelineService serializes GPU access and keeps the
-# VAD model warm across jobs (skipping its ~20-30s reload):
-service = PipelineService(resident=True)
-result = service.run("audio.wav", cfg)
-```
-
-A full reference web service (upload UI + job queue + GPU worker) built on this API
-lives in the companion `cantocaptions-web` repo. To pre-fetch model weights for a
-container image or fresh server, run `python scripts/download_models.py [--full]`.
-
-A fine-tuned LoRA checkpoint can be registered as the `Qwen3-ASR-lora` model by
-pointing `CANTOCAPTIONS_LORA_MODEL_DIR` at its merged-weights directory (otherwise
-that model choice is simply unavailable).
 
 ### HuggingFace access token
 
@@ -131,8 +100,7 @@ Current updates planned for the near future:
 - [x] Add [SubER](https://github.com/apptek/SubER) metric calculation compatibility, and use its Levenshtein distance algorithm to parallelize ensemble subs
 - [ ] Add more performant options for vocal isolation
 - [x] Implement the "realign" feature to run alignment on an existing untimed transcript
-- [ ] Finish the "retime" feature for subtitles that already carry (roughly correct) timings (IN PROGRESS)
-- [ ] Add an option to use Qwen LLM to do error-correction based on a reference standard Chinese subtitle file (IN PROGRESS)
-- [ ] Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
+- [x] Add error-correction based on a reference standard Chinese subtitle file
+- [x] Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
 - [ ] Add better multilingual recognition for Mandarin and English
 - [x] Complete diarization implementation to separate lines from different speakers
