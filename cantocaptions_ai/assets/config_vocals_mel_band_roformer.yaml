@@ -37,3 +37,28 @@ training:
 inference:
   num_overlap: 2
   chunk_size: 352800
+  # "chunked" slides a fixed chunk_size window at num_overlap and stitches with
+  # overlap-add; "whole" runs one forward pass per segment at its natural length.
+  # chunk_size is an inference-harness choice, not a model constraint -- the model
+  # is a transformer over STFT frames and takes any length -- and whole is ~2.5x
+  # faster with no seams, so it looks like the obvious default. It is not.
+  #
+  # Measured end-to-end on the 825-row dev split with the merged LoRA-r128 model,
+  # CER: chunked 0.1615, raw (no isolation) 0.1632, whole 0.1695. Whole costs
+  # +0.0080 CER against chunked (95% CI [-0.0016, +0.0185]; +0.0104, CI excluding
+  # zero, on a 300-row subsample) -- ~5% relative, consistently in that direction.
+  # The divergence does not grow with segment length, so this is not rotary
+  # extrapolation: it is the loss of overlap-add averaging, which acts as
+  # test-time ensembling and is apparently worth more than the speed.
+  #
+  # Keep "whole" for throughput-bound bulk jobs where a few percent CER is an
+  # acceptable trade. It must match what the downstream ASR model was trained on.
+  mode: chunked
+  # Reflect padding added to each end before separation and cut off after, giving
+  # the model context past the segment edge. Chunked mode ignores this and pins the
+  # border to chunk_size - step, which the overlap-add ramp requires.
+  border_s: 1.0
+  # Above this, a segment falls back to the chunked path. VAD bounds segments to
+  # --chunk_size (30 s default) but nothing structurally guarantees it, and peak
+  # VRAM grows with segment length (3.9 GB at 30 s, fp32).
+  whole_max_s: 35.0

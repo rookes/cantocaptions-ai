@@ -101,6 +101,17 @@ def _validate_segment_duration(start: float, end: float, audio: np.ndarray) -> N
 class MbRoformerProcessor(VocalIsolationProcessor):
     """Vocal isolation processor backed by the Mel-Band RoFormer model.
 
+    Two modes, selected by ``config.inference.mode``:
+
+    ``chunked`` (default) is the original sliding-window path, described below.
+
+    ``whole`` runs one forward pass per segment at its natural length, dropping
+    both the 2x overlap redundancy and the chunk seams for ~2.5x the throughput.
+    It is not the default despite that: overlap-add averaging turns out to act as
+    test-time ensembling, and losing it costs ~5% relative CER (see the yaml's
+    ``mode`` comment for the measurement). Segments longer than ``whole_max_s``
+    fall back to ``chunked`` per segment, bounding peak VRAM.
+
     The model runs on fixed-size chunks of ``config.inference.chunk_size`` samples, so
     the batch unit is the chunk (identical size → no padding). Segments are processed
     one file at a time (see ``_iter_windows``, sub-chunked defensively at
@@ -119,16 +130,31 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         config: DictConfig,
         device: torch.device,
         batch_size: Optional[int] = None,
+        segment_mode: Optional[str] = None,
     ):
         self.model = model
         self.config = config
         self.device = device
         self.model_sample_rate: int = config.model.sample_rate
         self._batch_size = batch_size
-        self._C = config.inference.chunk_size
-        self._step = self._C // config.inference.num_overlap
+        inference = config.inference
+        self._C = inference.chunk_size
+        self._step = self._C // inference.num_overlap
         self._fade = self._C // 10
-        self._border = self._C - self._step
+
+        self._mode = segment_mode or inference.get("mode", "chunked")
+        if self._mode not in ("chunked", "whole"):
+            raise ValueError(
+                f"unknown vocal isolation mode {self._mode!r} (expected 'chunked' or 'whole')"
+            )
+        if self._mode == "whole":
+            # Whole mode has no step, so the border is an explicit context pad
+            # rather than the overlap-add ramp width.
+            self._border = int(round(float(inference.get("border_s", 1.0)) * self.model_sample_rate))
+            self._whole_max = int(round(float(inference.get("whole_max_s", 35.0)) * self.model_sample_rate))
+        else:
+            self._border = self._C - self._step
+            self._whole_max = 0
 
     def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
         logger.info("Performing vocal isolation...")
@@ -166,6 +192,15 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             for idx, sdx, seg in window:
                 mixture, total_length, padded = self._prepare_mixture(seg['audio'])
                 key = (idx, sdx)
+                if self._mode == "whole" and total_length <= self._whole_max:
+                    # One forward pass at the segment's natural length. No offsets,
+                    # no overlap-add buffers, no seams -- and no batching, since
+                    # lengths vary and batching this model is measured to be flat
+                    # (150 ms/chunk at every batch size that fits).
+                    self._run_whole(key, seg, mixture, padded, item_out)
+                    if progress_callback is not None:
+                        progress_callback.advance(1)
+                    continue
                 offsets = list(range(0, total_length, step))
                 seg_state[key] = {
                     'mixture': mixture,
@@ -176,6 +211,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                     'remaining': len(offsets),
                     'start': seg['start'],
                     'end': seg['end'],
+                    'src_len': len(seg['audio']),
                     **{k: seg[k] for k in _PERSISTED_SEGMENT_KEYS if k in seg},
                 }
                 jobs.extend((key, off) for off in offsets)
@@ -209,7 +245,10 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                     st['counter'][:, off:off + length] += window_arr[:length]
                     st['remaining'] -= 1
                     if st['remaining'] == 0:
-                        self._finalize_segment(key, st, item_out)
+                        estimated = st['result'] / st['counter']
+                        np.nan_to_num(estimated, copy=False, nan=0.0)
+                        self._finalize_segment(key, st, estimated, item_out)
+                        st['mixture'] = st['result'] = st['counter'] = None
                         del seg_state[key]
 
             # No order_key: chunks are all the fixed model chunk_size, so batches never
@@ -256,7 +295,32 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         approx_len = round(len(seg['audio']) * self.model_sample_rate / SAMPLE_RATE)
         if approx_len > 2 * self._border and self._border > 0:
             approx_len += 2 * self._border
-        return len(range(0, approx_len, self._step)) if approx_len > 0 else 0
+        if approx_len <= 0:
+            return 0
+        if self._mode == "whole" and approx_len <= self._whole_max:
+            return 1
+        return len(range(0, approx_len, self._step))
+
+    def _run_whole(self, key, seg, mixture, padded, item_out) -> None:
+        """Separate one segment in a single forward pass at its natural length.
+
+        The chunked path exists because the reference harness slid a fixed
+        chunk_size window; the model itself is a transformer over STFT frames and
+        accepts any length. Running the segment whole removes the 2x overlap
+        redundancy and the chunk seams at once.
+        """
+        with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
+            with torch.no_grad():
+                out = self.model(mixture.unsqueeze(0).to(self.device))
+        estimated = out[0].float().cpu().numpy()
+        st = {
+            'padded': padded,
+            'start': seg['start'],
+            'end': seg['end'],
+            'src_len': len(seg['audio']),
+            **{k: seg[k] for k in _PERSISTED_SEGMENT_KEYS if k in seg},
+        }
+        self._finalize_segment(key, st, estimated, item_out)
 
     def _prepare_mixture(self, audio: np.ndarray):
         """Resample a 16 kHz mono segment to the model rate, build the stereo mixture,
@@ -276,10 +340,13 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             padded = True
         return mixture, mixture.shape[1], padded
 
-    def _finalize_segment(self, key, st, item_out) -> None:
+    def _finalize_segment(self, key, st, estimated, item_out) -> None:
+        """Unpad, downmix to mono, resample back to 16 kHz and file the result.
+
+        `estimated` is the separated (2, total_length) stereo signal: normalized
+        overlap-add output in chunked mode, the raw model output in whole mode.
+        """
         idx, sdx = key
-        estimated = st['result'] / st['counter']
-        np.nan_to_num(estimated, copy=False, nan=0.0)
         if st['padded']:
             estimated = estimated[:, self._border:-self._border]
         vocals_mono = estimated.mean(axis=0).astype(np.float32)
@@ -287,6 +354,18 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             vocals_mono = torchaudio.functional.resample(
                 torch.from_numpy(vocals_mono), self.model_sample_rate, SAMPLE_RATE
             ).numpy()
+        # Pin the result to the input's sample count. The 16k -> 44.1k -> 16k round
+        # trip is not length-preserving (ratio 2.75625; each leg rounds independently),
+        # which left segments up to ~9 ms short -- enough to trip
+        # _validate_segment_duration and to walk the audio out of step with the
+        # timestamps it is filed under. The drift is sub-frame, so clamping here is
+        # exact, not a fudge.
+        src_len = st.get('src_len')
+        if src_len is not None and len(vocals_mono) != src_len:
+            if len(vocals_mono) > src_len:
+                vocals_mono = vocals_mono[:src_len]
+            else:
+                vocals_mono = np.pad(vocals_mono, (0, src_len - len(vocals_mono)))
         _validate_segment_duration(st['start'], st['end'], vocals_mono)
         rebuilt = {'start': st['start'], 'end': st['end'], 'audio': vocals_mono}
         # Isolation rewrites the audio but must not lose provenance the VAD stage
@@ -295,8 +374,6 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             if key in st:
                 rebuilt[key] = st[key]
         item_out[idx]['segs'][sdx] = rebuilt
-        # Free the heavy buffers now that this segment is done.
-        st['mixture'] = st['result'] = st['counter'] = None
 
 
 # ---------------------------------------------------------------------------
@@ -312,12 +389,15 @@ def load_vocal_isolation(
     compute_type: str = "float32",
     vram_checks: bool = True,
     local_files_only: bool = False,
+    segment_mode: Optional[str] = None,
 ) -> VocalIsolationProcessor:
     """Load a vocal isolation model and return a processor.
 
     The checkpoint is downloaded from HuggingFace on first use and cached.
     model_dir, if given, overrides the default HuggingFace cache directory.
-    batch_size controls how many fixed-size chunks are run through the model at once.
+    batch_size controls how many fixed-size chunks are run through the model at once
+    (chunked mode only; whole mode runs one segment per pass).
+    segment_mode overrides config.inference.mode ("whole" or "chunked").
     compute_type="float16" halves the model's weight VRAM footprint; inference still
     runs under the existing autocast (see infer_fn) so activations/STFT stay numerically
     safe regardless of the stored weight dtype.
@@ -376,4 +456,5 @@ def load_vocal_isolation(
         config=config,
         device=torch_device,
         batch_size=batch_size,
+        segment_mode=segment_mode,
     )

@@ -73,6 +73,11 @@ class PipelineConfig:
     vocal_isolation_method: str = "none"
     vocal_isolation_batch_size: int = 4
     vocal_isolation_compute_type: str = "float32"
+    # How the isolation model consumes a segment. Must match whatever the ASR
+    # model was trained on: a model trained on whole-mode isolated audio meets
+    # different artifacts under chunked mode. (Direct load_vocal_isolation callers
+    # that pass segment_mode=None instead defer to the bundled model yaml.)
+    vocal_isolation_segment_mode: str = "chunked"
 
     # ASR options
     suppress_tokens: str = "-1"

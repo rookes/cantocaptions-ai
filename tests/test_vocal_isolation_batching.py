@@ -52,8 +52,8 @@ class _CountingMbRoformerProcessor(MbRoformerProcessor):
         self.peak_alive = max(self.peak_alive, self.alive)
         return result
 
-    def _finalize_segment(self, key, st, item_out):
-        super()._finalize_segment(key, st, item_out)
+    def _finalize_segment(self, key, st, estimated, item_out):
+        super()._finalize_segment(key, st, estimated, item_out)
         self.alive -= 1
 
 
@@ -145,6 +145,92 @@ class TestMbRoformerRunCorrectness(unittest.TestCase):
         for item in out:
             for seg in item["vad_segments"]:
                 self.assertEqual(len(seg["audio"]), 1600)
+
+
+class TestWholeSegmentMode(unittest.TestCase):
+    """`whole` mode: one forward pass per segment at its natural length.
+
+    chunk_size belongs to the inference harness, not the model, so a segment can
+    be separated in a single pass -- dropping the 2x overlap redundancy and the
+    chunk seams. These guard the two properties the dataset build depends on:
+    exact output length, and the long-segment fallback that bounds peak VRAM.
+    """
+
+    @staticmethod
+    def _config(whole_max_s=35.0, border_s=1.0, sample_rate=16000):
+        return OmegaConf.create({
+            "model": {"sample_rate": sample_rate},
+            "inference": {
+                "chunk_size": 128, "num_overlap": 2,
+                "mode": "whole", "border_s": border_s, "whole_max_s": whole_max_s,
+            },
+        })
+
+    def test_one_forward_pass_per_segment(self):
+        model = _FakeMbModel()
+        proc = MbRoformerProcessor(
+            model=model, config=self._config(),
+            device=torch.device("cpu"), batch_size=4,
+        )
+        items = _make_items(n_files=3, segs_per_file=4, audio_len=1600)
+        out = proc.run(items, debug_dir=None, load_debug_dir=None)
+
+        # 12 segments, all under whole_max_s -> exactly 12 calls. The chunked path
+        # would slide a 128-sample window over each and call many more times.
+        self.assertEqual(model.calls, 12)
+        for item in out:
+            for seg in item["vad_segments"]:
+                self.assertEqual(len(seg["audio"]), 1600)
+
+    def test_output_length_is_exact_across_resample_round_trip(self):
+        # 16k -> 44.1k -> 16k is not length-preserving (ratio 2.75625, each leg
+        # rounds independently). Segments came back up to ~9 ms short before
+        # _finalize_segment pinned them to the source length.
+        proc = MbRoformerProcessor(
+            model=_FakeMbModel(), config=self._config(sample_rate=44100),
+            device=torch.device("cpu"), batch_size=4,
+        )
+        for audio_len in (1600, 2411, 4099):
+            with self.subTest(audio_len=audio_len):
+                items = _make_items(n_files=1, segs_per_file=2, audio_len=audio_len)
+                out = proc.run(items, debug_dir=None, load_debug_dir=None)
+                for seg in out[0]["vad_segments"]:
+                    self.assertEqual(len(seg["audio"]), audio_len)
+
+    def test_long_segment_falls_back_to_chunked(self):
+        # whole_max_s below the segment length forces the chunked path, which
+        # bounds peak VRAM for a segment longer than VAD is supposed to emit.
+        model = _FakeMbModel()
+        # 1600 samples @ 16 kHz = 0.1 s; cap at 0.01 s so every segment overflows.
+        proc = MbRoformerProcessor(
+            model=model, config=self._config(whole_max_s=0.01),
+            device=torch.device("cpu"), batch_size=4,
+        )
+        items = _make_items(n_files=1, segs_per_file=2, audio_len=1600)
+        out = proc.run(items, debug_dir=None, load_debug_dir=None)
+
+        # Chunked: a 128-sample window over ~1600 samples is many calls, not 2.
+        self.assertGreater(model.calls, 2)
+        for seg in out[0]["vad_segments"]:
+            self.assertEqual(len(seg["audio"]), 1600)
+
+    def test_unknown_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            MbRoformerProcessor(
+                model=_FakeMbModel(), config=self._config(),
+                device=torch.device("cpu"), segment_mode="sideways",
+            )
+
+    def test_segment_mode_argument_overrides_config(self):
+        model = _FakeMbModel()
+        proc = MbRoformerProcessor(
+            model=model, config=self._config(),
+            device=torch.device("cpu"), batch_size=4, segment_mode="chunked",
+        )
+        self.assertEqual(proc._mode, "chunked")
+        items = _make_items(n_files=1, segs_per_file=1, audio_len=1600)
+        proc.run(items, debug_dir=None, load_debug_dir=None)
+        self.assertGreater(model.calls, 1)
 
 
 if __name__ == "__main__":

@@ -8,9 +8,33 @@ import torch.nn.functional as F
 
 from einops import rearrange, reduce
 
+try:  # torch >= 2.1
+    from torch.nn.attention import SDPBackend as _SDPBackend, sdpa_kernel as _sdpa_kernel
+except ImportError:  # pragma: no cover - older torch
+    _SDPBackend = _sdpa_kernel = None
+
 # constants
 
 FlashAttentionConfig = namedtuple('FlashAttentionConfig', ['enable_flash', 'enable_math', 'enable_mem_efficient'])
+
+
+def _sdpa_backends(config: FlashAttentionConfig):
+    """Context manager restricting SDPA to the backends `config` enables.
+
+    torch.backends.cuda.sdp_kernel is deprecated (and warns on every call, which
+    this enters depth x (time + freq) x 2 times per forward). Prefer the modern
+    torch.nn.attention.sdpa_kernel where it exists.
+    """
+    if _sdpa_kernel is None:
+        return torch.backends.cuda.sdp_kernel(**config._asdict())
+    backends = []
+    if config.enable_flash:
+        backends.append(_SDPBackend.FLASH_ATTENTION)
+    if config.enable_mem_efficient:
+        backends.append(_SDPBackend.EFFICIENT_ATTENTION)
+    if config.enable_math:
+        backends.append(_SDPBackend.MATH)
+    return _sdpa_kernel(backends)
 
 # helpers
 
@@ -53,9 +77,14 @@ class Attend(nn.Module):
         if not torch.cuda.is_available() or not flash:
             return
 
+        # Upstream gated flash on `major == 8 and minor == 0`, i.e. A100 only, so
+        # every other SM -- including sm_86/89/90 consumer and Hopper parts -- fell
+        # back to math + mem-efficient. Flash is supported on all of sm_80+.
+        # Measured worth ~0% here (attention is not this model's bottleneck at
+        # seq_len ~801), but there is no reason to keep asking for the slow kernel.
         device_properties = torch.cuda.get_device_properties(torch.device('cuda'))
 
-        if device_properties.major == 8 and device_properties.minor == 0:
+        if device_properties.major >= 8:
             self.cuda_config = FlashAttentionConfig(True, False, False)
         else:
             self.cuda_config = FlashAttentionConfig(False, True, True)
@@ -69,7 +98,7 @@ class Attend(nn.Module):
 
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, softmax_scale
 
-        with torch.backends.cuda.sdp_kernel(**config._asdict()):
+        with _sdpa_backends(config):
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p = self.dropout if self.training else 0.

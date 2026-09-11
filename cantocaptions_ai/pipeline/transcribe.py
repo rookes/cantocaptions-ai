@@ -964,6 +964,7 @@ def _execute_pipeline(
                 compute_type=cfg.vocal_isolation_compute_type,
                 vram_checks=cfg.vram_checks,
                 local_files_only=cfg.model_cache_only,
+                segment_mode=cfg.vocal_isolation_segment_mode,
             )
             stage.mark_inference_start()
             items = vocal_isolation_processor.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
