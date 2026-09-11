@@ -36,20 +36,13 @@
 "膩" = "泥" 
 "𠺻" = "級"
 "柚" = "油"
+"煨" = "會"
+"掟" = "訂"
+"棒" = "彭"
+
 
 # --- sentence-final particles the automatic tiers cannot reach -------------------------
-#
-# Both are contrast-set strict forms (rules/standardization.toml, sets "aa" and "zek"), so
-# they are concentrated in exactly the hand-standardized material a dataset build most wants
-# to keep -- 229 and 228 occurrences in the CantoCaptions corpus, the two largest unresolved
-# misses left after the homophone tier.
-#
-# 𠻺 is aa6 and no in-vocabulary character reads aa6, so the homophone tier finds nothing.
-# 呀 (aa3/aa4) is the same syllable at a different tone: the `near` tier would propose it,
-# but naming it here gets it at the homophone level without relaxing every other character.
 "𠻺" = "呀"
-#
-# 唧 is zek1. 啫 is ze1 -- same initial and nucleus, missing the -k coda -- so it is not a
-# homophone and no tier will offer it. Hand-picked as the closest available: the vocabulary
-# holds nothing reading zek at any tone.
+
+# 唧 is zek1. 啫 is ze1. Often used interchangeably, so alvinlii's model should detect just fine
 "唧" = "啫"

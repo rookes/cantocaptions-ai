@@ -47,7 +47,7 @@ logger = get_logger(__name__)
 CONTEXT_TEMPLATES: Dict[str, str] = {
     "none": "",
     "bare": "{text}",
-    "labelled": "參考翻譯：{text}",
+    "labelled": "［普通話參考字幕］：{text}",
     "instruct": "Use the following translation of this audio to assist transcription: {text}",
 }
 

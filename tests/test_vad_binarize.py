@@ -101,6 +101,80 @@ class TestMaxDurationCap(unittest.TestCase):
         self.assertAlmostEqual(got[0][1], 7.01, places=1)
 
 
+class TestMinSplitDuration(unittest.TestCase):
+    """The min-cut's search floor: None keeps the old max_duration/2 behavior; a caller-supplied
+    value (Pyannote.merge_chunks passes pad_onset + pad_offset + min_duration_off) widens the
+    search into the first half of the window too, so a real dip there is not ignored just
+    because it is early. cover_chunks must be unaffected -- see its own tests above.
+
+    Both dips stay well above ``offset`` (0.3) so hysteresis/smoothing never treat either as a
+    real gap -- exactly like the existing test_split_prefers_the_lowest_scoring_frame above --
+    isolating this to a pure _split_long search-window question.
+    """
+
+    def _curve_with_two_dips(self, total=16.0):
+        # max_duration=10 so the old floor is 5.0. A deeper dip sits at 2.0-2.1 (first half,
+        # unreachable by the old floor) and a shallower one at 7.0-7.1 (second half, what the
+        # old code would have picked instead).
+        n = int(round(total / FRAME))
+        data = np.full((n, 1), 0.9, dtype=np.float32)
+        data[int(2.0 / FRAME):int(2.1 / FRAME), 0] = 0.32
+        data[int(7.0 / FRAME):int(7.1 / FRAME), 0] = 0.35
+        return SlidingWindowFeature(data, SlidingWindow(start=0.0, duration=FRAME, step=FRAME))
+
+    def test_default_none_ignores_the_first_half_as_before(self):
+        curve = self._curve_with_two_dips()
+        got = regions(Binarize(onset=0.5, offset=0.3, max_duration=10)(curve))
+        self.assertGreater(len(got), 1)
+        self.assertAlmostEqual(got[0][1], 7.01, places=1)
+
+    def test_small_floor_finds_the_deeper_earlier_dip(self):
+        curve = self._curve_with_two_dips()
+        got = regions(Binarize(onset=0.5, offset=0.3, max_duration=10,
+                               min_split_duration=1.0)(curve))
+        self.assertGreater(len(got), 1)
+        self.assertAlmostEqual(got[0][1], 2.01, places=1)
+
+    def test_floor_still_bounds_progress_near_start(self):
+        # The only dip sits inside the excluded zone below the floor; the search must not
+        # reach back for it, so the first split lands at (or past) the floor itself instead.
+        n = int(round(20.0 / FRAME))
+        data = np.full((n, 1), 0.9, dtype=np.float32)
+        data[int(0.3 / FRAME):int(0.4 / FRAME), 0] = 0.4
+        curve = SlidingWindowFeature(data, SlidingWindow(start=0.0, duration=FRAME, step=FRAME))
+        got = regions(Binarize(onset=0.5, offset=0.3, max_duration=10,
+                               min_split_duration=1.0)(curve))
+        self.assertGreater(len(got), 1)
+        self.assertGreaterEqual(got[0][1], 1.0 - 1e-6)
+        self.assertNotAlmostEqual(got[0][1], 0.35, places=1)
+
+    def test_merge_chunks_wires_the_floor_from_configured_vad_params(self):
+        # End-to-end through Pyannote.merge_chunks, the actual production call site. Total
+        # duration is chosen just over chunk_size (10.5 > 10) so exactly one split is needed
+        # and Vad.merge_chunks' own outer grouping -- which would otherwise re-absorb a small
+        # early piece back into its neighbour -- cannot: the combined span already exceeds
+        # chunk_size regardless of where the inner split landed, so the split survives to the
+        # final output and is a direct probe of which one _split_long picked.
+        n = int(round(10.5 / FRAME))
+        data = np.full((n, 1), 0.9, dtype=np.float32)
+        data[int(2.0 / FRAME):int(2.1 / FRAME), 0] = 0.32  # only reachable with the new floor
+        curve = SlidingWindowFeature(data, SlidingWindow(start=0.0, duration=FRAME, step=FRAME))
+
+        merged = Pyannote.merge_chunks(curve, chunk_size=10, onset=0.5, offset=0.3,
+                                       pad_onset=0.2, pad_offset=0.2, min_duration_off=0.25)
+        starts = sorted(m["start"] for m in merged)
+        self.assertTrue(any(abs(s - 2.01) < 0.1 for s in starts[1:]),
+                        f"expected a split near 2.0s, got starts={starts}")
+
+    def test_cover_chunks_keeps_the_old_half_window_floor(self):
+        # cover_chunks builds its own Binarize(max_duration=chunk_size) with no
+        # min_split_duration -- the earlier, deeper dip must NOT be picked; --realign's
+        # "every piece is at least half the budget" guarantee must not move.
+        chunks = Pyannote.cover_chunks(self._curve_with_two_dips(), 10, 16.0)
+        cuts = sorted(c["start"] for c in chunks[1:])
+        self.assertAlmostEqual(cuts[0], 7.01, places=1)
+
+
 class TestClamping(unittest.TestCase):
     def test_padding_never_produces_a_negative_start(self):
         # A negative start becomes a negative sample index when the caller slices the

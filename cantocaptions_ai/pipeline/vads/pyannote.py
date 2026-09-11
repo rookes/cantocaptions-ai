@@ -69,7 +69,9 @@ class Binarize:
        crossings clip word onsets and tails, and a single sub-threshold frame (~17 ms) tears a
        region in half.
     3. **Min-cut** — any region still longer than ``max_duration`` is split at the
-       lowest-scoring frame in the second half of the over-long window, repeatedly. Splits are
+       lowest-scoring frame in the over-long window, repeatedly. By default the search is
+       limited to the window's second half (WhisperX's min-cut); ``min_split_duration`` widens
+       it to also cover the first half, down to that floor — see ``_split_long``. Splits are
        contiguous (the split timestamp ends one piece and starts the next), so no audio is
        dropped.
 
@@ -97,6 +99,11 @@ class Binarize:
         Defaults to 0s.
     max_duration: float
         The maximum length of an active segment, divides segment at timestamp with lowest score.
+    min_split_duration : float, optional
+        Search floor for the min-cut, in seconds. ``None`` (default) searches only the second
+        half of the over-long window (``max_duration / 2``). A smaller value widens the search
+        into the first half too, so a genuine low-score dip before the midpoint can be found
+        instead of forcing a cut deep inside continuous speech. See ``_split_long``.
     Reference
     ---------
     Gregory Gelly and Jean-Luc Gauvain. "Minimum Word Error Training of
@@ -116,7 +123,8 @@ class Binarize:
             min_duration_off: float = 0.0,
             pad_onset: float = 0.0,
             pad_offset: float = 0.0,
-            max_duration: float = float('inf')
+            max_duration: float = float('inf'),
+            min_split_duration: Optional[float] = None,
     ):
 
         super().__init__()
@@ -131,6 +139,9 @@ class Binarize:
         self.min_duration_off = min_duration_off
 
         self.max_duration = max_duration
+        # None preserves the original WhisperX-style "second half only" search
+        # (min_split_duration == max_duration / 2); see _split_long.
+        self.min_split_duration = min_split_duration
 
     def _hysteresis(self, timestamps, k_scores):
         """Stage 1: raw (start, end) regions from hysteresis thresholding, no smoothing."""
@@ -178,17 +189,42 @@ class Binarize:
     def _split_long(self, regions, timestamps, k_scores):
         """Stage 3: cap region length, cutting at the lowest-scoring frame.
 
-        Searches the second half of the over-long window (as WhisperX's min-cut does) so each
-        emitted piece is at least ``max_duration / 2`` and the loop always makes progress.
+        The search floor is ``max_duration / 2`` by default (WhisperX's min-cut: search only
+        the second half of the over-long window, so each emitted piece is at least half the
+        budget and the loop always makes progress). ``min_split_duration`` -- when the caller
+        supplies one -- lowers that floor instead, so the search also covers the *first* half.
+
+        This matters because ``max_duration/2`` is an argument about loop termination, not
+        about the audio: it guarantees *some* cut exists, not a *good* one. In a long run of
+        genuinely continuous speech (a monologue with no pause anywhere near the midpoint),
+        the lowest-scoring frame in the second half is still deep inside active speech --
+        there is no real pause there to find, so the cut lands wherever, indistinguishable
+        from random. If a real, deeper dip exists earlier in the window (before the midpoint),
+        forbidding the search from ever looking there is what forces the bad cut.
+
+        ``min_split_duration`` still has to stop the search from reaching all the way back to
+        ``start`` -- a floor of 0 would let a single noisy low-scoring frame right next to the
+        previous cut immediately become the next one, fragmenting a region into many
+        near-zero-length pieces before the loop's forward-progress guarantee (still technically
+        respected, since ``split_t > start`` whenever ``min_split_duration > 0``) becomes
+        practically meaningless. The caller is expected to derive it from the same
+        onset/offset/pad/min_duration_off configuration already governing hysteresis and
+        smoothing -- see ``Pyannote.merge_chunks`` -- rather than pass a new unrelated
+        constant. ``None`` (the default, and what ``cover_chunks`` uses -- see its own
+        docstring for why that guarantee must not move) preserves the original
+        ``max_duration / 2`` behaviour exactly.
+
         The split timestamp both ends one piece and starts the next, so no audio is dropped.
         """
         if self.max_duration == float("inf"):
             return regions
 
+        floor = self.min_split_duration if self.min_split_duration is not None else self.max_duration / 2
+
         out = []
         for start, end in regions:
             while end - start > self.max_duration:
-                lo = bisect.bisect_left(timestamps, start + self.max_duration / 2)
+                lo = bisect.bisect_left(timestamps, start + floor)
                 hi = bisect.bisect_right(timestamps, start + self.max_duration)
                 if hi <= lo:
                     break
@@ -318,10 +354,18 @@ class Pyannote(Vad):
                      min_duration_on: float = 0.0,
                      ):
         assert chunk_size > 0
+        # The min-cut's search floor: the shortest span that could hold a boundary the rest
+        # of this configuration would treat as real -- a real gap has to clear
+        # min_duration_off to not be bridged by _smooth, and pad_onset/pad_offset is the
+        # context the pipeline always attaches to one. Anything shorter is indistinguishable
+        # from noise, so the search still refuses to land there; anything at or beyond it is
+        # fair game, including before max_duration/2. See _split_long for the full rationale.
+        min_split_duration = pad_onset + pad_offset + min_duration_off
         binarize = Binarize(
             max_duration=chunk_size, onset=onset, offset=offset,
             pad_onset=pad_onset, pad_offset=pad_offset,
             min_duration_off=min_duration_off, min_duration_on=min_duration_on,
+            min_split_duration=min_split_duration,
         )
         segments = binarize(segments)
         segments_list = []

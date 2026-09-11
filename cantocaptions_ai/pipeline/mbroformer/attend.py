@@ -1,4 +1,4 @@
-from functools import wraps
+from functools import wraps, lru_cache
 from packaging import version
 from collections import namedtuple
 
@@ -35,6 +35,26 @@ def _sdpa_backends(config: FlashAttentionConfig):
     if config.enable_math:
         backends.append(_SDPBackend.MATH)
     return _sdpa_kernel(backends)
+
+
+@lru_cache(maxsize=None)
+def _flash_attention_usable(device_index: int) -> bool:
+    """Probe whether this torch build can actually run flash SDPA on this GPU.
+
+    Compute capability alone doesn't say so: some platform wheels (Windows CUDA
+    builds in particular) ship without the flash-attention kernel compiled in at
+    all, even on a qualifying sm_80+ card. Gating on `major >= 8` alone then asks
+    `sdpa_kernel` to restrict to a backend that doesn't exist, and it raises
+    "No available kernel" instead of silently falling back. Cached per device
+    since the answer never changes for a given process.
+    """
+    try:
+        q = torch.zeros(1, 1, 8, 8, device=f'cuda:{device_index}', dtype=torch.float16)
+        with _sdpa_backends(FlashAttentionConfig(True, False, False)):
+            F.scaled_dot_product_attention(q, q, q)
+        return True
+    except RuntimeError:
+        return False
 
 # helpers
 
@@ -79,12 +99,16 @@ class Attend(nn.Module):
 
         # Upstream gated flash on `major == 8 and minor == 0`, i.e. A100 only, so
         # every other SM -- including sm_86/89/90 consumer and Hopper parts -- fell
-        # back to math + mem-efficient. Flash is supported on all of sm_80+.
-        # Measured worth ~0% here (attention is not this model's bottleneck at
-        # seq_len ~801), but there is no reason to keep asking for the slow kernel.
+        # back to math + mem-efficient. Flash is supported on all of sm_80+ *builds
+        # that were compiled with it* -- some platform wheels (Windows CUDA in
+        # particular) are not, so the compute-capability check alone is not enough;
+        # see _flash_attention_usable. Measured worth ~0% here (attention is not
+        # this model's bottleneck at seq_len ~801), but there is no reason to keep
+        # asking for the slow kernel where flash does work.
         device_properties = torch.cuda.get_device_properties(torch.device('cuda'))
+        device_index = torch.cuda.current_device()
 
-        if device_properties.major >= 8:
+        if device_properties.major >= 8 and _flash_attention_usable(device_index):
             self.cuda_config = FlashAttentionConfig(True, False, False)
         else:
             self.cuda_config = FlashAttentionConfig(False, True, True)

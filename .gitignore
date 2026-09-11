@@ -232,6 +232,7 @@ Claude.md
 /*.mp4
 /*.srt
 /*.wav
+/*.webm
 
 # Informal test directories
 temp/

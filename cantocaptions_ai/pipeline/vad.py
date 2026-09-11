@@ -197,7 +197,7 @@ def load_vad(
     chunk_size: int = 30,
     vad_model: Optional[Vad] = None,
     use_auth_token: Optional[Union[str, bool]] = None,
-    vad_pad_onset: float = 0.20,
+    vad_pad_onset: float = 1.00,
     vad_pad_offset: float = 0.20,
     vad_min_duration_off: float = 0.25,
     reference_cues: Optional[List[SingleSegment]] = None,
