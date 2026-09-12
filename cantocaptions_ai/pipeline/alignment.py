@@ -6,7 +6,7 @@ import bisect
 from dataclasses import dataclass
 import math
 import time
-from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Union, List, Tuple
+from typing import Callable, Dict, Iterable, Mapping, NamedTuple, Optional, Sequence, Union, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -265,6 +265,53 @@ def merge_repeats(path, transcript):
         )
         i1 = i2
     return segments
+
+
+class AlignedCandidate(NamedTuple):
+    """The winner of :func:`align_best_of`: which candidate text it was, its
+    per-character segments (already run through `merge_repeats`), and its mean
+    path score."""
+
+    text: str
+    segments: List["Segment"]
+    mean_score: float
+
+
+def align_best_of(emission, dictionary, blank_id, candidates: Sequence[str]) -> Optional[AlignedCandidate]:
+    """Score each of `candidates` against the SAME `emission` and keep the best.
+
+    Generic over any list of candidate strings -- not particle- or numeral-
+    specific. Exists because the particle `SpotCheck` rescoring in
+    `_align_segment` below cannot be reused for this: it swaps a single character
+    for another single character at a fixed frame, which only works because every
+    candidate has the same length and so leaves the rest of the path's frame
+    assignments valid. A numeral reading changes the token count itself (`一千八
+    百九十一` vs `一八九一`), so each candidate needs its own `get_trellis`/
+    `backtrack` walk; only the (expensive) `emission` is shared across them.
+
+    Candidates are tokenized against `dictionary`, dropping characters it has no
+    token for (same policy as the rest of this module) -- a candidate that ends
+    up with zero usable characters is skipped rather than raising. Returns `None`
+    if every candidate fails to produce a usable token sequence or to align.
+    """
+    best: Optional[tuple[str, list, float]] = None
+    for text in candidates:
+        chars = [c for c in text if c in dictionary]
+        if not chars:
+            continue
+        tokens = [dictionary[c] for c in chars]
+        trellis = get_trellis(emission, tokens, blank_id)
+        path = backtrack(trellis, emission, tokens, blank_id)
+        if path is None:
+            continue
+        mean_score = sum(p.score for p in path) / len(path)
+        if best is None or mean_score > best[2]:
+            best = (text, chars, mean_score)
+            best_path = path
+    if best is None:
+        return None
+    text, chars, mean_score = best
+    return AlignedCandidate(text, merge_repeats(best_path, chars), mean_score)
 
 
 def merge_words(segments, separator="|"):

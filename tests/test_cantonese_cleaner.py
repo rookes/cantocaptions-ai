@@ -322,6 +322,19 @@ class TestChineseNumbers(unittest.TestCase):
         self.assertEqual(convert_chinese_numbers("二十五點三十分"), "25點30分")
         self.assertEqual(convert_chinese_numbers("三點五"), "3點5")
 
+    def test_decimal_fraction_is_digit_by_digit_not_place_value(self):
+        # A bare-digit fraction (no unit) is never a clock minute, so it reads
+        # digit-by-digit -- a leading 零 must not be silently dropped, and a
+        # multi-digit fraction with no leading zero must still convert (it was
+        # previously rejected outright as an "ambiguous digit string").
+        self.assertEqual(convert_chinese_numbers("零點零一"), "0點01")
+        self.assertEqual(convert_chinese_numbers("三點一四"), "3點14")
+        self.assertEqual(convert_chinese_numbers("零點零零一"), "0點001")
+        self.assertEqual(convert_chinese_numbers("十四點零八"), "14點08")
+        # A fraction that DOES carry a unit is still a place-value reading
+        # (unaffected by the digit-literal fraction path above).
+        self.assertEqual(convert_chinese_numbers("八點六十"), "8點60")
+
     def test_clock_face_minute_is_padded(self):
         # ...but only where the pair really could be a clock time.
         self.assertEqual(convert_chinese_numbers("我八點零五分返嚟"), "我8點05分返嚟")

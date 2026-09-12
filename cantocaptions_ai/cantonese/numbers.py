@@ -10,6 +10,12 @@ Three contexts are recognised, in this order:
     hour in ``MIN_HOUR..MAX_HOUR``, minute <= ``MAX_MINUTE``) the minute is
     zero-padded to read as a clock face: ``八點零五分`` -> ``8點05分``.
 
+    A bare-digit fraction (no ``十``/``百``/... unit) is never a clock minute, so it
+    converts digit-by-digit instead of by place value: ``零點零一`` -> ``0點01`` (not
+    ``0點1``, which would silently lose the leading zero), ``三點一四`` -> ``3點14``.
+    A fraction that DOES carry a unit (``八點六十`` above) still reads by place
+    value, since nobody speaks a decimal digit-by-digit through a ``十``.
+
     With nothing after the ``點`` the reading is not fixed, so the numeral converts
     only once it is too large to be an hour -- above ``MAX_BARE_HOUR``, a bare hour
     being written on the 12-hour clock. ``五點`` and ``十二點`` stay; ``十九點`` ->
@@ -166,6 +172,18 @@ def _parse(text: str) -> Optional[_Number]:
     )
 
 
+def _digits_literal(text: str) -> Optional[str]:
+    """Digit-by-digit transcription of a bare Chinese-digit run (no units) --
+    the reading a decimal fraction always takes: ``零一`` is the two digits "0","1"
+    (0.01), not the place-value integer 1 that :func:`_parse` would collapse it to.
+    Returns ``None`` if `text` carries a unit character (十/百/千/萬/億/廿/卅), i.e. it
+    reads as a place-value quantity (a clock minute like 三十五), not literal digits.
+    """
+    if not text or any(c in _UNITS or c in _COLLOQUIAL_TENS for c in text):
+        return None
+    return ''.join(str(_CHINESE_DIGITS[c]) for c in text)
+
+
 def _should_convert(number: _Number) -> bool:
     """Whether a plain quantity (no date, name or time context) reads better in digits."""
     if not number.max_unit:
@@ -192,10 +210,13 @@ def convert_chinese_numbers(text: str) -> str:
     def point_replacer(match):
         """A 點 construct: a clock time, or a point/degree reading of the same shape."""
         left = _parse(match.group(1))
-        right = _parse(match.group(2)) if match.group(2) else None
         if left is None or left.colloquial:
             return match.group(0)
-        if match.group(2) and (right is None or right.colloquial):
+
+        right_text = match.group(2)
+        right = _parse(right_text) if right_text else None        # place-value (clock minutes)
+        right_literal = _digits_literal(right_text) if right_text else None  # digit-by-digit
+        if right_text and right_literal is None and (right is None or right.colloquial):
             return match.group(0)
 
         source = match.string
@@ -206,16 +227,25 @@ def convert_chinese_numbers(text: str) -> str:
         if after.startswith(_QUARTER_HOUR_UNIT):
             return match.group(0)  # 十點四個字
 
-        if right is None:
+        if right_text is None:
             # Nothing after the 點 to fix the reading, so it converts only once it is
             # too large to be an hour.
             return f'{left.value}點' if left.value > MAX_BARE_HOUR else match.group(0)
 
-        if (after.startswith('分')
+        if (right is not None and not right.colloquial
+                and after.startswith('分')
                 and MIN_HOUR <= left.value <= MAX_HOUR
                 and right.value <= MAX_MINUTE):
             # A clock face, so the minute is zero-padded: 8點05分, not 8點5分.
             return f'{left.value}點{right.value:02d}'
+
+        if right_literal is not None:
+            # A decimal/degree fraction: literal digits, not a place-value quantity
+            # -- 零一 is "0","1" (0.01), never the collapsed integer 1.
+            return f'{left.value}點{right_literal}'
+
+        # right_text carries a unit (三十五) but didn't match a recognised clock
+        # minute above -- fall back to its place-value reading, as before this fix.
         return f'{left.value}點{right.value}'
 
     text = _POINT_PATTERN.sub(point_replacer, text)
