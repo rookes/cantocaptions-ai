@@ -907,6 +907,7 @@ def _execute_pipeline(
                     'audio_path': audio_paths[i],
                     'audio_track': _select_audio_track(audio_paths[i]),
                     'audio_downmix': cfg.audio_downmix,
+                    'audio_normalize': cfg.audio_normalize,
                 }
                 for i in vad_indices
             ]

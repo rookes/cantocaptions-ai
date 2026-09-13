@@ -57,6 +57,7 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
             item['audio_path'],
             audio_track=item.get('audio_track', 0),
             downmix=item.get('audio_downmix', 'mix'),
+            normalize=item.get('audio_normalize', False),
         )
 
     @staticmethod
@@ -66,6 +67,8 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
             out['audio_track'] = item['audio_track']
         if 'audio_downmix' in item:
             out['audio_downmix'] = item['audio_downmix']
+        if 'audio_normalize' in item:
+            out['audio_normalize'] = item['audio_normalize']
         return out
 
     def process(self, input: np.ndarray, *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:

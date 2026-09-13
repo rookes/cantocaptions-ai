@@ -101,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     audio_grp.add_argument("--audio_start", type=float, default=argparse.SUPPRESS, help="seconds of audio to skip before processing")
     audio_grp.add_argument("--audio_end", type=float, default=argparse.SUPPRESS, help="seconds of audio to cut from the ending")
     audio_grp.add_argument("--audio_downmix", type=str, default=argparse.SUPPRESS, choices=["mix", "center"], help="how to reduce a multichannel track to mono. 'center' takes the front-center channel alone, which on a 5.1 film soundtrack is largely the dialogue stem and is close to free vocal isolation; layouts with no centre channel fall back to a full downmix.")
+    audio_grp.add_argument("--no_audio_normalize", dest="audio_normalize", action="store_false", default=argparse.SUPPRESS, help="do not level the file before processing. Levelling is on by default because the training corpus is cut that way; turn it off only to reproduce an older run, since an unlevelled file is a different input distribution than the model was trained on.")
 
     vad_grp = parser.add_argument_group("vad")
     vad_grp.add_argument("--vad_method", type=str, default=argparse.SUPPRESS, choices=["pyannote"], help="VAD method to be used")

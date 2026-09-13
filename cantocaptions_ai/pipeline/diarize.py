@@ -132,6 +132,7 @@ class FileDiarization(_BaseDiarization):
             item['audio_path'],
             audio_track=item.get('audio_track', 0),
             downmix=item.get('audio_downmix', 'mix'),
+            normalize=item.get('audio_normalize', False),
         )
 
     def process(

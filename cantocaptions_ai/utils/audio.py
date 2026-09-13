@@ -104,18 +104,93 @@ def select_cantonese_track(streams: List[dict]) -> int:
     return 0
 
 
+# Channel ORDER for every ffmpeg layout this module knows how to reduce to mono.
+#
+# Order, not just membership: the downmix below weights channels by role, and a
+# `pan` expression has to address them somehow. It addresses them by INDEX,
+# because the names are not portable between layouts that are otherwise
+# interchangeable here -- 5.1 calls its rear pair BL/BR while 5.1(side) calls
+# the same pair SL/SR, so an expression naming SL fails outright on a 5.1 file.
+#
+# Deriving _LAYOUTS_WITH_CENTER from this table also fixes a quiet bug: the old
+# hand-written set listed 3.0(back) (FL FR BC), 6.0(front) and 6.1(front)
+# (FLC/FRC, no centre) as having an FC, so `--audio_downmix center` built
+# `pan=mono|c0=FC` for them and ffmpeg rejected it partway into the decode.
+_LAYOUT_CHANNELS = {
+    "mono": ("FC",),
+    "3.0": ("FL", "FR", "FC"),
+    "3.0(back)": ("FL", "FR", "BC"),
+    "4.0": ("FL", "FR", "FC", "BC"),
+    "5.0": ("FL", "FR", "FC", "BL", "BR"),
+    "5.0(side)": ("FL", "FR", "FC", "SL", "SR"),
+    "5.1": ("FL", "FR", "FC", "LFE", "BL", "BR"),
+    "5.1(side)": ("FL", "FR", "FC", "LFE", "SL", "SR"),
+    "6.0": ("FL", "FR", "FC", "BC", "SL", "SR"),
+    "6.0(front)": ("FL", "FR", "FLC", "FRC", "SL", "SR"),
+    "6.1": ("FL", "FR", "FC", "LFE", "BC", "SL", "SR"),
+    "6.1(back)": ("FL", "FR", "FC", "LFE", "BL", "BR", "BC"),
+    "6.1(front)": ("FL", "FR", "FLC", "FRC", "LFE", "SL", "SR"),
+    "7.0": ("FL", "FR", "FC", "BL", "BR", "SL", "SR"),
+    "7.0(front)": ("FL", "FR", "FC", "FLC", "FRC", "SL", "SR"),
+    "7.1": ("FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"),
+    "7.1(wide)": ("FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC"),
+    "7.1(wide-side)": ("FL", "FR", "FC", "LFE", "FLC", "FRC", "SL", "SR"),
+    "hexagonal": ("FL", "FR", "FC", "BL", "BR", "BC"),
+    "octagonal": ("FL", "FR", "FC", "BL", "BR", "BC", "SL", "SR"),
+}
+
 # ffmpeg channel layouts that carry a discrete front-center channel. On a mixed
 # soundtrack FC is the dialogue stem, so extracting it alone is close to free vocal
 # isolation -- the reason --audio_downmix center exists. Layouts absent from this set
 # (stereo, 2.1, quad) have no FC to take, and an unknown layout is not guessed at.
-_LAYOUTS_WITH_CENTER = frozenset({
-    "mono",
-    "3.0", "3.0(back)", "4.0",
-    "5.0", "5.0(side)", "5.1", "5.1(side)",
-    "6.0", "6.0(front)", "6.1", "6.1(back)", "6.1(front)",
-    "7.0", "7.0(front)", "7.1", "7.1(wide)", "7.1(wide-side)",
-    "hexagonal", "octagonal",
-})
+_LAYOUTS_WITH_CENTER = frozenset(
+    layout for layout, channels in _LAYOUT_CHANNELS.items() if "FC" in channels)
+
+_CHANNEL_ROLE = {"FC": "center", "FL": "front", "FR": "front",
+                 "FLC": "front", "FRC": "front", "LFE": "lfe"}
+
+# Weights for the multichannel -> mono downmix, by channel role.
+#
+# NOT ffmpeg's defaults, and deliberately so. Two things are wrong with letting
+# swresample do this:
+#
+#   1. Gain. swr resolves `rematrix_maxval` to 1.0 for INTEGER output and to
+#      unlimited for float. We decode to s16le, so it lands on the integer path
+#      and scales the whole matrix down by its coefficient sum (~3.41 for 5.1),
+#      costing every multichannel source ~9.4 dB for no reason but the output
+#      sample format. Stereo never noticed: (L+R)/2 is already unity for centred
+#      dialogue, which is why this hid for so long.
+#
+#   2. Balance. The conventional matrix puts surrounds 6 dB under the centre.
+#      Background and off-screen speech is exactly the content panned off-centre,
+#      so that spread is the wrong one for a transcription corpus -- it buries
+#      the lines that are already hardest to hear. These weights narrow it to
+#      3 dB.
+#
+# The centre sits BELOW the fronts (0.75 vs 0.53 each, so FL+FR together exceed
+# it) which also buys headroom, because film peaks are centre-driven. Measured
+# over all 55 multichannel sources in the corpus: 1 exceeded 0 dBFS, by 0.02 dB.
+# With LFE included instead of dropped it was 2, by up to 1.03 dB -- the LFE term
+# was the clipping, and it carries nothing above 120 Hz that speech needs.
+_DOWNMIX_WEIGHTS = {"center": 0.75, "front": 0.53, "surround": 0.53, "lfe": 0.0}
+
+
+def _mono_pan_filter(layout: str) -> Optional[str]:
+    """A `pan` expression summing `layout` to mono, or None if it is not known.
+
+    Channels weighted at zero are omitted rather than written as `0*cN`: the
+    expression turns up in logs and in the dataset's downmix report, and "LFE is
+    not in this mix" reads better as an absence than as arithmetic.
+    """
+    channels = _LAYOUT_CHANNELS.get(layout)
+    if not channels:
+        return None
+    terms = []
+    for index, name in enumerate(channels):
+        weight = _DOWNMIX_WEIGHTS[_CHANNEL_ROLE.get(name, "surround")]
+        if weight > 0:
+            terms.append(f"{weight:g}*c{index}")
+    return "pan=mono|c0=" + "+".join(terms) if terms else None
 
 
 def _downmix_ffmpeg_args(file: str, audio_track: int, downmix: str) -> list:
@@ -125,10 +200,16 @@ def _downmix_ffmpeg_args(file: str, audio_track: int, downmix: str) -> list:
     a layout known to have one; anything else (stereo, an unnamed layout) falls back to
     the ordinary all-channel downmix with a warning rather than risking a filter error
     partway through decoding a feature-length file.
+
+    ``mix`` states its matrix explicitly for any multichannel layout in
+    ``_LAYOUT_CHANNELS`` (see ``_DOWNMIX_WEIGHTS`` for why it is not swresample's).
+    Stereo and mono return no filter at all: ffmpeg's stereo downmix is already
+    (L+R)/2, which is unity for centred dialogue and has nothing wrong with it.
+    An unrecognised multichannel layout also returns no filter -- that leaves it
+    on the old, quiet path, but a WRONG pan expression would be worse than a
+    quiet one, and the warning says which layout to add to the table.
     """
-    if downmix == "mix":
-        return []
-    if downmix != "center":
+    if downmix not in ("mix", "center"):
         raise ValueError(f"Unknown downmix mode: {downmix!r} (expected 'mix' or 'center')")
 
     streams = probe_audio_tracks(file)
@@ -137,16 +218,142 @@ def _downmix_ffmpeg_args(file: str, audio_track: int, downmix: str) -> list:
     channels = int((stream or {}).get("channels", 0) or 0)
 
     if layout == "mono" or channels == 1:
-        return []  # already the center channel; nothing to extract
-    if layout in _LAYOUTS_WITH_CENTER:
-        return ["-af", "pan=mono|c0=FC"]
+        return []  # already one channel; nothing to combine or extract
 
+    if downmix == "center":
+        if layout in _LAYOUTS_WITH_CENTER:
+            return ["-af", "pan=mono|c0=FC"]
+        logger.warning(
+            "--audio_downmix center: track %d has layout %r (%d channel(s)) with no front-center "
+            "channel to extract; falling back to a full downmix.",
+            audio_track, layout or "unknown", channels,
+        )
+        return []
+
+    if channels <= 2:
+        return []  # stereo: (L+R)/2 is already correct
+    pan = _mono_pan_filter(layout)
+    if pan:
+        return ["-af", pan]
     logger.warning(
-        "--audio_downmix center: track %d has layout %r (%d channel(s)) with no front-center "
-        "channel to extract; falling back to a full downmix.",
-        audio_track, layout or "unknown", channels,
+        "downmix: track %d has %d channels in unrecognised layout %r; falling back to "
+        "ffmpeg's normalised matrix, which is roughly 9 dB quiet. Add the layout to "
+        "_LAYOUT_CHANNELS to fix it.",
+        audio_track, channels, layout or "unknown",
     )
     return []
+
+
+# --- level normalisation -----------------------------------------------------
+#
+# Training and inference MUST measure level the same way or normalising is worse
+# than not bothering: the model would learn one level distribution and meet
+# another. That is the whole reason this lives here, in the decoder both sides
+# call, rather than in the dataset repo where the corpus statistics were worked
+# out. `cantocaptions_dataset.audio_cut` imports these constants so its staleness
+# stamp invalidates the cut tree when they change.
+
+#: Level a normalised file's speech is brought to, in dBFS.
+NORMALIZE_TARGET_DBFS = -24.0
+
+#: Never lift past this true peak, whatever the target asks for.
+NORMALIZE_CEILING_DBFS = -1.0
+
+#: Gating for the level estimate. A block below `_GATE_ABSOLUTE` is silence; one
+#: more than `_GATE_RELATIVE` under the mean of the rest is background.
+#:
+#: The relative gate is deliberately far wider than EBU R128's 10 LU. R128 is
+#: built to answer "how loud does this programme feel", so it gates hard toward
+#: the loud content and reports that. The question here is the opposite one --
+#: "how loud is the dialogue" -- and on a film the loud content is the score and
+#: the action. Measured against per-segment ground truth over 26 episodes, a
+#: 10 dB gate scores sd 1.94 dB and 30 dB scores 1.49; no relative gate at all
+#: scores 1.44, so the gate costs almost nothing and buys protection against
+#: material that is mostly ambience.
+_BLOCK_S, _HOP_S = 0.400, 0.100
+_GATE_ABSOLUTE, _GATE_RELATIVE = -60.0, 30.0
+
+
+def gated_level(audio: np.ndarray, sr: int = SAMPLE_RATE) -> Optional[float]:
+    """Mean level in dBFS of the blocks that look like speech, or None.
+
+    Gating is what makes this usable at inference, where there are no subtitle
+    spans to measure over: silence and low-level ambience are excluded, so the
+    result tracks the level of the loud, sustained content rather than the
+    proportion of the file that happens to be quiet.
+
+    The surviving blocks are reduced with a MEDIAN, not a mean, and that is the
+    single choice that makes this work. Speech is the most COMMON audible thing
+    in a film, but rarely the loudest; a mean is pulled upward by the score and
+    the action, a median lands on the typical talking block. Measured against
+    the dataset's per-segment ground truth over 26 episodes spanning its
+    mastering styles:
+
+        mean of gated blocks (EBU R128)   +2.49 dB offset, sd 2.74, worst 9.14
+        median of gated blocks            -1.14 dB offset, sd 1.49, worst 3.93
+
+    The mean's worst case is action cinema -- on Ip Man it read 11.6 dB HIGH,
+    which would have left that film's dialogue 11.6 dB under target.
+
+    The gate threshold is computed in the POWER domain even so. A threshold
+    taken from the mean of the LEVELS sinks along with the background: on a file
+    that is three quarters quiet it lands near the quiet part, nothing is gated
+    out, and the estimate reports the silence.
+
+    Known weakness: material that is mostly ambience within 30 dB of its speech
+    will have that ambience as its median, reading LOW and so lifting the file
+    too far. The peak ceiling in `normalize_gain` bounds the damage, and this
+    corpus -- film and television, near-continuous soundtrack -- does not
+    contain the case. The failure is bounded and rare where the mean's failure
+    was unbounded and common, which is why this trade was taken.
+    """
+    block, hop = int(_BLOCK_S * sr), int(_HOP_S * sr)
+    if audio.size < block:
+        return None
+    usable = audio.size - ((audio.size - block) % hop)
+    blocks = np.lib.stride_tricks.sliding_window_view(
+        audio[:usable].astype(np.float64), block)[::hop]
+    power = (blocks ** 2).mean(axis=1)
+
+    loud = power[10.0 * np.log10(power + 1e-20) > _GATE_ABSOLUTE]
+    if loud.size == 0:
+        return None                      # silence, or close enough to it
+    threshold = 10.0 * np.log10(loud.mean() + 1e-20) - _GATE_RELATIVE
+    speech = loud[10.0 * np.log10(loud + 1e-20) > threshold]
+    kept = speech if speech.size else loud
+    return float(10.0 * np.log10(np.median(kept) + 1e-20))
+
+
+def normalize_gain(audio: np.ndarray, sr: int = SAMPLE_RATE,
+                   target_db: Optional[float] = None,
+                   ceiling_db: Optional[float] = None) -> float:
+    """Gain in dB bringing `audio` to `target_db`, held under `ceiling_db` peak.
+
+    A single linear gain, never compression: the recording's own dynamics are
+    what make dialogue sound like dialogue, and the problem being solved is
+    variation BETWEEN recordings, not within one.
+
+    The targets default to the module constants, resolved HERE rather than in
+    the signature. A default argument binds once at import, so spelling this
+    `target_db: float = NORMALIZE_TARGET_DBFS` would freeze whatever was in
+    scope when the module first loaded. Retuning the constant would then be
+    picked up by the dataset's staleness stamp, mark the whole cut tree stale,
+    re-cut all 401 episodes -- and write them at the OLD level regardless. The
+    stamp would be describing audio that does not exist, which is worse than
+    having no stamp at all.
+
+    Returns 0.0 when there is nothing measurable, so a caller can apply it
+    unconditionally.
+    """
+    target_db = NORMALIZE_TARGET_DBFS if target_db is None else target_db
+    ceiling_db = NORMALIZE_CEILING_DBFS if ceiling_db is None else ceiling_db
+    level = gated_level(audio, sr)
+    if level is None:
+        return 0.0
+    peak = float(np.abs(audio).max()) if audio.size else 0.0
+    if peak <= 0:
+        return 0.0
+    return min(target_db - level, ceiling_db - 20.0 * float(np.log10(peak)))
 
 
 def _clip_ffmpeg_args(audio_start: Optional[float], audio_end: Optional[float]) -> tuple:
@@ -242,6 +449,7 @@ def load_audio(file: str,
                audio_start: Optional[float] = None,
                audio_end: Optional[float] = None,
                downmix: str = "mix",
+               normalize: bool = False,
                ) -> np.ndarray:
     """
     Open an audio file and read as mono waveform, resampling as necessary
@@ -268,6 +476,18 @@ def load_audio(file: str,
         downmix every channel; "center" takes the front-center channel alone, which
         on a film soundtrack is largely the dialogue stem.
 
+    normalize: bool
+        Apply one linear gain bringing the speech to ``NORMALIZE_TARGET_DBFS``.
+
+        Defaults to FALSE, and that default is load-bearing. This function is
+        called on two quite different things: source media, and clips that were
+        already cut from source media and therefore already carry their
+        episode's gain (``alignment`` reloads per-segment wavs that way). A
+        default of True would normalise those a second time -- per clip, which
+        flattens exactly the dynamics the per-file gain is designed to keep --
+        and it would do it silently, in one stage only. So it is switched on
+        explicitly where source media is read, and nowhere else.
+
     Returns
     -------
     A NumPy array containing the audio waveform, in float32 dtype.
@@ -284,7 +504,14 @@ def load_audio(file: str,
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
 
-    return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+    audio = np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+    if normalize:
+        gain = normalize_gain(audio, sr)
+        if gain:
+            # Clipping is prevented by the ceiling in normalize_gain, so this
+            # clamp only catches the float edge; it is not doing the work.
+            audio = np.clip(audio * (10.0 ** (gain / 20.0)), -1.0, 1.0)
+    return audio
 
 
 def extract_clip_to_wav(

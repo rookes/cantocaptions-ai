@@ -175,6 +175,12 @@ class PipelineConfig:
     # back to a full downmix for any layout without one. See utils/audio.py.
     audio_downmix: str = "mix"
 
+    # Bring each file's speech to a fixed level with one linear gain before any
+    # stage sees it. On by default because the TRAINING corpus is cut this way:
+    # a model trained on levelled audio and then shown unlevelled audio meets a
+    # different distribution than it learned. See utils/audio.normalize_gain.
+    audio_normalize: bool = True
+
     # Reference subtitle correction
     reference_subtitle: Optional[str] = None
     reference_correction_semantic: bool = False
