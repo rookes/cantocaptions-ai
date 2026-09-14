@@ -38,7 +38,7 @@ sys.path.insert(0, REPO_ROOT)
 from cantocaptions_ai.pipeline.realign import (  # noqa: E402
     EmissionTimeline, TranscriptLine, assign_lines, load_transcript_lines,
 )
-from cantocaptions_ai.pipeline.retime import load_subtitle_file  # noqa: E402
+from cantocaptions_ai.utils.subtitles import load_subtitle_file  # noqa: E402
 
 CACHE = os.path.join(REPO_ROOT, "temp", "realign_placement_cache")
 THRESHOLDS = (0.25, 0.5, 1.0, 2.0)

@@ -153,7 +153,7 @@ def score(hyp: str, ref: str) -> Dict[str, float]:
 
 
 def load_cues(path: str) -> List[dict]:
-    from cantocaptions_ai.pipeline.retime import load_subtitle_file
+    from cantocaptions_ai.utils.subtitles import load_subtitle_file
 
     return load_subtitle_file(path)
 

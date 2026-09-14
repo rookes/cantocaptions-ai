@@ -151,11 +151,35 @@ class PipelineConfig:
     flag_speaker_conflicts: bool = False
     speaker_labels: bool = False
 
-    # Retime
-    retime: Optional[str] = None
-
-    # Realign: put an untimed transcript on the audio timeline. See pipeline/realign.py.
+    # Realign: put a transcript on the audio timeline. See pipeline/realign.py.
     realign: Optional[str] = None
+    # What to do with the input's own timings, if it has any.
+    #   transcript -- discard them and place every line from scratch
+    #   sync       -- fit a transform from the audio and map every cue through it, which
+    #                 preserves the subtitle's proportions exactly
+    #   adjust     -- fit the same transform, then re-time each cue from the audio inside
+    #                 realign_adjust_tolerance of where the transform put it
+    #   auto       -- transcript for a bare transcript, sync for a subtitle with timings
+    # This replaces the old --retime, which could only carry a rolling offset and so could
+    # not express a rate change at all. See pipeline/timefit.py.
+    realign_mode: str = "auto"
+    # Bound on |scale - 1| the fitted transform may use. Beyond it the fit is refused rather
+    # than clamped, since a clamped scale is a number the fit does not believe.
+    realign_max_scale: float = 0.25
+    # What happens to cues the fit says this recording has no audio for.
+    #   drop -- leave them out of the output entirely, and report them
+    #   keep -- collapse them onto the cut point, flagged, so nothing the user wrote is lost
+    realign_cut_policy: str = "drop"
+    # Mode adjust only: how far forced alignment may move a cue from its transform position
+    # before the transform wins. Widened automatically when the transform fits only loosely.
+    realign_adjust_tolerance: float = 2.0
+    # Fold the input's punctuation into the forms the aligner can use (halfwidth marks beside
+    # Chinese text to fullwidth, any ellipsis to U+2026). On by default because most such
+    # marks are typing slips and because the aligner spends a real pause on the result. Turn
+    # it off to have the text reach the writer exactly as written -- at the cost of alignment,
+    # since a halfwidth mark is in neither the align vocabulary nor split_chars and is simply
+    # dropped. See realign.normalize_transcript_text.
+    realign_normalize: bool = True
     # 'acoustic' places lines with a sliding free-end Viterbi and no ASR; 'asr' runs the
     # normal ASR stage and matches the two character streams, which is slower but degrades
     # gracefully when the transcript and the recording disagree.

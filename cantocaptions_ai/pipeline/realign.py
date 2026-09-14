@@ -1,13 +1,28 @@
-"""Forced alignment of an *untimed* transcript onto a recording (``--realign``).
+"""Putting a transcript on a recording's timeline (``--realign``).
 
-The input is a complete transcript with no timings at all -- one cue per line, the shape a
-human transcriptionist or a scraped film script produces. The job is to put every line on the
-audio timeline so the ordinary alignment, cleaning and subtitle-writing stages can finish it.
+The input is a complete, ordered transcript -- one cue per line, the shape a human
+transcriptionist, a scraped film script, or an existing subtitle file produces. The job is to
+put every line on *this* recording's timeline so the ordinary alignment, cleaning and
+subtitle-writing stages can finish it.
 
-This is not what ``--retime`` does. That feature searches for each cue *around its existing
-timestamp* (see ``retime.py``), which is exactly the information a plain transcript lacks.
+**Three modes**, differing only in what they do with timings the input already had:
 
-Three ideas carry the whole module:
+* ``transcript`` -- there are none, or they are discarded. Every line is placed from scratch
+  by the anchor-and-fill search below. This is the original feature and the rest of this
+  docstring is about it.
+* ``sync`` -- the confident lines are found acoustically, the simplest transform between the
+  subtitle's timeline and this recording's is fitted from them (see ``timefit.py``), and every
+  cue is mapped through it. The subtitle's own proportions survive exactly; no forced
+  alignment runs at all.
+* ``adjust`` -- the same transform, then each cue is re-timed from the audio within a
+  tolerance of where the transform put it.
+
+``sync`` and ``adjust`` replace the old ``--retime``, which searched a +/-5 s window around
+each cue's existing timestamp and carried a single rolling offset. That could not express a
+rate difference -- a 4% one puts cue 600 a minute outside the window -- which is the most
+common reason a subtitle does not fit a different release in the first place.
+
+Three ideas carry the placement search:
 
 1. **The transcript's line breaks are the cue boundaries.** ``split_chars`` exists because
    Qwen returns an undifferentiated block per segment that has to be cut into cues; a
@@ -43,6 +58,7 @@ from __future__ import annotations
 import bisect
 import difflib
 import math
+import re
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -57,6 +73,7 @@ from cantocaptions_ai.pipeline.alignment import (
     backtrack,
     get_trellis,
 )
+from cantocaptions_ai.pipeline import timefit
 from cantocaptions_ai.utils.audio import SAMPLE_RATE
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.schema import SingleSegment, VadAudioSegment
@@ -76,8 +93,16 @@ REALIGN_SENTINEL = ""
 # rather than being dropped outright. The space earns its place because a transcript uses one
 # where a comma would go, and the aligner should spend silence there rather than running the
 # two clauses together.
+#
+# The newline earns its place for the same reason and is load-bearing for a subtitle input: a
+# line break *inside* a cue is usually a change of speaker, and a two-speaker exchange has a
+# real pause in the middle of it. Listing it here is the whole mechanism -- _preprocess_segment
+# keeps a character if it is in the dictionary or in split_chars, and line_tokens maps anything
+# in split_chars to the blank id -- so the break survives into the cue text and the aligner
+# spends silence on it. It cannot split a cue: _get_sentence_spans is never consulted under
+# --realign, which declares its cue boundaries through cue_spans instead.
 REALIGN_PUNCTUATION = PunctuationConfig(
-    split_chars=tuple(DEFAULT_PUNCTUATION.split_chars) + (" ", REALIGN_SENTINEL),
+    split_chars=tuple(DEFAULT_PUNCTUATION.split_chars) + (" ", "\n", REALIGN_SENTINEL),
     mergeable_chars=DEFAULT_PUNCTUATION.mergeable_chars,
 )
 
@@ -91,6 +116,13 @@ _FULLWIDTH_PUNCT = {",": "，", ".": "。", "?": "？", "!": "！", ";": "；"}
 # Transcripts in the wild use U+22EF (midline) or a doubled U+2026 for a trailing-off pause;
 # only the single U+2026 is a split char.
 _ELLIPSIS_FORMS = ("⋯⋯", "⋯", "……")
+
+# ...and plenty of them type an ASCII ellipsis instead. Folding it has to happen *before* the
+# fullwidth pass below, not as part of it, because that pass works one character at a time: in
+# 美少...女 the first dot follows a CJK character and would become a full stop on its own,
+# leaving 美少。..女. Two or more dots are an ellipsis; a single one is a full stop (or a
+# decimal point, which _follows_cjk already protects).
+_ASCII_ELLIPSIS = re.compile(r"\.{2,}")
 
 # Ceiling on how fast the transcript could possibly be spoken, used only to decide how many
 # lines to *offer* a window. Over-supplying costs a few tokens; under-supplying would cap
@@ -237,12 +269,36 @@ MAX_FILL_DEPTH = 24
 # transcript-versus-recording mismatch detector -- and is logged, not attached to cues.
 UNCONSTRAINED_ROOM = 1.5
 
+# How far mode `adjust` lets forced alignment move a cue away from where the fitted transform
+# put it, before the transform wins instead.
+#
+# The two sources of evidence fail in opposite ways, which is why neither is trusted alone. The
+# transform is global and cannot be locally wrong by much -- it is fitted to hundreds of
+# anchors -- but it is also blind to anything smaller than a piece. Forced alignment is exact
+# where it can read the audio and confidently wrong where it cannot, and CLAUDE.md records that
+# the confidence score does not distinguish the two. So the transform bounds the aligner, and
+# within the bound the aligner wins.
+ADJUST_TOLERANCE = 2.0
+
 
 @dataclass
 class TranscriptLine:
-    """One cue of the source transcript, before it has a time."""
+    """One cue of the source transcript.
+
+    ``source_start`` and ``source_end`` are the timings the input *already had*, and are None
+    for a bare line-delimited transcript. They are never used as an answer -- the anchor search
+    ignores them completely, deliberately, because a search narrowed by the prior would only
+    confirm the prior (which is exactly how the old --retime failed). They are the x-axis the
+    transform is fitted against, and nothing else.
+    """
     index: int
     text: str
+    source_start: Optional[float] = None
+    source_end: Optional[float] = None
+
+    @property
+    def timed(self) -> bool:
+        return self.source_start is not None and self.source_end is not None
 
 
 # Why a line's timing is not to be trusted.
@@ -259,6 +315,8 @@ REASON_ISOLATED = "isolated"            # placed by its neighbours; no support o
 REASON_LOW_SCORE = "low_score"          # aligned, but weakly
 REASON_IMPLAUSIBLE = "implausible"      # final cue is longer than its text could be spoken in
 REASON_SILENT_START = "silent_start"    # final cue starts on silence
+REASON_CUT = "cut"                      # this recording is missing the content of this cue
+REASON_OFF_PRIOR = "off_prior"          # alignment disagreed with the transform beyond tolerance
 
 REASON_HELP = {
     REASON_NO_AUDIO: "the recording ran out before this line",
@@ -268,6 +326,8 @@ REASON_HELP = {
     REASON_LOW_SCORE: "weak acoustic support",
     REASON_IMPLAUSIBLE: "cue is longer than its text could be spoken in",
     REASON_SILENT_START: "cue starts on silence",
+    REASON_CUT: "this recording does not contain the content of this cue",
+    REASON_OFF_PRIOR: "alignment disagreed with the fitted transform; the transform was kept",
 }
 
 # Counted apart in the summary. A line the model has no characters for is a property of the
@@ -292,26 +352,83 @@ class LineTiming:
         return self.reason is None
 
 
+# What to do with the timings a --realign input already carries. See CLAUDE.md.
+REALIGN_MODES = ("transcript", "sync", "adjust")
+
+
+def resolve_realign_mode(path: str, mode: str) -> str:
+    """Turn ``auto`` into a concrete mode by looking at the input file.
+
+    The test is on the file's *content*, not its extension: a bare transcript saved as .srt
+    must not be "synced" against timings it does not have, and a subtitle saved as .txt must
+    not have its timings silently thrown away.
+    """
+    if mode != "auto":
+        return mode
+    from cantocaptions_ai.utils.subtitles import subtitle_has_timings
+    return "sync" if subtitle_has_timings(path) else "transcript"
+
+
 # --- Loading ------------------------------------------------------------------------
 
+# What counts as "Chinese text" for the purpose of deciding that a halfwidth mark beside it was
+# a typing slip. The supplementary range is not padding: written Cantonese genuinely uses
+# plane-2 ideographs -- 𠸏, 𠻹, 𠺢, 𡃁 -- and 62 cues across the test fixtures contain one. A
+# lookback that stops at U+9FFF silently treats them as non-Chinese. Planes 2 and 3 are
+# ideographs in their entirety, so the whole span is safe to claim.
+_CJK_RANGES = (
+    ("　", "〿"),           # CJK symbols and punctuation
+    ("㐀", "鿿"),           # Extension A, then the Unified Ideographs
+    ("豈", "﫿"),           # Compatibility Ideographs
+    ("＀", "￯"),           # Halfwidth and Fullwidth Forms
+    ("\U00020000", "\U0003ffff"),   # Extension B onwards
+)
+
+# Marks the lookback steps over to find the text a punctuation *run* is attached to.
+_MARK_RUN = frozenset(_FULLWIDTH_PUNCT) | frozenset(_FULLWIDTH_PUNCT.values()) | {"…", "⋯"}
+
+
+def _is_cjk(ch: str) -> bool:
+    return any(lo <= ch <= hi for lo, hi in _CJK_RANGES)
+
+
 def _follows_cjk(text: str, i: int) -> bool:
-    """True when text[i] is a CJK ideograph or a fullwidth mark."""
-    if not 0 <= i < len(text):
-        return False
-    ch = text[i]
-    return "㐀" <= ch <= "鿿" or "　" <= ch <= "〿" or "＀" <= ch <= "￯"
+    """True when the punctuation run ending at *i* is attached to Chinese text.
+
+    Scanning back **over other marks** is what makes a run convert as a unit. Judging each mark
+    by its immediate neighbour splits the run: in 咩話!? the ! sees 話 and converts while the ?
+    sees the halfwidth ! and does not, giving 咩話！? -- two widths in one breath. The same
+    shape is what turned 美少...女 into 美少。..女 before the dot-run fold above, the first dot
+    having been the only one with a Chinese character to its left.
+
+    Digits and letters are deliberately *not* stepped over, which is what keeps 1.5 a decimal
+    and 3,000 a thousands separator even in the middle of a Chinese line.
+    """
+    while i >= 0 and text[i] in _MARK_RUN:
+        i -= 1
+    return 0 <= i < len(text) and _is_cjk(text[i])
 
 
-def normalize_transcript_text(text: str) -> str:
+def normalize_transcript_text(text: str, *, punctuation: bool = True) -> str:
     """Fold a transcript line into the punctuation the aligner can actually use.
 
     Only punctuation and whitespace are touched -- never the words -- because this text *is*
     the subtitle. Anything a rule file should decide (particle conventions, character
     variants) is left to the cleaner, which runs after alignment.
+
+    With *punctuation* False (``--realign_normalize False``) nothing but the sentinel is
+    touched and the text reaches the writer exactly as it was written. That is a real trade
+    rather than a strictly safer setting: a halfwidth mark is in neither the align vocabulary
+    nor ``split_chars``, so ``_preprocess_segment`` drops it outright and the pause it stands
+    for goes unmodelled. Worth taking when the input's punctuation is deliberate; not worth
+    taking to avoid a handful of typing slips.
     """
+    text = text.replace(REALIGN_SENTINEL, "")
+    if not punctuation:
+        return text
     for form in _ELLIPSIS_FORMS:
         text = text.replace(form, "…")
-    text = text.replace(REALIGN_SENTINEL, "")
+    text = _ASCII_ELLIPSIS.sub("…", text)
     out = []
     for i, ch in enumerate(text):
         repl = _FULLWIDTH_PUNCT.get(ch)
@@ -319,28 +436,84 @@ def normalize_transcript_text(text: str) -> str:
             out.append(repl)
         else:
             out.append(ch)
-    # A transcript uses runs of spaces as loose phrasing; one pause token is enough.
-    return " ".join("".join(out).split())
+    # A transcript uses runs of spaces as loose phrasing; one pause token is enough. Runs are
+    # collapsed *within* a physical line so an intra-cue break survives -- see
+    # REALIGN_PUNCTUATION for why the aligner wants to see it.
+    parts = ["".join(out)] if "\n" not in text else "".join(out).split("\n")
+    return "\n".join(
+        cleaned for cleaned in (" ".join(part.split()) for part in parts) if cleaned
+    )
 
 
-def load_transcript_lines(path: str) -> List[TranscriptLine]:
-    """Read a line-delimited transcript (or an SRT, discarding its timings).
+def load_transcript_lines(
+    path: str, *, keep_timings: bool = False, normalize: bool = True,
+) -> List[TranscriptLine]:
+    """Read a line-delimited transcript, or a subtitle file.
 
-    Handles a UTF-8 BOM and any mix of line endings. Blank lines are separators, not cues.
+    With ``keep_timings`` the subtitle's own cue timings come back on each line, for the
+    transform to be fitted against; without it they are discarded and the file is treated as a
+    bare transcript, which is what ``--realign_mode transcript`` wants. A line break *inside* a
+    cue is kept either way: it is usually a change of speaker, so flattening it would change
+    the content rather than the formatting.
+
+    ``normalize`` False hands the text through untouched; see normalize_transcript_text.
+
+    Handles a UTF-8 BOM and any mix of line endings. In a plain transcript blank lines are
+    separators, not cues.
     """
-    if path.lower().endswith((".srt", ".vtt")):
-        from cantocaptions_ai.pipeline.retime import load_subtitle_file
-        raw = [seg["text"] for seg in load_subtitle_file(path)]
+    if path.lower().endswith((".srt", ".vtt", ".webvtt")):
+        from cantocaptions_ai.utils.subtitles import read_subtitle_cues
+        cues = read_subtitle_cues(path)
+        raw = [(cue.text, cue.start, cue.end) for cue in cues]
     else:
         with open(path, "rb") as fh:
-            raw = fh.read().decode("utf-8-sig").splitlines()
+            raw = [(line, None, None) for line in fh.read().decode("utf-8-sig").splitlines()]
 
     lines: List[TranscriptLine] = []
-    for text in raw:
-        text = normalize_transcript_text(text.strip())
-        if text:
-            lines.append(TranscriptLine(index=len(lines), text=text))
+    for text, start, end in raw:
+        text = normalize_transcript_text(text.strip(), punctuation=normalize)
+        if not text:
+            continue
+        lines.append(TranscriptLine(
+            index=len(lines), text=text,
+            source_start=start if keep_timings else None,
+            source_end=end if keep_timings else None,
+        ))
     return lines
+
+
+def source_spans(lines: Sequence[TranscriptLine]) -> List[Tuple[float, float]]:
+    """The input's own (start, end) per line. Raises if any line is untimed."""
+    missing = [line.index for line in lines if not line.timed]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} transcript line(s) carry no timing, so there is nothing to fit a "
+            f"transform against; first is line {missing[0] + 1}"
+        )
+    return [(float(line.source_start), float(line.source_end)) for line in lines]
+
+
+def anchor_pairs(
+    chain: Sequence[Tuple[int, float, float, float]],
+    lines: Sequence[TranscriptLine],
+) -> List[Tuple[float, float, float]]:
+    """(source start, audio start, weight) for each anchor whose line carries a timing.
+
+    **Starts only, never ends.** An anchor's start is an acoustic onset -- the first frame of
+    the line's core token run. Its *end* is a display decision: padded, released to the next
+    cue, floored at a minimum duration. It carries no acoustic information, so pairing on it
+    would feed the fit noise dressed as evidence. A subtitler's systematic lead-in bias on the
+    start is absorbed exactly into the per-piece offset, so it costs nothing.
+    """
+    by_index = {line.index: line for line in lines}
+    out: List[Tuple[float, float, float]] = []
+    for index, start, _end, score in chain:
+        line = by_index.get(index)
+        if line is None or not line.timed:
+            continue
+        weight = max(float(score) if score == score else 0.0, 1e-6)
+        out.append((float(line.source_start), float(start), weight))
+    return out
 
 
 # --- Tokenization -------------------------------------------------------------------
@@ -840,23 +1013,11 @@ def assign_lines(
     audio those anchors bracket. Returns one LineTiming per input line; a ``reason`` marks a
     line whose span came from its neighbours rather than from the audio.
     """
-    if not vad_segments:
-        raise ValueError("realign needs at least one audio chunk")
-    if blank_id is None:
-        blank_id = _get_blank_id(model_dictionary)
-
-    tokens_per_line = [
-        line_tokens(line.text, model_lang, model_dictionary, blank_id, punctuation)
-        for line in lines
-    ]
-    aligner = _Aligner(timeline, tokens_per_line, blank_id)
-    stats = dict(blind=0, verified=0, dropped=0, fills=0, fill_failed=0, splits=0,
-                 interpolated=0, unconstrained=0)
-
-    anchors = acquire(lines, aligner, window_seconds=window_seconds,
-                      commit_margin=commit_margin, stats=stats)
-    chain = sanitise_anchors(anchors, lines)
-    chain = sanitise_anchors(verify_anchors(chain, aligner, stats), lines)
+    blank_id, tokens_per_line, aligner, stats = _prepare(
+        lines, vad_segments, timeline, model_dictionary, model_lang, blank_id, punctuation,
+    )
+    chain = _find_anchors(lines, aligner, window_seconds=window_seconds,
+                          commit_margin=commit_margin, stats=stats)
 
     out: List[Optional[LineTiming]] = [None] * len(lines)
     for i, start, end, score in chain:
@@ -873,6 +1034,64 @@ def assign_lines(
         if progress_callback is not None:
             progress_callback.advance(i1 - i0 - 1)
 
+    return _finalise(out, lines, tokens_per_line, blank_id, timeline, stats, len(chain))
+
+
+def _prepare(
+    lines: Sequence[TranscriptLine],
+    vad_segments: Sequence[VadAudioSegment],
+    timeline: EmissionTimeline,
+    model_dictionary: dict,
+    model_lang: str,
+    blank_id: Optional[int],
+    punctuation: PunctuationConfig,
+):
+    """Tokens, aligner and the stats dict -- the setup every mode shares."""
+    if not vad_segments:
+        raise ValueError("realign needs at least one audio chunk")
+    if blank_id is None:
+        blank_id = _get_blank_id(model_dictionary)
+    tokens_per_line = [
+        line_tokens(line.text, model_lang, model_dictionary, blank_id, punctuation)
+        for line in lines
+    ]
+    aligner = _Aligner(timeline, tokens_per_line, blank_id)
+    stats = dict(blind=0, verified=0, dropped=0, fills=0, fill_failed=0, splits=0,
+                 interpolated=0, unconstrained=0, off_prior=0)
+    return blank_id, tokens_per_line, aligner, stats
+
+
+def _find_anchors(
+    lines: Sequence[TranscriptLine], aligner: _Aligner, *,
+    window_seconds: float, commit_margin: float, stats: dict,
+) -> List[Tuple[int, float, float, float]]:
+    """acquire -> sanitise -> verify -> sanitise. The chain every mode starts from.
+
+    **The input's own timings are not consulted, in any mode.** That looks wasteful when a
+    subtitle arrives already roughly in sync, and it is the single most important thing this
+    function does. A search narrowed around the prior can only return the prior, and the
+    transform would then be fitted to its own assumption -- which is precisely how the old
+    --retime failed: it searched a +/-5 s window around each cue's existing timestamp and
+    carried a rolling offset, so a rate change (the common case) was unrepresentable and
+    invisible at the same time. The prior is the thing being measured; it cannot also be the
+    ruler.
+    """
+    anchors = acquire(lines, aligner, window_seconds=window_seconds,
+                      commit_margin=commit_margin, stats=stats)
+    chain = sanitise_anchors(anchors, lines)
+    return sanitise_anchors(verify_anchors(chain, aligner, stats), lines)
+
+
+def _finalise(
+    out: List[Optional[LineTiming]],
+    lines: Sequence[TranscriptLine],
+    tokens_per_line: Sequence[Sequence[int]],
+    blank_id: int,
+    timeline: EmissionTimeline,
+    stats: dict,
+    anchors: int,
+) -> List[LineTiming]:
+    """Fill the gaps nothing placed, reclassify, flag and report."""
     # A line with no alignable character was never going to be timed from the audio; say so
     # rather than letting it look like a placement failure. The test is for a *non-blank*
     # token: punctuation maps to the blank id, so a line of nothing but out-of-vocabulary
@@ -889,10 +1108,282 @@ def assign_lines(
     logger.info(
         "realign: %d anchor(s) kept (%d dropped on review), %d line(s) filled between them; "
         "%d blind window(s), %d split(s)",
-        len(chain), stats["dropped"], len(lines) - len(chain), stats["blind"], stats["splits"],
+        anchors, stats["dropped"], len(lines) - anchors, stats["blind"], stats["splits"],
     )
     _report(out, lines)
     return out
+
+
+# --- Modes for a subtitle that already has timings -----------------------------------
+
+def _fit_for_lines(
+    chain: Sequence[Tuple[int, float, float, float]],
+    lines: Sequence[TranscriptLine],
+    spans: Sequence[Tuple[float, float]],
+    *,
+    max_scale_dev: float,
+    break_penalty: float,
+    slope_penalty: float,
+) -> timefit.Transform:
+    """Fit the source-to-audio transform, or fall back to the identity and say so.
+
+    A refused fit is not an error to work around. Unchanged timings are wrong in a way the
+    user can see and understand; timings mapped through a transform nobody believes are wrong
+    *and* look deliberate, which is worse. So the fallback changes nothing at all.
+    """
+    pairs = anchor_pairs(chain, lines)
+    try:
+        transform = timefit.fit_transform(
+            pairs, max_scale_dev=max_scale_dev, break_penalty=break_penalty,
+            slope_penalty=slope_penalty,
+        )
+    except timefit.TransformError as exc:
+        logger.warning("realign: %s", exc)
+        logger.warning(
+            "realign: falling back to the subtitle's own timings, unchanged (fitted from "
+            "%d anchor(s))", len(pairs),
+        )
+        return timefit.identity_transform()
+    return timefit.locate_breaks(transform, spans, max_scale_dev=max_scale_dev,
+                                 slope_penalty=slope_penalty)
+
+
+def _apply(
+    lines: Sequence[TranscriptLine],
+    spans: Sequence[Tuple[float, float]],
+    transform: timefit.Transform,
+    timeline: EmissionTimeline,
+    cut_policy: str,
+) -> Tuple[List[LineTiming], frozenset, List]:
+    """Map every cue, and work out which ones this recording has no audio for."""
+    rows = timefit.map_cues(
+        transform, spans, cut_policy="keep", min_step=MIN_LINE_STEP,
+        min_visible=MIN_VISIBLE_DURATION,
+        file_start=timeline.file_start, file_end=timeline.file_end,
+    )
+    dropped = set()
+    if cut_policy == "drop":
+        for brk in transform.breaks:
+            if brk.kind == "cut":
+                dropped.update(brk.cue_indices)
+    timings = [
+        LineTiming(line.index, row[0], row[1], reason=row[2])
+        for line, row in zip(lines, rows)
+    ]
+    # What describe_transform should summarise is what actually shipped, so a dropped cue is
+    # a hole here rather than a placement.
+    effective = [None if i in dropped else row for i, row in enumerate(rows)]
+    return timings, frozenset(dropped), effective
+
+
+def assign_lines_sync(
+    lines: Sequence[TranscriptLine],
+    vad_segments: Sequence[VadAudioSegment],
+    timeline: EmissionTimeline,
+    model_dictionary: dict,
+    model_lang: str,
+    *,
+    blank_id: Optional[int] = None,
+    window_seconds: float = 120.0,
+    commit_margin: float = 10.0,
+    punctuation: PunctuationConfig = REALIGN_PUNCTUATION,
+    max_scale_dev: float = timefit.MAX_SCALE_DEV,
+    break_penalty: float = timefit.BREAK_PENALTY,
+    slope_penalty: float = timefit.SLOPE_PENALTY,
+    cut_policy: str = "drop",
+    progress_callback=None,
+) -> Tuple[List[LineTiming], frozenset, timefit.Transform, timefit.TransformReport]:
+    """Mode ``sync``: fit a transform from the anchors, then map every cue through it.
+
+    Every cue moves, including the ones that anchored -- and that is the point rather than an
+    oversight. Within a piece the map is linear, so every duration and every gap scales by the
+    same factor and the subtitle's own rhythm survives exactly. Giving an anchored cue its
+    individually measured time instead would break that rhythm to gain a tenth of a second on
+    the cues that were already the most certain. ``adjust`` is the mode for people who want
+    the measurement to win.
+
+    No forced alignment runs here at all: the anchor search is the only acoustic work, which
+    makes this roughly half the cost of ``transcript`` mode.
+    """
+    spans = source_spans(lines)
+    _blank, _tokens, aligner, stats = _prepare(
+        lines, vad_segments, timeline, model_dictionary, model_lang, blank_id, punctuation,
+    )
+    chain = _find_anchors(lines, aligner, window_seconds=window_seconds,
+                          commit_margin=commit_margin, stats=stats)
+    if progress_callback is not None:
+        progress_callback.advance(len(lines))
+
+    transform = _fit_for_lines(
+        chain, lines, spans, max_scale_dev=max_scale_dev,
+        break_penalty=break_penalty, slope_penalty=slope_penalty,
+    )
+    timings, dropped, effective = _apply(lines, spans, transform, timeline, cut_policy)
+    report = timefit.describe_transform(transform, spans, effective)
+    timefit.report_transform(report, len(lines))
+    _report(timings, lines)
+    return timings, dropped, transform, report
+
+
+def assign_lines_adjust(
+    lines: Sequence[TranscriptLine],
+    vad_segments: Sequence[VadAudioSegment],
+    timeline: EmissionTimeline,
+    model_dictionary: dict,
+    model_lang: str,
+    *,
+    blank_id: Optional[int] = None,
+    window_seconds: float = 120.0,
+    commit_margin: float = 10.0,
+    punctuation: PunctuationConfig = REALIGN_PUNCTUATION,
+    max_scale_dev: float = timefit.MAX_SCALE_DEV,
+    break_penalty: float = timefit.BREAK_PENALTY,
+    slope_penalty: float = timefit.SLOPE_PENALTY,
+    cut_policy: str = "drop",
+    tolerance: float = ADJUST_TOLERANCE,
+    progress_callback=None,
+) -> Tuple[List[LineTiming], frozenset, timefit.Transform, timefit.TransformReport]:
+    """Mode ``adjust``: the transform as a prior, then re-time each cue from the audio.
+
+    The transform says roughly where every cue is; forced alignment says exactly. So the
+    transform is used to cut the transcript into blocks whose ``+/- tolerance`` brackets are
+    disjoint, and each block goes through the ordinary ``fill`` -- the same call, with the
+    same guarantees, that ``assign_lines`` makes between two anchors. The bracket *is* the
+    tolerance clamp for the lines at a block's edges, and interior lines are further pinned by
+    their neighbours, since forced alignment has to consume every token in order.
+
+    ``clamp_to_prior`` then catches the one case that leaves: an interior line in a long dense
+    block drifting while its neighbours stay put. Reverting it to the prior and flagging it
+    beats building a second, constrained trellis to prevent it.
+    """
+    spans = source_spans(lines)
+    blank_id, tokens_per_line, aligner, stats = _prepare(
+        lines, vad_segments, timeline, model_dictionary, model_lang, blank_id, punctuation,
+    )
+    chain = _find_anchors(lines, aligner, window_seconds=window_seconds,
+                          commit_margin=commit_margin, stats=stats)
+    transform = _fit_for_lines(
+        chain, lines, spans, max_scale_dev=max_scale_dev,
+        break_penalty=break_penalty, slope_penalty=slope_penalty,
+    )
+    prior, dropped, effective = _apply(lines, spans, transform, timeline, cut_policy)
+    report = timefit.describe_transform(transform, spans, effective)
+    timefit.report_transform(report, len(lines))
+
+    # A loose fit widens its own leash rather than fighting the aligner over a prior it does
+    # not itself believe to better than a second.
+    leash = max(tolerance, 3.0 * report.residual_p90)
+    if leash > tolerance:
+        logger.info(
+            "realign: widening the adjust tolerance to %.1fs, since the transform only fits "
+            "its anchors to %.2fs", leash, report.residual_p90,
+        )
+
+    out: List[Optional[LineTiming]] = [None] * len(lines)
+    for lo, hi, t0, t1 in bracket_blocks(prior, leash, timeline.file_start, timeline.file_end):
+        fill(lines, aligner, lo, hi, t0, t1, out, stats)
+        if progress_callback is not None:
+            progress_callback.advance(hi - lo)
+    reverted = clamp_to_prior(out, prior, leash, stats)
+    if reverted:
+        logger.info(
+            "realign: %d cue(s) were re-timed further than %.1fs from the transform and were "
+            "reverted to it", reverted, leash,
+        )
+    timings = _finalise(out, lines, tokens_per_line, blank_id, timeline, stats, len(chain))
+    return timings, dropped, transform, report
+
+
+def bracket_blocks(
+    prior: Sequence[LineTiming], tolerance: float, file_start: float, file_end: float,
+) -> List[Tuple[int, int, float, float]]:
+    """Cut the line list into blocks whose +/- tolerance brackets are disjoint.
+
+    Disjointness is the whole requirement: it is what lets each block be an ordinary ``fill``
+    call with trusted edges, which is the same contract a pair of anchors provides. Blocks
+    split wherever the prior leaves more than ``2 * tolerance`` of room, since that is the
+    first point at which two brackets could not overlap anyway.
+    """
+    if not prior:
+        return []
+    cuts = [0]
+    for i in range(1, len(prior)):
+        if prior[i].start - prior[i - 1].end > 2.0 * tolerance:
+            cuts.append(i)
+    cuts.append(len(prior))
+
+    out: List[Tuple[int, int, float, float]] = []
+    cursor = file_start
+    for lo, hi in zip(cuts, cuts[1:]):
+        if hi <= lo:
+            continue
+        t0 = max(cursor, file_start, prior[lo].start - tolerance)
+        t1 = min(file_end, prior[hi - 1].end + tolerance)
+        t1 = max(t1, t0 + 0.1)
+        out.append((lo, hi, t0, t1))
+        cursor = t1
+    return out
+
+
+def clamp_to_prior(
+    out: List[Optional[LineTiming]], prior: Sequence[LineTiming],
+    tolerance: float, stats: dict,
+) -> int:
+    """Revert any line the audio placed further than *tolerance* from its prior.
+
+    A line ``fill`` could not place from the audio (isolated, unreadable, out of vocabulary)
+    goes back to the prior too, whatever the distance: the transform is real evidence from
+    hundreds of anchors, while an interpolation between two neighbours is a guess. Both keep a
+    reason, so neither disappears from suspect.srt.
+    """
+    reverted = 0
+    for i, timing in enumerate(out):
+        if i >= len(prior):
+            break
+        if timing is None:
+            out[i] = LineTiming(prior[i].index, prior[i].start, prior[i].end,
+                                reason=prior[i].reason or REASON_OFF_PRIOR)
+            reverted += 1
+            continue
+        off = abs(timing.start - prior[i].start) > tolerance
+        if not off and timing.reason is None:
+            continue
+        out[i] = LineTiming(
+            prior[i].index, prior[i].start, prior[i].end, timing.score,
+            reason=timing.reason or prior[i].reason or REASON_OFF_PRIOR,
+        )
+        reverted += 1
+    stats["off_prior"] = stats.get("off_prior", 0) + reverted
+    return reverted
+
+
+def segments_from_timings(
+    lines: Sequence[TranscriptLine],
+    timings: Sequence[LineTiming],
+    dropped: frozenset = frozenset(),
+) -> List[dict]:
+    """Finished cues straight from the timings, with no forced alignment.
+
+    Mode ``sync`` only. There are no word timings because nothing measured any: the cue's
+    span came from the transform, and inventing per-character times to fill the field would
+    be asserting precision that was never there.
+    """
+    by_index = {timing.index: timing for timing in timings}
+    segments: List[dict] = []
+    for line in lines:
+        if line.index in dropped:
+            continue
+        timing = by_index.get(line.index)
+        if timing is None or not line.text:
+            continue
+        segment = {
+            "start": float(timing.start), "end": float(timing.end),
+            "text": line.text, "words": [],
+        }
+        if timing.reason:
+            segment["realign_reason"] = timing.reason
+        segments.append(segment)
+    return segments
 
 
 def flag_unconstrained(

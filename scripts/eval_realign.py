@@ -12,6 +12,15 @@ CER score *text*, and --realign never changes the text.
     uv run python scripts/eval_realign.py ... --anchor both
     uv run python scripts/eval_realign.py ... --worst 20
 
+For ``--realign_mode sync`` and ``adjust`` the two halves come apart, because those modes
+*read* the input's timings: the thing being realigned is a subtitle timed against some other
+release, and the answer key is a separate SRT known to be right for this audio. So pass both::
+
+    uv run python scripts/eval_realign.py --audio bluray.mkv --mode sync \
+        --input broadcast.srt --groundtruth correct-for-bluray.srt
+
+Handing ``--mode sync`` no ``--input`` is refused rather than silently measuring the identity.
+
 Two things to know when reading the numbers:
 
 * **Text cleaning is off by default**, so every transcript line survives to the output and the
@@ -36,7 +45,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from cantocaptions_ai.pipeline.retime import load_subtitle_file  # noqa: E402
+from cantocaptions_ai.utils.subtitles import load_subtitle_file  # noqa: E402
 
 THRESHOLDS = (0.25, 0.5, 1.0, 2.0)
 
@@ -62,7 +71,7 @@ def write_transcript(cues: Sequence[dict], path: str) -> None:
 
 def run_realign(
     audio: str, transcript: str, workdir: str, name: str,
-    anchor: str, clean: bool, extra_args: Sequence[str],
+    anchor: str, clean: bool, extra_args: Sequence[str], mode: str = "transcript",
 ) -> Tuple[str, float]:
     """Run the pipeline once; return (path to its SRT, wall seconds)."""
     out_dir = os.path.join(workdir, name)
@@ -71,10 +80,14 @@ def run_realign(
         "uv", "run", "cantocaptions", audio,
         "--realign", transcript,
         "--realign_anchor", anchor,
+        "--realign_mode", mode,
         "--output_dir", out_dir,
         "--output_format", "srt",
         "--debug_dir", os.path.join(out_dir, "debug"),
     ]
+    # sync and adjust suppress cleaning themselves (their input is a finished subtitle), so
+    # asking for --no_clean_text on top would be redundant but harmless; keep the flag tied to
+    # what the harness is actually measuring.
     if not clean:
         cmd += ["--no_clean_text"]
     cmd += list(extra_args)
@@ -151,6 +164,37 @@ def report(name: str, res: Dict[str, object], elapsed: float) -> None:
     print(f"  wall            {elapsed:.1f}s")
 
 
+def show_transform(debug_dir: str, audio: str) -> None:
+    """Print the fitted transform, if the run produced one (modes sync and adjust).
+
+    The error table says *how well* the run did; this says *what it decided*, which is what
+    you need to tell a good fit from a lucky one. A file whose cues all land within 0.5 s via
+    six transform pieces and a cut is not the same result as one that got there with a single
+    offset, even though the table cannot tell them apart.
+    """
+    import glob
+    import json
+    matches = glob.glob(os.path.join(debug_dir, "*", "realign", "transform.json"))
+    if not matches:
+        return
+    with open(matches[0], encoding="utf-8") as fh:
+        data = json.load(fh)
+    named = f"  ({data['named_ratio']})" if data.get("named_ratio") else ""
+    print(f"\n  transform       mode {data['mode']}, scale {data['scale']:.6f}{named}"
+          f"{'  [REFUSED -- timings unchanged]' if data.get('refused') else ''}")
+    for piece in data["pieces"]:
+        start = "start" if piece["source_start"] is None else f"{piece['source_start']:.1f}s"
+        end = "end" if piece["source_end"] is None else f"{piece['source_end']:.1f}s"
+        print(f"    [{start:>8s}-{end:>8s}] x{piece['scale']:.6f} {piece['offset']:+8.3f}s  "
+              f"{piece['anchors']:4d} anchors  resid p90 {piece['residual_p90']:.2f}s")
+    for brk in data["breaks"]:
+        print(f"    {brk['kind']:6s} {brk['target_seconds']:6.1f}s at source "
+              f"{brk['source_start']:8.1f}s  ({len(brk['cues'])} cue(s) affected)")
+    print(f"    anchors {data['anchors_used']} used / {len(data['anchors_rejected'])} rejected"
+          f"   dropped cues {len(data['dropped_cues'])}"
+          f"   moved median {data['median_move']:+.2f}s")
+
+
 def show_worst(truth, hyp, res, limit: int) -> None:
     pairs, errs = res["pairs"], res["start_err"]
     order = sorted(range(len(pairs)), key=lambda k: errs[k], reverse=True)[:limit]
@@ -170,7 +214,17 @@ def main() -> None:
     )
     parser.add_argument("--audio", required=True, help="audio or video file to align against")
     parser.add_argument("--groundtruth", required=True,
-                        help="SRT holding the correct timings; its text becomes the transcript")
+                        help="SRT holding the correct timings for this audio -- the answer key. "
+                             "With no --input its text is also what gets realigned.")
+    parser.add_argument("--input", default=None,
+                        help="the subtitle or transcript to realign. Defaults to the ground "
+                             "truth with its timings stripped, which is the right control for "
+                             "mode 'transcript'. For 'sync' and 'adjust' pass the *misaligned* "
+                             "subtitle here -- those modes read its timings, so handing them "
+                             "the answer key would measure nothing.")
+    parser.add_argument("--mode", default="transcript",
+                        choices=["transcript", "sync", "adjust"],
+                        help="--realign_mode to measure")
     parser.add_argument("--workdir", default=os.path.join(REPO_ROOT, "temp", "realign_eval"))
     parser.add_argument("--anchor", default="acoustic",
                         choices=["acoustic", "asr", "both"],
@@ -186,19 +240,31 @@ def main() -> None:
 
     os.makedirs(args.workdir, exist_ok=True)
     truth = load_subtitle_file(args.groundtruth)
-    transcript = os.path.join(args.workdir, f"{_stem(args.groundtruth)}.transcript.txt")
-    write_transcript(truth, transcript)
-    print(f"{len(truth)} ground-truth cues -> {transcript}")
+    if args.input:
+        transcript = args.input
+        print(f"{len(truth)} ground-truth cues; realigning {transcript} in mode {args.mode!r}")
+    else:
+        if args.mode != "transcript":
+            raise SystemExit(
+                f"--mode {args.mode} reads the input's own timings, so scoring it against the "
+                "file it came from would measure nothing. Pass the misaligned subtitle as "
+                "--input."
+            )
+        transcript = os.path.join(args.workdir, f"{_stem(args.groundtruth)}.transcript.txt")
+        write_transcript(truth, transcript)
+        print(f"{len(truth)} ground-truth cues -> {transcript}")
 
     anchors = ["acoustic", "asr"] if args.anchor == "both" else [args.anchor]
     results = {}
     for anchor in anchors:
         srt, elapsed = run_realign(
             args.audio, transcript, args.workdir, anchor, anchor, args.clean, args.extra_args,
+            mode=args.mode,
         )
         res = score(truth, load_subtitle_file(srt))
         results[anchor] = res
         report(anchor, res, elapsed)
+        show_transform(os.path.join(args.workdir, anchor, "debug"), args.audio)
         if args.worst:
             show_worst(truth, load_subtitle_file(srt), res, args.worst)
 

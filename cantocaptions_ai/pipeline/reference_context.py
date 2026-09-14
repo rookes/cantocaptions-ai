@@ -61,7 +61,7 @@ def shift_cues(cues: Sequence[SingleSegment], offset: float) -> List[SingleSegme
     release, or OCR'd from burned-in subs) and can carry a constant offset. Both consumers
     are sensitive to it: expansion pads the wrong spans, and per-segment context attaches
     cues to the wrong segment near a boundary. A constant shift is the cheap fix; for a
-    drifting or scene-by-scene offset use ``--retime``, which realigns acoustically.
+    drifting or scene-by-scene offset use ``--realign``, which fits the transform acoustically.
 
     Cues are clamped at zero and any that end up entirely before the start are dropped.
     """

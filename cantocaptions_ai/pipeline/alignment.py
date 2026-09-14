@@ -683,7 +683,7 @@ def _compute_vad_emissions(
 
 
 def compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size: int = 4, vram_checks: bool = True, primer=None):
-    """Public wrapper around _compute_vad_emissions for use by the retime pipeline."""
+    """Public wrapper around _compute_vad_emissions, for callers outside this module."""
     return _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size, vram_checks=vram_checks, primer=primer)
 
 
@@ -1217,7 +1217,7 @@ def load_align_model(
 def load_bert_processor(model_dir=None, model_cache_only: bool = False):
     """Load the Wav2Vec2-BERT processor used for particle disambiguation during alignment.
 
-    Shared by both the --retime and normal alignment paths in transcribe.py, which
+    Shared by both the --realign and normal alignment paths in transcribe.py, which
     otherwise each held their own unlogged, cache_dir/local_files_only-blind
     from_pretrained call for the same repo.
     """

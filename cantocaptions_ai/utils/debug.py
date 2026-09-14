@@ -20,6 +20,20 @@ from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
 
+# How many cues either side of a transform breakpoint changes.srt shows.
+#
+# A per-cue "moved further than the median" threshold was tried here first and is useless for
+# the case that matters. Under a speed change every cue moves by a different amount *by
+# design* -- on the ReZero Blu-ray the first cue shifts +0.8 s and the last +127 s -- so
+# comparing each move against the file median flagged 876 of 956 cues and buried the handful
+# worth reading.
+#
+# What a reader actually needs is the seam: an edit is a local event, and checking it means
+# watching the cues on either side of it line up. So the file holds every cue the recording
+# has no audio for, every cue carrying a reason, and this many neighbours around each
+# breakpoint -- a few dozen lines instead of the whole subtitle.
+BREAK_CONTEXT_CUES = 5
+
 
 def _stem(audio_path: str) -> str:
     """Directory name a file's checkpoints live under.
@@ -359,6 +373,136 @@ def write_realign_debug(
     logger.info(
         f"Realign debug output written to {json_path} "
         f"({output['num_lines']} lines, {output['num_unplaced']} unplaced)"
+    )
+
+
+def write_realign_transform(
+    audio_path: str, transcript_path: str, mode: str, lines: list, timings: list,
+    transform, report, dropped, debug_dir: str,
+) -> None:
+    """Write what the fitted transform did, as JSON and as a watchable SRT.
+
+    Two files, because they answer different questions. ``transform.json`` is the record --
+    every piece, every cut and insertion, the anchors that were used *and the ones that were
+    trimmed*, and one row per cue saying where it moved from and to. ``changes.srt`` is the
+    one you actually load beside the video: only the cues whose move differs from the file's
+    median move, plus every cue the recording has no audio for, each labelled with what
+    happened to it.
+
+    A whole-file shift moves every cue by the same amount and is not interesting per cue, so
+    the SRT reports the *residual* move. That is what turns "956 cues moved by a minute" into
+    the handful of places where something other than the offset happened.
+    """
+    stage_dir = _stage_dir(audio_path, "realign", debug_dir)
+    by_index = {line.index: line for line in lines}
+
+    # Which cues sit either side of an edit. Found by source time rather than by cue index,
+    # because a breakpoint lands in a gap between cues and belongs to neither of them.
+    near_break = {}
+    ordered = [t for t in timings if by_index.get(t.index) is not None]
+    for brk in transform.breaks:
+        after = [
+            k for k, t in enumerate(ordered)
+            if by_index[t.index].source_start is not None
+            and by_index[t.index].source_start >= brk.source_start
+        ]
+        pivot = after[0] if after else len(ordered)
+        label = (
+            f"an insertion of {brk.seconds:.1f}s" if brk.kind == "insert" else
+            f"a cut of {brk.seconds:.1f}s ({brk.source_seconds:.1f}s of the subtitle)"
+        )
+        for k in range(max(0, pivot - BREAK_CONTEXT_CUES),
+                       min(len(ordered), pivot + BREAK_CONTEXT_CUES)):
+            side = "before" if k < pivot else "after"
+            near_break[ordered[k].index] = f"{side} {label}"
+
+    rows = []
+    cues = []
+    for timing in timings:
+        line = by_index.get(timing.index)
+        if line is None:
+            continue
+        was_dropped = timing.index in dropped
+        source_start = line.source_start
+        move = None if source_start is None else round(timing.start - source_start, 3)
+        cues.append({
+            "index": timing.index,
+            "source_start": source_start,
+            "source_end": line.source_end,
+            "start": round(timing.start, 3),
+            "end": round(timing.end, 3),
+            "move": move,
+            "dropped": was_dropped,
+            "reason": timing.reason,
+            "text": line.text,
+        })
+        labels = []
+        if was_dropped:
+            labels.append("dropped: no audio in this recording")
+        elif timing.reason:
+            labels.append(timing.reason)
+        if timing.index in near_break:
+            labels.append(near_break[timing.index])
+        if labels:
+            # "moved +0.0s" is noise, and reads as though something happened.
+            if move is not None and abs(move) >= 0.05:
+                labels.append(f"moved {move:+.1f}s")
+            rows.append((timing.start, timing.end, labels, line.text))
+
+    output = {
+        "audio_path": os.path.abspath(audio_path),
+        "transcript_path": os.path.abspath(transcript_path),
+        "mode": mode,
+        "scale": round(report.scale, 8),
+        "named_ratio": report.named_ratio,
+        "refused": report.refused,
+        "median_move": round(report.median_move, 3),
+        "max_move": round(report.max_move, 3),
+        "residual_p50": round(report.residual_p50, 4),
+        "residual_p90": round(report.residual_p90, 4),
+        "pieces": [
+            {
+                "source_start": None if p.x0 == float("-inf") else round(p.x0, 3),
+                "source_end": None if p.x1 == float("inf") else round(p.x1, 3),
+                "scale": round(p.scale, 8),
+                "offset": round(p.offset, 4),
+                "free_slope": p.free_slope,
+                "anchors": p.anchors,
+                "residual_p50": round(p.residual_p50, 4),
+                "residual_p90": round(p.residual_p90, 4),
+            }
+            for p in transform.pieces
+        ],
+        "breaks": [
+            {
+                "kind": b.kind,
+                "source_start": round(b.source_start, 3),
+                "source_end": round(b.source_end, 3),
+                "target_seconds": round(b.seconds, 3),
+                "source_seconds": round(b.source_seconds, 3),
+                "cues": [
+                    {"index": i, "text": by_index[i].text}
+                    for i in b.cue_indices if i in by_index
+                ],
+            }
+            for b in transform.breaks
+        ],
+        # The rejected anchors matter as much as the kept ones: when a fit looks wrong, they
+        # are the first thing to read.
+        "anchors_used": len(transform.used),
+        "anchors_rejected": list(transform.rejected),
+        "dropped_cues": sorted(dropped),
+        "cues": cues,
+    }
+    json_path = os.path.join(stage_dir, "transform.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    srt_path = os.path.join(stage_dir, "changes.srt")
+    count = write_labelled_srt(srt_path, rows)
+    logger.info(
+        "Realign transform written to %s (%d piece(s), %d break(s)); %d notable change(s) "
+        "in %s", json_path, len(transform.pieces), len(transform.breaks), count, srt_path,
     )
 
 

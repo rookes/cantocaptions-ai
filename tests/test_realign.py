@@ -26,9 +26,11 @@ from cantocaptions_ai.pipeline.realign import (
     REALIGN_PUNCTUATION,
     REALIGN_SENTINEL,
     EmissionTimeline,
+    REASON_CUT,
     REASON_ISOLATED,
     REASON_NO_AUDIO,
     REASON_NO_VOCABULARY,
+    REASON_OFF_PRIOR,
     LineTiming,
     TranscriptLine,
     MAX_CHARS_PER_SECOND,
@@ -41,11 +43,16 @@ from cantocaptions_ai.pipeline.realign import (
     _bounded_timing,
     _char_times,
     acquire,
+    anchor_pairs,
     _core_token_run,
     _sanitize,
     assign_lines,
     assign_lines_via_asr,
+    bracket_blocks,
     build_align_input,
+    clamp_to_prior,
+    segments_from_timings,
+    source_spans,
     enforce_cue_order,
     ensure_visible_cues,
     sanitise_anchors,
@@ -107,6 +114,69 @@ class TestNormalization(unittest.TestCase):
         # The source file uses U+22EF, which is neither in the vocab nor a split char.
         self.assertEqual(normalize_transcript_text("你呀⋯⋯"), "你呀…")
         self.assertEqual(normalize_transcript_text("你呀……"), "你呀…")
+
+    def test_an_ascii_ellipsis_folds_whole_and_not_one_dot_at_a_time(self):
+        """A dot run must be folded before the fullwidth pass, not by it.
+
+        That pass works one character at a time, so in 美少...女 the first dot follows a CJK
+        character and became a full stop on its own, leaving 美少。..女 -- found on the ReZero
+        fixture, where two cues came out mangled.
+        """
+        self.assertEqual(normalize_transcript_text("美少...女"), "美少…女")
+        self.assertEqual(normalize_transcript_text("你...你係"), "你…你係")
+        self.assertEqual(normalize_transcript_text("等等......"), "等等…")
+        self.assertEqual(normalize_transcript_text("a..b"), "a…b")
+
+    def test_a_single_dot_is_still_a_full_stop(self):
+        # Two dots are an ellipsis; one is a full stop, and a decimal point is neither.
+        self.assertEqual(normalize_transcript_text("唔該."), "唔該。")
+        self.assertEqual(normalize_transcript_text("價錢係1.5蚊"), "價錢係1.5蚊")
+
+    def test_a_run_of_marks_converts_as_a_unit(self):
+        """Judging each mark by its immediate neighbour splits the run.
+
+        The ! sees 話 and converts; the ? sees the halfwidth ! and does not, so 咩話!? came out
+        as 咩話！? -- two widths in one breath. The lookback steps over other marks to find the
+        text the whole run is attached to.
+        """
+        self.assertEqual(normalize_transcript_text("咩話!?"), "咩話！？")
+        self.assertEqual(normalize_transcript_text("你好,,,"), "你好，，，")
+
+    def test_a_mark_after_an_ellipsis_still_sees_the_chinese(self):
+        self.assertEqual(normalize_transcript_text("你好…?"), "你好…？")
+
+    def test_a_supplementary_plane_ideograph_counts_as_chinese(self):
+        """Written Cantonese uses plane-2 ideographs, and a lookback capped at U+9FFF misses
+        them: 62 cues across the test fixtures contain one (𠸏 alone appears 40 times)."""
+        self.assertEqual(normalize_transcript_text("\U00020E0F?"), "\U00020E0F？")
+        self.assertEqual(normalize_transcript_text("\U000210C1,"), "\U000210C1，")
+
+    def test_digits_are_not_stepped_over(self):
+        # Stepping back over digits as well would turn a decimal into a full stop the moment
+        # the line also contained Chinese.
+        self.assertEqual(normalize_transcript_text("價錢係3,000蚊"), "價錢係3,000蚊")
+        self.assertEqual(normalize_transcript_text("我用Windows."), "我用Windows.")
+
+    def test_an_english_clause_keeps_its_own_punctuation(self):
+        self.assertEqual(normalize_transcript_text("OK, 你好"), "OK, 你好")
+
+    def test_normalization_can_be_turned_off_entirely(self):
+        """--realign_normalize False hands the text through exactly as written.
+
+        A real trade rather than a safer setting: a halfwidth mark is in neither the align
+        vocabulary nor split_chars, so it is dropped and the pause it stands for goes
+        unmodelled. Worth it when the input's punctuation is deliberate.
+        """
+        for raw in ("世界呀?", "美少...女", "喂  有三個人", "咩話!?"):
+            self.assertEqual(normalize_transcript_text(raw, punctuation=False), raw)
+
+    def test_the_sentinel_is_stripped_even_with_normalization_off(self):
+        # Not cosmetic: a stray sentinel in the source would be read as a cue boundary and
+        # split the line in two.
+        self.assertEqual(
+            normalize_transcript_text("你" + REALIGN_SENTINEL + "好", punctuation=False),
+            "你好",
+        )
 
     def test_space_runs_collapse_but_a_single_space_survives(self):
         self.assertEqual(normalize_transcript_text("喂  有三個人"), "喂 有三個人")
@@ -1133,6 +1203,213 @@ class TestDwellingCharacters(unittest.TestCase):
         emission = self._emission(310, {1: "a"})
         self.assertEqual(
             _reseat_dwelling_chars(chars, emission, [VOCAB["a"], BLANK], BLANK, 0.04), 0)
+
+
+class TestTimedTranscriptLoading(unittest.TestCase):
+    """A subtitle input keeps its timings and its intra-cue line breaks."""
+
+    SRT = (
+        "1\r\n00:00:05,000 --> 00:00:07,000\r\n-講真嘠？\r\n-講真㗎！\r\n\r\n"
+        "2\r\n00:00:08,000 --> 00:00:09,500\r\n哦，   原來係噉\r\n\r\n"
+    )
+
+    def _write(self, name, text):
+        import os
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), name)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        return path
+
+    def test_keep_timings_populates_the_source_span(self):
+        lines = load_transcript_lines(self._write("a.srt", self.SRT), keep_timings=True)
+        self.assertEqual(len(lines), 2)
+        self.assertAlmostEqual(lines[0].source_start, 5.0)
+        self.assertAlmostEqual(lines[0].source_end, 7.0)
+        self.assertTrue(all(line.timed for line in lines))
+
+    def test_without_keep_timings_the_input_is_a_bare_transcript(self):
+        lines = load_transcript_lines(self._write("a.srt", self.SRT))
+        self.assertTrue(all(not line.timed for line in lines))
+        self.assertIsNone(lines[0].source_start)
+
+    def test_a_line_break_inside_a_cue_survives(self):
+        # 5 of the 7 multi-line cues in the ReZero fixture are two-speaker exchanges, so
+        # flattening this would change the content and not merely the formatting.
+        lines = load_transcript_lines(self._write("a.srt", self.SRT), keep_timings=True)
+        self.assertIn("\n", lines[0].text)
+        self.assertEqual(lines[0].text.count("\n"), 1)
+
+    def test_space_runs_collapse_within_a_line_without_eating_the_break(self):
+        lines = load_transcript_lines(self._write("a.srt", self.SRT), keep_timings=True)
+        self.assertNotIn("  ", lines[1].text)
+        self.assertNotIn("\n", lines[1].text)
+
+    def test_a_plain_transcript_has_no_timings(self):
+        lines = load_transcript_lines(self._write("a.txt", "one\ntwo\n\nthree\n"),
+                                      keep_timings=True)
+        self.assertEqual([line.text for line in lines], ["one", "two", "three"])
+        self.assertTrue(all(not line.timed for line in lines))
+
+    def test_source_spans_refuses_an_untimed_line(self):
+        lines = load_transcript_lines(self._write("a.txt", "one\ntwo\n"))
+        with self.assertRaises(ValueError):
+            source_spans(lines)
+
+
+class TestNewlineTokenisation(unittest.TestCase):
+    """The aligner has to see an intra-cue break as a pause, not drop it."""
+
+    def test_a_newline_is_in_split_chars(self):
+        self.assertIn("\n", REALIGN_PUNCTUATION.split_chars)
+
+    def test_a_newline_becomes_the_blank_token(self):
+        tokens = line_tokens("a\nb", "yue", VOCAB, BLANK, REALIGN_PUNCTUATION)
+        # Dropping it outright would run the two speakers' clauses together with no pause
+        # for CTC to spend the silence on.
+        self.assertEqual(tokens, [VOCAB["a"], BLANK, VOCAB["b"]])
+
+    def test_a_cue_span_slice_still_carries_the_newline(self):
+        data = _preprocess_segment("a\nb", "yue", VOCAB, REALIGN_PUNCTUATION,
+                                   spans=[(0, 2)])
+        text = "".join(data["clean_char"])
+        self.assertIn("\n", text)
+
+
+class TestAnchorPairs(unittest.TestCase):
+    """What the transform is fitted against."""
+
+    def _lines(self):
+        return [TranscriptLine(i, "abcd", source_start=10.0 * i, source_end=10.0 * i + 2.0)
+                for i in range(4)]
+
+    def test_pairs_use_starts_and_carry_the_score_as_weight(self):
+        chain = [(1, 110.0, 112.0, 0.8), (3, 130.0, 132.0, 0.6)]
+        pairs = anchor_pairs(chain, self._lines())
+        self.assertEqual([(p[0], p[1]) for p in pairs], [(10.0, 110.0), (30.0, 130.0)])
+        self.assertAlmostEqual(pairs[0][2], 0.8)
+
+    def test_an_untimed_line_contributes_no_pair(self):
+        lines = self._lines()
+        lines[1] = TranscriptLine(1, "abcd")
+        self.assertEqual(len(anchor_pairs([(1, 110.0, 112.0, 0.8)], lines)), 0)
+
+    def test_a_nan_score_still_yields_a_usable_weight(self):
+        pairs = anchor_pairs([(0, 5.0, 6.0, float("nan"))], self._lines())
+        self.assertEqual(len(pairs), 1)
+        self.assertGreater(pairs[0][2], 0.0)
+
+
+class TestBracketBlocks(unittest.TestCase):
+    """Mode adjust cuts the transcript into blocks fill() can be trusted with."""
+
+    def _prior(self, starts, duration=1.0):
+        return [LineTiming(i, s, s + duration) for i, s in enumerate(starts)]
+
+    def test_blocks_are_disjoint_sorted_and_cover_every_line_once(self):
+        prior = self._prior([0.0, 2.0, 4.0, 40.0, 42.0, 100.0])
+        blocks = bracket_blocks(prior, 2.0, 0.0, 200.0)
+        covered = []
+        for lo, hi, _t0, _t1 in blocks:
+            covered.extend(range(lo, hi))
+        self.assertEqual(covered, list(range(len(prior))))
+        for (_lo, _hi, _a0, a1), (_lo2, _hi2, b0, _b1) in zip(blocks, blocks[1:]):
+            self.assertLessEqual(a1, b0 + 1e-9)
+
+    def test_a_wide_gap_splits_a_block(self):
+        prior = self._prior([0.0, 2.0, 100.0])
+        self.assertEqual(len(bracket_blocks(prior, 2.0, 0.0, 200.0)), 2)
+
+    def test_a_narrow_gap_does_not(self):
+        prior = self._prior([0.0, 2.0, 4.0])
+        self.assertEqual(len(bracket_blocks(prior, 5.0, 0.0, 200.0)), 1)
+
+    def test_brackets_stay_inside_the_file(self):
+        prior = self._prior([0.5, 199.0])
+        for _lo, _hi, t0, t1 in bracket_blocks(prior, 5.0, 0.0, 200.0):
+            self.assertGreaterEqual(t0, 0.0)
+            self.assertLessEqual(t1, 200.0)
+
+    def test_no_lines_gives_no_blocks(self):
+        self.assertEqual(bracket_blocks([], 2.0, 0.0, 10.0), [])
+
+
+class TestClampToPrior(unittest.TestCase):
+    """The transform bounds the aligner; inside the bound the aligner wins."""
+
+    def _prior(self):
+        return [LineTiming(i, 10.0 * i, 10.0 * i + 2.0) for i in range(3)]
+
+    def test_a_placement_inside_the_tolerance_is_kept(self):
+        prior = self._prior()
+        out = [LineTiming(0, 1.0, 3.0), LineTiming(1, 11.0, 13.0), LineTiming(2, 20.5, 22.5)]
+        stats = {}
+        self.assertEqual(clamp_to_prior(out, prior, 2.0, stats), 0)
+        self.assertAlmostEqual(out[1].start, 11.0)
+
+    def test_a_placement_past_the_tolerance_reverts_and_is_flagged(self):
+        prior = self._prior()
+        out = [LineTiming(0, 0.0, 2.0), LineTiming(1, 25.0, 27.0), LineTiming(2, 20.0, 22.0)]
+        stats = {}
+        self.assertEqual(clamp_to_prior(out, prior, 2.0, stats), 1)
+        self.assertAlmostEqual(out[1].start, 10.0)
+        self.assertEqual(out[1].reason, REASON_OFF_PRIOR)
+
+    def test_a_line_with_no_acoustic_support_reverts_whatever_the_distance(self):
+        # An interpolation between two neighbours is a guess; the transform is evidence from
+        # hundreds of anchors. Distance is not the point here.
+        prior = self._prior()
+        out = [LineTiming(0, 0.0, 2.0),
+               LineTiming(1, 10.1, 12.1, reason=REASON_ISOLATED),
+               LineTiming(2, 20.0, 22.0)]
+        stats = {}
+        self.assertEqual(clamp_to_prior(out, prior, 2.0, stats), 1)
+        self.assertAlmostEqual(out[1].start, 10.0)
+        self.assertEqual(out[1].reason, REASON_ISOLATED)
+
+    def test_an_unplaced_line_takes_the_prior(self):
+        prior = self._prior()
+        out = [LineTiming(0, 0.0, 2.0), None, LineTiming(2, 20.0, 22.0)]
+        stats = {}
+        self.assertEqual(clamp_to_prior(out, prior, 2.0, stats), 1)
+        self.assertAlmostEqual(out[1].start, 10.0)
+
+
+class TestSegmentsFromTimings(unittest.TestCase):
+    """Mode sync emits cues with no forced alignment behind them."""
+
+    def _lines(self):
+        return [TranscriptLine(i, f"line{i}", source_start=i * 10.0, source_end=i * 10.0 + 2.0)
+                for i in range(3)]
+
+    def test_cues_come_out_in_order_and_visible(self):
+        lines = self._lines()
+        timings = [LineTiming(i, i * 10.0, i * 10.0 + 2.0) for i in range(3)]
+        segments = segments_from_timings(lines, timings)
+        self.assertEqual(len(segments), 3)
+        for a, b in zip(segments, segments[1:]):
+            self.assertLessEqual(a["end"], b["start"])
+        for seg in segments:
+            self.assertGreater(seg["end"], seg["start"])
+
+    def test_no_word_timings_are_invented(self):
+        # Nothing measured a character here, and filling the field would assert a precision
+        # that was never there.
+        lines = self._lines()
+        timings = [LineTiming(i, i * 10.0, i * 10.0 + 2.0) for i in range(3)]
+        self.assertTrue(all(seg["words"] == [] for seg in segments_from_timings(lines, timings)))
+
+    def test_dropped_cues_are_omitted(self):
+        lines = self._lines()
+        timings = [LineTiming(i, i * 10.0, i * 10.0 + 2.0) for i in range(3)]
+        segments = segments_from_timings(lines, timings, frozenset({1}))
+        self.assertEqual([seg["text"] for seg in segments], ["line0", "line2"])
+
+    def test_a_reason_reaches_the_cue(self):
+        lines = self._lines()
+        timings = [LineTiming(0, 0.0, 2.0, reason=REASON_CUT)]
+        segments = segments_from_timings(lines[:1], timings)
+        self.assertEqual(segments[0]["realign_reason"], REASON_CUT)
 
 
 if __name__ == "__main__":

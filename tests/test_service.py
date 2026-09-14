@@ -64,10 +64,71 @@ class TestValidateConfig(unittest.TestCase):
         with self.assertRaises(ConfigError):
             validate_config(cfg)
 
-    def test_asr_context_conflicts_with_retime(self):
+    def test_asr_context_conflicts_with_an_acoustic_realign(self):
+        # The acoustic anchor skips ASR entirely, so there is no decode for context to bias.
         cfg = PipelineConfig(
-            reference_subtitle="ref.srt", asr_context=True, retime="in.srt"
+            reference_subtitle="ref.srt", asr_context=True,
+            realign=__file__, realign_anchor="acoustic", realign_mode="transcript",
         )
+        with self.assertRaises(ConfigError):
+            validate_config(cfg)
+
+
+class TestRealignModeValidation(unittest.TestCase):
+    """--realign_mode has to agree with what the input file actually carries."""
+
+    def _write(self, name, text):
+        import os
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), name)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        return path
+
+    SRT = "1\n00:00:01,000 --> 00:00:02,000\nhello\n\n"
+
+    def test_sync_needs_an_input_that_has_timings(self):
+        cfg = PipelineConfig(
+            realign=self._write("a.txt", "one\ntwo\n"), realign_mode="sync",
+        )
+        with self.assertRaises(ConfigError):
+            validate_config(cfg)
+
+    def test_sync_is_accepted_for_a_subtitle(self):
+        cfg = PipelineConfig(realign=self._write("a.srt", self.SRT), realign_mode="sync")
+        validate_config(cfg)
+
+    def test_transcript_mode_accepts_a_subtitle_and_discards_its_timings(self):
+        cfg = PipelineConfig(realign=self._write("a.srt", self.SRT),
+                             realign_mode="transcript")
+        validate_config(cfg)
+
+    def test_an_unknown_mode_is_rejected(self):
+        cfg = PipelineConfig(realign=self._write("a.srt", self.SRT), realign_mode="nudge")
+        with self.assertRaises(ConfigError):
+            validate_config(cfg)
+
+    def test_an_unknown_cut_policy_is_rejected(self):
+        cfg = PipelineConfig(realign=self._write("a.srt", self.SRT),
+                             realign_cut_policy="squeeze")
+        with self.assertRaises(ConfigError):
+            validate_config(cfg)
+
+    def test_max_scale_must_be_a_fraction(self):
+        cfg = PipelineConfig(realign=self._write("a.srt", self.SRT), realign_max_scale=1.5)
+        with self.assertRaises(ConfigError):
+            validate_config(cfg)
+
+    def test_no_align_is_allowed_with_sync_which_never_aligns(self):
+        # max_line_count/width are a separate, pre-existing no_align conflict; clear them so
+        # this test is about the realign rule and nothing else.
+        cfg = PipelineConfig(realign=self._write("a.srt", self.SRT), realign_mode="sync",
+                             no_align=True, max_line_count=None, max_line_width=None)
+        validate_config(cfg)
+
+    def test_no_align_still_conflicts_with_transcript_mode(self):
+        cfg = PipelineConfig(realign=self._write("a.txt", "one\ntwo\n"),
+                             realign_mode="transcript", no_align=True)
         with self.assertRaises(ConfigError):
             validate_config(cfg)
 

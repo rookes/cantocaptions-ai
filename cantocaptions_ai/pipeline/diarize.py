@@ -222,7 +222,7 @@ class SegmentDiarization(_BaseDiarization):
         if segments is None:
             raise RuntimeError(
                 "--diarize_scope segment needs the VAD segments, which are not available for "
-                f"'{item['audio_path']}' (this happens under --retime). "
+                f"'{item['audio_path']}'. "
                 "Use --diarize_scope file instead."
             )
         return segments

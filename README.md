@@ -63,9 +63,52 @@ breaks are treated as the authoritative cue boundaries, so the output has one cu
 (interjection-only lines aside, which the cleaning rules drop). Text cleaning and the
 acoustic particle spot-checks (喇/啦, 呀/啊/吖, 咁/噉) run as they do on ASR output.
 
-An SRT works too, in which case its timings are discarded and re-derived from scratch. That
-is the difference from `--retime`, which *keeps* a subtitle's timings and nudges them, and so
-needs one that is already roughly in sync.
+#### Retiming a subtitle onto a different release
+
+Pass a subtitle that already has timings and `--realign` will keep them as a starting point
+instead of discarding them:
+
+```bash
+uv run cantocaptions bluray.mkv --realign broadcast.srt
+```
+
+This is the case where a subtitle was timed against one release and you want it on another —
+a different broadcast, a Blu-ray, a version with the adverts cut out. It finds the lines it is
+confident about acoustically, fits the simplest map between the two timelines, and moves every
+cue through it, so the subtitle's own rhythm survives exactly. The map can express an offset,
+a speed difference (a PAL broadcast runs ~4.3% fast against its 23.976 fps master), and cuts
+and insertions where one release has content the other does not — all of which it reports:
+
+```
+realign: 956 cue(s) mapped through 3 transform piece(s) from 848 anchor(s) (5 rejected)
+realign: SPEED CHANGE of 1.0434x (close to a 25 -> 23.976 fps conversion)
+realign: insertion of 2.8s at source 00:09:42 -- this recording has audio the subtitle does not cover
+realign: cues moved by a median of +65.98s (largest +127.61s)
+```
+
+With `--debug_dir`, `realign/transform.json` records every piece, every edit and where each
+cue moved from and to, and `realign/changes.srt` holds just the cues that did something other
+than shift with the rest of the file — load it beside the video and step through them.
+
+* `--realign_mode transcript` — ignore the timings after all and place every line from
+  scratch, as for a bare transcript.
+* `--realign_mode adjust` — fit the same map, then re-time each cue from the audio within
+  `--realign_adjust_tolerance` of it. Slower, and it does not preserve the input's proportions.
+* `--realign_cut_policy keep` — where the recording is missing content the subtitle covers,
+  keep those cues (collapsed onto the cut and flagged) instead of dropping them.
+
+Text cleaning is **off** for a subtitle input — it is already a finished subtitle, so its
+wording is left alone — and on for a bare transcript.
+
+Punctuation is still normalized in every mode, which is a smaller thing than cleaning but not
+nothing: a halfwidth `, . ? ! ;` sitting beside Chinese text becomes its fullwidth form, and
+any ellipsis becomes a single `…`. Words are never touched, and punctuation inside an English
+clause is left as written. It matters because a halfwidth mark is in neither the align
+vocabulary nor the pause tokens, so without this the pause it stands for goes unmodelled. Pass
+`--realign_normalize False` to have the text come out byte for byte as it went in, accepting
+that cost.
+
+#### Other options
 
 * `--realign_anchor asr` — transcribe first and match the two texts, instead of searching
   acoustically. Slower, but it can leave a line unmatched rather than forcing it somewhere,
