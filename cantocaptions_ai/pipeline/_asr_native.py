@@ -334,16 +334,27 @@ def load_model_native(
     verbose: bool = False,
     vram_checks: bool = True,
     vram_headroom_mb: int = 512,
+    processor=None,
 ) -> QwenPipelineNative:
+    """Build the native ASR pipeline, loading whatever the caller did not supply.
+
+    ``model`` and ``processor`` may be passed in pre-built. That is how a caller
+    with its own checkpoint layout reuses this pipeline's batching, generation
+    budget and decode unchanged: a LoRA adapter directory, for instance, holds
+    neither base weights nor processor files, so the caller merges the adapter
+    and loads the processor from the base itself. When both are supplied nothing
+    is downloaded.
+    """
     from transformers import AutoModelForMultimodalLM, AutoProcessor
 
     profile = get_model_profile(model_name)
     model_id = profile.hf_id
 
-    try:
-        ensure_hf_model_downloaded(model_id, cache_dir=download_root, local_files_only=local_files_only)
-    except Exception as e:
-        logger.warning("Could not download %r: %s — using cached version if available.", model_id, e)
+    if model is None or processor is None:
+        try:
+            ensure_hf_model_downloaded(model_id, cache_dir=download_root, local_files_only=local_files_only)
+        except Exception as e:
+            logger.warning("Could not download %r: %s — using cached version if available.", model_id, e)
 
     if compute_type == "default":
         compute_type = "float16" if device == "cuda" else "float32"
@@ -369,11 +380,12 @@ def load_model_native(
             ).eval(),
         )
 
-    processor = AutoProcessor.from_pretrained(
-        model_id,
-        local_files_only=local_files_only,
-        cache_dir=download_root,
-    )
+    if processor is None:
+        processor = AutoProcessor.from_pretrained(
+            model_id,
+            local_files_only=local_files_only,
+            cache_dir=download_root,
+        )
 
     # Cap the allocator now that the weights are resident, so the reading reflects
     # true post-load free VRAM. Keeps generation's growing KV-cache from silently

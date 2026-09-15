@@ -217,5 +217,27 @@ class TestAsrScatterAndOrder(unittest.TestCase):
         self.assertEqual([seg["text"] for seg in result["segments"]], [str(m) for m in markers])
 
 
+class TestLoadModelNativeWithSuppliedParts(unittest.TestCase):
+    """A caller that builds its own model and processor (cantocaptions-dataset,
+    for a merged LoRA adapter whose directory has no processor files) must get
+    them back inside the pipeline untouched, with no hub round-trip."""
+
+    def test_supplied_model_and_processor_skip_download_and_loading(self):
+        from unittest import mock
+
+        from cantocaptions_ai.pipeline import _asr_native
+
+        model, processor = _FakeModel(fail_first_call=False), _FakeProcessor()
+        with mock.patch.object(_asr_native, "ensure_hf_model_downloaded") as download,                 mock.patch("transformers.AutoProcessor.from_pretrained") as load_processor:
+            pipe = _asr_native.load_model_native(
+                "runs/some-adapter/merged", device="cpu",
+                model=model, processor=processor, batch_size=2,
+            )
+        download.assert_not_called()
+        load_processor.assert_not_called()
+        self.assertIs(pipe.model, model)
+        self.assertIs(pipe.processor, processor)
+
+
 if __name__ == "__main__":
     unittest.main()
