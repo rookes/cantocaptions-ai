@@ -180,6 +180,14 @@ class PipelineConfig:
     # since a halfwidth mark is in neither the align vocabulary nor split_chars and is simply
     # dropped. See realign.normalize_transcript_text.
     realign_normalize: bool = True
+    # Mode sync only: roughly how many anchors per minute of the file get to set a cue's
+    # start directly, once thinned by residual against the fitted transform (see
+    # timefit.prune_to_density). Every other cue is interpolated between whichever of those
+    # survive nearby. Keeping every anchor exposes every cue to that anchor's own acoustic
+    # search individually -- a confidently-wrong anchor (a repeated phrase confusing CTC, a
+    # stylised reading) scores exactly as well as a correct one, so a confidence floor cannot
+    # separate them; the fitted transform's own residual can.
+    realign_sync_anchor_density: float = 3.0
     # 'acoustic' places lines with a sliding free-end Viterbi and no ASR; 'asr' runs the
     # normal ASR stage and matches the two character streams, which is slower but degrades
     # gracefully when the transcript and the recording disagree.

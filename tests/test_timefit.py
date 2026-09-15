@@ -18,12 +18,15 @@ import pytest
 from cantocaptions_ai.pipeline.timefit import (
     MIN_SEGMENT_ANCHORS,
     TransformError,
+    _pad_starts,
+    _trim_overlaps,
     describe_transform,
     fit_transform,
     identity_transform,
     locate_breaks,
     map_cues,
     named_ratio,
+    prune_to_density,
 )
 
 PAL = 25.0 / (24000.0 / 1001.0)   # 1.0427083..., the classic speed-up
@@ -368,6 +371,235 @@ def test_map_preserves_proportions_inside_a_piece():
     assert gap_out == pytest.approx(gap_in * scale, abs=1e-3)
 
 
+def test_a_cue_that_is_an_anchor_gets_its_own_position_exactly():
+    """An anchor is never re-derived from the line fitted through everyone else's.
+
+    Even a well-estimated piece-wide scale still leaves each anchor scattered around it by
+    that piece's own residual -- a few tenths of a second in practice, which is well past
+    what's visible on screen. A cue that IS an anchor must skip that averaging entirely.
+    """
+    rng = np.random.default_rng(3)
+    xs = np.arange(40) * 20.0
+    noise = rng.normal(0, 0.15, 40)
+    ys = 1.0 * xs + 3.0 + noise
+    data = list(zip(xs.tolist(), ys.tolist(), [1.0] * 40))
+    t = locate_breaks(fit_transform(data, ids=list(range(40))), [])
+    spans = [(x, x + 1.5) for x in xs]
+    out = map_cues(t, spans)
+    for i in range(40):
+        # map_cues rounds to milliseconds for SRT output; that rounding, not this test, is
+        # the precision floor here.
+        assert out[i][0] == pytest.approx(ys[i], abs=1e-3), \
+            f"anchor {i} should be its own measured position, not the fitted line's"
+
+
+def test_a_non_anchor_cue_interpolates_locally_not_off_the_whole_piece():
+    """A filled cue is placed by its two nearest anchors, not a piece-wide average.
+
+    Two anchors bracketing a real local dip in the data pull a non-anchor cue toward
+    themselves; a piece-wide fit, blind to that local structure, would place it on the
+    smooth line instead -- exactly the gap this design closes.
+    """
+    # Two clean anchors, offset by a known local jump, bracketing an unanchored line.
+    pairs_ = [(0.0, 3.0, 1.0), (50.0, 53.5, 1.0), (100.0, 103.0, 1.0),
+              (150.0, 153.0, 1.0), (200.0, 203.0, 1.0)]
+    ids_ = [0, 1, 3, 4, 5]  # line 2 has no anchor of its own -- it must interpolate
+    t = locate_breaks(fit_transform(pairs_, ids=ids_, min_segment_anchors=3), [])
+    spans = {0: (0.0, 1.0), 1: (50.0, 51.0), 2: (75.0, 76.0), 3: (100.0, 101.0),
+             4: (150.0, 151.0), 5: (200.0, 201.0)}
+    ordered = [spans[i] for i in sorted(spans)]
+    out = map_cues(t, ordered)
+    # Line 2 (source 75) sits midway between anchors at 50->53.5 and 100->103: local
+    # interpolation gives 53.5 + 0.5*(103-53.5) = 78.25, not whatever the piece-wide
+    # (noisier) average slope would predict.
+    assert out[2][0] == pytest.approx(78.25, abs=1e-6)
+
+
+def test_interpolation_does_not_cross_a_cut():
+    """The two nearest anchors by source time can straddle a cut; that must not blend them."""
+    before = [(x, x + 1.0, 1.0) for x in (0.0, 20.0, 40.0, 60.0)]
+    after = [(x, x - 30.0 + 1.0, 1.0) for x in (100.0, 120.0, 140.0, 160.0)]
+    pairs_ = before + after
+    ids_ = list(range(8))
+    t = fit_transform(pairs_, ids=ids_, min_segment_anchors=3)
+    spans = [(0.0, 1.0), (20.0, 21.0), (40.0, 41.0), (60.0, 61.0),
+             (80.0, 81.0),  # unanchored line sitting inside the cut gap
+             (100.0, 101.0), (120.0, 121.0), (140.0, 141.0), (160.0, 161.0)]
+    t = locate_breaks(t, spans)
+    assert len(t.breaks) == 1 and t.breaks[0].kind == "cut"
+    out = map_cues(t, spans, cut_policy="keep")
+    # The line inside the gap must fall back to a piece formula, not a straight blend
+    # between an anchor before the cut and one after it.
+    naive_blend = 1.0 + (80.0 - 0.0) / (100.0 - 0.0) * ((100.0 - 30.0 + 1.0) - 1.0)
+    assert out[4][0] != pytest.approx(naive_blend, abs=1.0)
+
+
+def test_duration_scales_by_the_local_rate_not_the_piece_average():
+    """A cue's end still comes from its own duration, scaled by the *local* rate."""
+    rng = np.random.default_rng(4)
+    xs = np.arange(30) * 10.0
+    ys = 1.2 * xs + 1.0 + rng.normal(0, 0.05, 30)
+    data = list(zip(xs.tolist(), ys.tolist(), [1.0] * 30))
+    t = locate_breaks(fit_transform(data, ids=list(range(30)), min_slope_span=50.0), [])
+    spans = [(x, x + 3.0) for x in xs]
+    out = map_cues(t, spans)
+    for i in range(1, 29):
+        local_scale = (ys[i + 1] - ys[i - 1]) / (xs[i + 1] - xs[i - 1])
+        # Both endpoints round to milliseconds independently, so the duration can carry up
+        # to 2x that rounding -- not a precision issue in the mapping itself.
+        assert (out[i][1] - out[i][0]) == pytest.approx(3.0 * local_scale, abs=2e-3)
+
+
+def test_without_ids_map_cues_behaves_exactly_as_before():
+    """No ids given must never let a cue collide with an anchor by coincidental index.
+
+    fit_transform used to default a missing ids to range(n), which happened to equal many
+    callers' own span indices -- silently matching an unrelated cue to a stranger's anchor
+    purely because both carried the same small integer. ids must come back empty instead.
+    """
+    t = fit_transform(pairs(lambda x: 1.05 * x + 2.0, count=40, step=20.0))
+    assert t.ids == ()
+    t = locate_breaks(t, [])
+    spans = [(1.0, 2.0), (2.0, 3.0), (3.0, 4.0)]  # indices 0,1,2 exist in the anchor set too
+    out = map_cues(t, spans)
+    for (s, e), row in zip(spans, out):
+        expected = t.pieces[0].map(s)
+        assert row[0] == pytest.approx(expected, abs=1e-6)
+
+
+# --- Thinning the anchor set sync mode trusts directly --------------------------------
+
+def _noisy_transform(n=120, span=600.0, seed=5, noise=0.15):
+    rng = np.random.default_rng(seed)
+    xs = np.sort(rng.uniform(0, span, n))
+    ys = 1.02 * xs + 1.0 + rng.normal(0, noise, n)
+    data = list(zip(xs.tolist(), ys.tolist(), [1.0] * n))
+    return locate_breaks(fit_transform(data, ids=list(range(n))), [])
+
+
+def test_prune_keeps_roughly_the_requested_density():
+    t = _noisy_transform(n=200, span=600.0)  # 10 minutes
+    pruned = prune_to_density(t, target_per_minute=3.0, min_anchors_per_piece=3)
+    # ~30 anchors targeted (3/min * 10 min); a handful of slack for the two guaranteed edges.
+    assert 25 <= len(pruned.xs) <= 35
+
+
+def test_prune_never_drops_below_the_per_piece_floor():
+    t = _noisy_transform(n=10, span=60.0)  # too short to reach the density target honestly
+    pruned = prune_to_density(t, target_per_minute=3.0, min_anchors_per_piece=5)
+    assert len(pruned.xs) >= 5
+
+
+def test_prune_always_keeps_each_piece_edges():
+    t = _noisy_transform(n=150, span=500.0)
+    pruned = prune_to_density(t, target_per_minute=2.0, min_anchors_per_piece=2)
+    assert min(pruned.xs) == pytest.approx(min(t.xs))
+    assert max(pruned.xs) == pytest.approx(max(t.xs))
+
+
+def test_prune_keeps_the_anchors_closest_to_the_fit():
+    """The whole point: a confidently-wrong anchor is exactly what should be thinned away."""
+    xs = np.arange(60) * 10.0
+    ys = 1.0 * xs + 2.0
+    # Off by enough to be the clear worst residual, but not so much that the segmentation DP
+    # reads a single-point jump as a genuine edit rather than as one noisy anchor -- that
+    # would confound this test with a different mechanism entirely.
+    ys[30] += 3.0
+    data = list(zip(xs.tolist(), ys.tolist(), [1.0] * 60))
+    t = locate_breaks(fit_transform(data, ids=list(range(60)), outlier_tolerance=100.0), [])
+    assert len(t.pieces) == 1 and 30 in t.ids, "fixture must stay one piece with 30 still in it"
+    pruned = prune_to_density(t, target_per_minute=3.0, min_anchors_per_piece=3)
+    assert 30 not in pruned.ids
+
+
+def test_prune_does_not_change_the_fitted_scale_or_offset():
+    t = _noisy_transform(n=200, span=600.0)
+    pruned = prune_to_density(t, target_per_minute=3.0)
+    assert pruned.pieces[0].scale == t.pieces[0].scale
+    assert pruned.pieces[0].offset == t.pieces[0].offset
+
+
+def test_prune_is_a_noop_on_an_identity_transform():
+    # No anchors at all (a refused fit): must not raise, and must change nothing.
+    t = identity_transform()
+    assert prune_to_density(t).pieces == t.pieces
+
+
+def test_pruned_anchors_fall_back_to_interpolation_not_exact_match():
+    t = _noisy_transform(n=100, span=400.0, noise=0.3)
+    pruned = prune_to_density(t, target_per_minute=3.0)
+    dropped_ids = set(t.ids) - set(pruned.ids)
+    assert dropped_ids, "fixture should have discarded at least one anchor"
+    by_id = {lid: (x, y) for lid, x, y in zip(t.ids, t.xs, t.ys)}
+    victim = next(iter(dropped_ids))
+    vx, vy = by_id[victim]
+    spans = [(vx, vx + 1.0)]
+    out = map_cues(pruned, spans)
+    # No longer exact -- it is now wherever interpolation between the survivors lands, which
+    # is not the discarded anchor's own (possibly wrong) measured position.
+    assert out[0][0] != pytest.approx(vy, abs=1e-6)
+
+
+# --- Overlap trimming and the final start-padding step ---------------------------------
+
+def test_trim_overlaps_pulls_the_earlier_cue_back():
+    out = [(0.0, 5.0, None), (4.0, 6.0, None)]
+    _trim_overlaps(out, pad=0.1, min_visible=0.08)
+    assert out[0][1] == pytest.approx(3.9, abs=1e-6)
+    assert out[1] == (4.0, 6.0, None)
+
+
+def test_trim_overlaps_leaves_non_overlapping_cues_alone():
+    out = [(0.0, 3.0, None), (3.5, 6.0, None)]
+    before = list(out)
+    _trim_overlaps(out, pad=0.1, min_visible=0.08)
+    assert out == before
+
+
+def test_trim_overlaps_never_inverts_a_cue():
+    # The successor starts before the predecessor even begins -- an extreme case, but the
+    # trimmed cue must still have end >= start + min_visible, never a negative duration.
+    out = [(2.0, 5.0, None), (2.05, 6.0, None)]
+    _trim_overlaps(out, pad=0.1, min_visible=0.08)
+    assert out[0][1] - out[0][0] >= 0.08 - 1e-9
+
+
+def test_trim_overlaps_skips_dropped_cues():
+    out = [(0.0, 5.0, None), None, (4.0, 6.0, None)]
+    _trim_overlaps(out, pad=0.1, min_visible=0.08)
+    assert out[0][1] == pytest.approx(3.9, abs=1e-6)
+    assert out[1] is None
+
+
+def test_pad_starts_shifts_every_start_earlier():
+    out = [(1.0, 2.0, None), (5.0, 6.0, "cut")]
+    _pad_starts(out, pad=0.04, file_start=0.0)
+    assert out[0] == (0.96, 2.0, None)
+    assert out[1] == (4.96, 6.0, "cut")
+
+
+def test_pad_starts_does_not_go_negative():
+    out = [(0.02, 1.0, None)]
+    _pad_starts(out, pad=0.04, file_start=0.0)
+    assert out[0][0] == 0.0
+
+
+def test_map_cues_with_padding_trims_then_pads_flush():
+    """A pair the trim pass actually touches comes out exactly flush, not overlapping."""
+    t = locate_breaks(fit_transform(pairs(lambda x: x + 1.0, count=40, step=20.0)), [])
+    # Two spans placed so the first cue's own duration runs into the second's start.
+    spans = [(5.0, 30.0), (25.0, 26.0)]
+    out = map_cues(t, spans, align_padding=0.04)
+    assert out[0][1] == pytest.approx(out[1][0], abs=1e-9)
+
+
+def test_map_cues_without_padding_does_not_shift_starts():
+    t = locate_breaks(fit_transform(pairs(lambda x: x + 1.0, count=40, step=20.0)), [])
+    spans = [(5.0, 6.0)]
+    out = map_cues(t, spans)
+    assert out[0][0] == pytest.approx(6.0, abs=1e-6)
+
+
 def test_map_is_the_identity_for_an_identity_transform():
     cues = [(10.0, 12.0), (20.0, 21.5)]
     out = map_cues(identity_transform(), cues)
@@ -383,9 +615,13 @@ def test_drop_policy_removes_cut_cues_and_leaves_the_rest_alone():
     cut = set(t.breaks[0].cue_indices)
     assert cut, "this fixture is supposed to destroy some cues"
     assert [i for i, row in enumerate(dropped) if row is None] == sorted(cut)
-    # Every cue that was not cut is identical under both policies.
+    # Every cue that was not cut is identical under both policies, except the one immediately
+    # before the cut under 'keep': the stacked cut cues right after it can only exist there
+    # because that cue's own end was trimmed back to make room for them. That trim is the
+    # correct behaviour (see _trim_overlaps), not a discrepancy between the two policies.
+    before_cut = min(cut) - 1
     for i, (a, b) in enumerate(zip(dropped, kept)):
-        if i not in cut:
+        if i not in cut and i != before_cut:
             assert a == b
 
 

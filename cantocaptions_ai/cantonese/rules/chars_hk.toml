@@ -259,6 +259,10 @@ pattern = '妳'
 replace = '你'
 
 [[rules]]
+pattern = '姖'
+replace = '佢'
+
+[[rules]]
 pattern = '您'
 replace = '你'
 

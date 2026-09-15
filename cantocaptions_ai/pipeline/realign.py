@@ -235,7 +235,7 @@ ACQUIRE_MIN_SCORE = 0.45
 # ...and what a single line must reach, and hold in characters, to become an anchor. Anchors
 # are the load-bearing part: a wrong one misplaces everything filled around it, while a
 # missing one costs nothing because the fill covers it. So this is deliberately strict.
-ANCHOR_MIN_SCORE = 0.55
+ANCHOR_MIN_SCORE = 0.75 # Changed from 0.55 for testing
 ANCHOR_MIN_CHARS = 4
 
 # Consecutive windows overlap by this much, so a line near a window's far edge gets a second,
@@ -496,24 +496,31 @@ def source_spans(lines: Sequence[TranscriptLine]) -> List[Tuple[float, float]]:
 def anchor_pairs(
     chain: Sequence[Tuple[int, float, float, float]],
     lines: Sequence[TranscriptLine],
-) -> List[Tuple[float, float, float]]:
-    """(source start, audio start, weight) for each anchor whose line carries a timing.
+) -> Tuple[List[Tuple[float, float, float]], List[int]]:
+    """(source start, audio start, weight) for each anchor whose line carries a timing, plus
+    the transcript line index each pair came from (same order, same length).
 
     **Starts only, never ends.** An anchor's start is an acoustic onset -- the first frame of
     the line's core token run. Its *end* is a display decision: padded, released to the next
     cue, floored at a minimum duration. It carries no acoustic information, so pairing on it
     would feed the fit noise dressed as evidence. A subtitler's systematic lead-in bias on the
     start is absorbed exactly into the per-piece offset, so it costs nothing.
+
+    The line indices exist so ``fit_transform``/``map_cues`` can give a cue that *is* an
+    anchor its own measured position exactly, rather than a value read off a line fitted
+    through every other anchor in the piece -- see the note on ``map_cues``.
     """
     by_index = {line.index: line for line in lines}
-    out: List[Tuple[float, float, float]] = []
+    pairs: List[Tuple[float, float, float]] = []
+    ids: List[int] = []
     for index, start, _end, score in chain:
         line = by_index.get(index)
         if line is None or not line.timed:
             continue
         weight = max(float(score) if score == score else 0.0, 1e-6)
-        out.append((float(line.source_start), float(start), weight))
-    return out
+        pairs.append((float(line.source_start), float(start), weight))
+        ids.append(index)
+    return pairs, ids
 
 
 # --- Tokenization -------------------------------------------------------------------
@@ -778,7 +785,7 @@ def acquire(
     p, t = 0, timeline.file_start
     while p < len(lines) and t < timeline.file_end - 0.5:
         t1 = min(t + window_seconds, timeline.file_end)
-        frames = max(int(round((t1 - t) * 25.0)), 1)
+        frames = max(int(round((t1 - t) * 25.0)), 1) # TODO: Are we assuming frame rate here with a hard-coded value? Needs clarification
         best = None
         for offset in ANCHOR_OFFSETS:
             q = p + offset
@@ -1131,10 +1138,10 @@ def _fit_for_lines(
     user can see and understand; timings mapped through a transform nobody believes are wrong
     *and* look deliberate, which is worse. So the fallback changes nothing at all.
     """
-    pairs = anchor_pairs(chain, lines)
+    pairs, ids = anchor_pairs(chain, lines)
     try:
         transform = timefit.fit_transform(
-            pairs, max_scale_dev=max_scale_dev, break_penalty=break_penalty,
+            pairs, ids=ids, max_scale_dev=max_scale_dev, break_penalty=break_penalty,
             slope_penalty=slope_penalty,
         )
     except timefit.TransformError as exc:
@@ -1154,12 +1161,20 @@ def _apply(
     transform: timefit.Transform,
     timeline: EmissionTimeline,
     cut_policy: str,
+    *,
+    align_padding: float = 0.0,
 ) -> Tuple[List[LineTiming], frozenset, List]:
-    """Map every cue, and work out which ones this recording has no audio for."""
+    """Map every cue, and work out which ones this recording has no audio for.
+
+    ``align_padding`` only matters to the ``sync`` caller: ``adjust`` uses this only to build
+    a rough prior/bracket for forced alignment, whose own output gets the pipeline's ordinary
+    padding treatment later, so shifting the prior here would be pointless.
+    """
     rows = timefit.map_cues(
         transform, spans, cut_policy="keep", min_step=MIN_LINE_STEP,
         min_visible=MIN_VISIBLE_DURATION,
         file_start=timeline.file_start, file_end=timeline.file_end,
+        align_padding=align_padding,
     )
     dropped = set()
     if cut_policy == "drop":
@@ -1191,16 +1206,25 @@ def assign_lines_sync(
     break_penalty: float = timefit.BREAK_PENALTY,
     slope_penalty: float = timefit.SLOPE_PENALTY,
     cut_policy: str = "drop",
+    align_padding: float = 0.0,
+    target_anchors_per_minute: float = timefit.TARGET_ANCHORS_PER_MINUTE,
+    min_anchors_per_piece: int = timefit.MIN_ANCHORS_PER_PIECE,
     progress_callback=None,
 ) -> Tuple[List[LineTiming], frozenset, timefit.Transform, timefit.TransformReport]:
     """Mode ``sync``: fit a transform from the anchors, then map every cue through it.
 
-    Every cue moves, including the ones that anchored -- and that is the point rather than an
-    oversight. Within a piece the map is linear, so every duration and every gap scales by the
-    same factor and the subtitle's own rhythm survives exactly. Giving an anchored cue its
-    individually measured time instead would break that rhythm to gain a tenth of a second on
-    the cues that were already the most certain. ``adjust`` is the mode for people who want
-    the measurement to win.
+    Within a piece the map is close to linear, so a cue's rhythm survives the round trip --
+    but "close to" is deliberate, not "exactly": every acoustic anchor the search accepted
+    would individually override that line's position, and a confidently-wrong one (a repeated
+    phrase confusing CTC, a stylised reading) is indistinguishable from a good one by its own
+    score. Measured on the ReZero Blu-ray, four hand-flagged bad lines scored 0.945-0.99,
+    above the anchor set's own median -- a confidence floor cannot see them. So the anchors
+    that get to move a cue on their own are thinned first (``timefit.prune_to_density``) down
+    to a sparse, residual-screened subset with a floor per piece and its two edges always
+    kept; everything else is placed by interpolating between whichever of those survive
+    nearby, which is far steadier than 800-950 individually-trusted acoustic opinions.
+    ``adjust`` is the mode that instead re-derives every line from the audio, at the cost of
+    being exposed to that same per-line risk on every cue rather than a screened few.
 
     No forced alignment runs here at all: the anchor search is the only acoustic work, which
     makes this roughly half the cost of ``transcript`` mode.
@@ -1218,7 +1242,21 @@ def assign_lines_sync(
         chain, lines, spans, max_scale_dev=max_scale_dev,
         break_penalty=break_penalty, slope_penalty=slope_penalty,
     )
-    timings, dropped, effective = _apply(lines, spans, transform, timeline, cut_policy)
+    if not transform.identity:
+        before = len(transform.xs)
+        transform = timefit.prune_to_density(
+            transform, target_per_minute=target_anchors_per_minute,
+            min_anchors_per_piece=min_anchors_per_piece,
+        )
+        if len(transform.xs) < before:
+            logger.info(
+                "realign: %d of %d anchors kept for direct use (~%.1f/minute); the rest are "
+                "interpolated between whichever of those survive nearby",
+                len(transform.xs), before, target_anchors_per_minute,
+            )
+    timings, dropped, effective = _apply(
+        lines, spans, transform, timeline, cut_policy, align_padding=align_padding,
+    )
     report = timefit.describe_transform(transform, spans, effective)
     timefit.report_transform(report, len(lines))
     _report(timings, lines)

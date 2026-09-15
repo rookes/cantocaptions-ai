@@ -1285,19 +1285,23 @@ class TestAnchorPairs(unittest.TestCase):
 
     def test_pairs_use_starts_and_carry_the_score_as_weight(self):
         chain = [(1, 110.0, 112.0, 0.8), (3, 130.0, 132.0, 0.6)]
-        pairs = anchor_pairs(chain, self._lines())
+        pairs, ids = anchor_pairs(chain, self._lines())
         self.assertEqual([(p[0], p[1]) for p in pairs], [(10.0, 110.0), (30.0, 130.0)])
         self.assertAlmostEqual(pairs[0][2], 0.8)
+        self.assertEqual(ids, [1, 3])
 
     def test_an_untimed_line_contributes_no_pair(self):
         lines = self._lines()
         lines[1] = TranscriptLine(1, "abcd")
-        self.assertEqual(len(anchor_pairs([(1, 110.0, 112.0, 0.8)], lines)), 0)
+        pairs, ids = anchor_pairs([(1, 110.0, 112.0, 0.8)], lines)
+        self.assertEqual(len(pairs), 0)
+        self.assertEqual(len(ids), 0)
 
     def test_a_nan_score_still_yields_a_usable_weight(self):
-        pairs = anchor_pairs([(0, 5.0, 6.0, float("nan"))], self._lines())
+        pairs, ids = anchor_pairs([(0, 5.0, 6.0, float("nan"))], self._lines())
         self.assertEqual(len(pairs), 1)
         self.assertGreater(pairs[0][2], 0.0)
+        self.assertEqual(ids, [0])
 
 
 class TestBracketBlocks(unittest.TestCase):

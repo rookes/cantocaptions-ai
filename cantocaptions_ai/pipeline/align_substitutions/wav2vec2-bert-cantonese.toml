@@ -39,10 +39,25 @@
 "煨" = "會"
 "掟" = "訂"
 "棒" = "彭"
-
+"氹" = "探"
+"鍛" = "段"
+"昴" = "某"
+"詛" = "左"
+"庶" = "樹"
+"曳" = "踩"
+"萌" = "猛"
+"抌" = "淡"
+"鯨" = "傾"
+"掁" = "撐"
+"剁" = "朵"
+"蝕" = "舌"
 
 # --- sentence-final particles the automatic tiers cannot reach -------------------------
 "𠻺" = "呀"
+"𡁜" = "喎"
+"咓" = "呀"
+"哩" = "呢"
+"嘠" = "㗎"
 
 # 唧 is zek1. 啫 is ze1. Often used interchangeably, so alvinlii's model should detect just fine
 "唧" = "啫"

@@ -232,6 +232,8 @@ def _run_realign(
     cut_policy: str = "drop",
     max_scale: float = 0.25,
     adjust_tolerance: float = 2.0,
+    align_padding: float = 0.04,
+    sync_anchor_density: float = 3.0,
     normalize: bool = True,
     batch_size: int = 4,
     vram_checks: bool = True,
@@ -309,7 +311,9 @@ def _run_realign(
         if mode == "sync":
             timings, dropped, transform, report = assign_lines_sync(
                 lines, vad_segments, timeline,
-                align_metadata["dictionary"], align_metadata["language"], **common,
+                align_metadata["dictionary"], align_metadata["language"],
+                align_padding=align_padding, target_anchors_per_minute=sync_anchor_density,
+                **common,
             )
         elif mode == "adjust":
             timings, dropped, transform, report = assign_lines_adjust(
@@ -1071,6 +1075,8 @@ def _execute_pipeline(
                 cut_policy=cfg.realign_cut_policy,
                 max_scale=cfg.realign_max_scale,
                 adjust_tolerance=cfg.realign_adjust_tolerance,
+                align_padding=cfg.align_padding,
+                sync_anchor_density=cfg.realign_sync_anchor_density,
                 normalize=cfg.realign_normalize,
                 batch_size=cfg.align_batch_size,
                 vram_checks=cfg.vram_checks,

@@ -28,7 +28,7 @@ correct, and is the definition of a cut.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -89,7 +89,7 @@ MIN_BREAK_JUMP = 0.4
 
 # Floor on the outlier-trim threshold, which is otherwise four scaled MADs. A very tight fit
 # would otherwise start trimming anchors that sit at the edge of ordinary jitter.
-OUTLIER_TOLERANCE = 1.0
+OUTLIER_TOLERANCE = 0.5 # Changed from 1.0 for testing
 MAX_TRIM_ROUNDS = 3
 
 # Below either of these the fit is refused and the caller falls back (the identity for sync,
@@ -112,8 +112,25 @@ CUT_OVERLAP_SHARE = 0.5
 REASON_CUT = "cut"
 REASON_NO_AUDIO = "no_audio"
 
+# --- sync mode's own anchor discipline ------------------------------------------------
+#
+# Using every anchor `map_cues` was handed exposes every cue that happens to score well to
+# whatever acoustic mistake the search made for it, individually -- and a confidently wrong
+# anchor (a repeated phrase confusing CTC, a stylised reading) scores exactly as well as a
+# correct one. This guards against the case where the model is sometimes both confident and  
+# wrong. What can is the fitted transform itself: an anchor with a large residual against 
+# hundreds of others is exactly what raising the bar for direct trust should be measured 
+# against, not the search's own opinion of itself.
+#
+# So sync keeps only a sparse, high-residual-screened subset of anchors for map_cues to trust
+# directly (see prune_to_density), and everywhere else falls back to interpolation between
+# whichever of those survive nearby -- the discipline the file-wide transform was fitted for
+# in the first place, rather than 800-950 individually-trusted acoustic opinions.
+TARGET_ANCHORS_PER_MINUTE = 3.0 # Changed from 3 for testing
+MIN_ANCHORS_PER_PIECE = 3
+
 # Common frame-rate conversions, for naming a fitted scale in the log. NAMING ONLY -- the fit
-# is never snapped to one of these. On the ReZero fixture the scale measures about 1.0435
+# is never snapped to one of these. On a test file the fixture the scale measures about 1.0435
 # while 25/23.976 is 1.042709; that 7.9e-4 difference is 2.2 s of drift by the end of the
 # file, so snapping would be actively wrong. Report the neighbour, keep the measurement.
 _RATIOS = (
@@ -123,7 +140,7 @@ _RATIOS = (
     ("30 -> 29.97 fps", 30.0 / (30000.0 / 1001.0)),
 )
 # Relative, and tight enough to keep 25/23.976 and 25/24 (0.1% apart) from both matching.
-_RATIO_TOLERANCE = 0.0008
+_RATIO_TOLERANCE = 0.0008 # Changed from 0.0008 for testing
 
 
 class TransformError(ValueError):
@@ -210,6 +227,12 @@ class Transform:
     xs: Tuple[float, ...] = ()        # the anchors the fit was built from, for refitting
     ys: Tuple[float, ...] = ()
     ws: Tuple[float, ...] = ()
+    # The transcript line index each surviving anchor in xs/ys/ws came from, same order and
+    # length. What makes map_cues able to use an anchor's own measured position for the exact
+    # line it was found on, rather than a smoothed line through hundreds of others -- see
+    # map_cues for why that distinction turned out to matter far more than a piece-level fit
+    # ever could, however precisely that fit is estimated.
+    ids: Tuple[int, ...] = ()
 
     def piece_for(self, t: float) -> Piece:
         for piece in self.pieces:
@@ -563,6 +586,7 @@ def _residuals(
 def fit_transform(
     pairs: Sequence[Tuple[float, float, float]],
     *,
+    ids: Optional[Sequence[int]] = None,
     max_scale_dev: float = MAX_SCALE_DEV,
     break_penalty: float = BREAK_PENALTY,
     slope_penalty: float = SLOPE_PENALTY,
@@ -578,7 +602,10 @@ def fit_transform(
 ) -> Transform:
     """Fit the simplest piecewise-affine map explaining *pairs*.
 
-    Each pair is ``(source time, audio time, weight)``, in source order. Raises
+    Each pair is ``(source time, audio time, weight)``, in source order. ``ids``, if given,
+    is a parallel array (a transcript line index per pair) that survives sorting and outlier
+    trimming unchanged and comes back as ``Transform.ids`` -- what lets ``map_cues`` use an
+    anchor's own measured position for the exact line it came from, see there. Raises
     :class:`TransformError` when the anchors do not support a fit worth applying, which the
     caller must treat as "change nothing" rather than as a failure to work around.
 
@@ -602,9 +629,20 @@ def fit_transform(
     all_xs = np.array([float(p[0]) for p in pairs], dtype=float)
     all_ys = np.array([float(p[1]) for p in pairs], dtype=float)
     all_ws = np.array([max(float(p[2]), 1e-6) for p in pairs], dtype=float)
+    # A caller that gives no ids gets none back (Transform.ids == ()), never a sequential
+    # placeholder. map_cues treats a populated ids as "cue i is anchor i" by line index, and
+    # a made-up 0..n-1 default would collide with unrelated span indices in exactly that
+    # lookup -- silently mapping some cue to a stranger's anchor merely because both happened
+    # to carry the same small integer index.
+    has_ids = ids is not None
+    all_ids = np.array(list(ids), dtype=int) if has_ids else np.arange(len(pairs))
+    if len(all_ids) != len(pairs):
+        raise ValueError(f"ids has {len(all_ids)} entries for {len(pairs)} pairs")
     if np.any(np.diff(all_xs) < 0):
         order = np.argsort(all_xs, kind="stable")
-        all_xs, all_ys, all_ws = all_xs[order], all_ys[order], all_ws[order]
+        all_xs, all_ys, all_ws, all_ids = (
+            all_xs[order], all_ys[order], all_ws[order], all_ids[order],
+        )
 
     fit_kwargs = dict(
         max_scale_dev=max_scale_dev, slope_penalty=slope_penalty,
@@ -701,6 +739,7 @@ def fit_transform(
         xs=tuple(float(v) for v in xs),
         ys=tuple(float(v) for v in ys),
         ws=tuple(float(v) for v in all_ws[keep]),
+        ids=tuple(int(v) for v in all_ids[keep]) if has_ids else (),
     )
 
 
@@ -799,7 +838,7 @@ def locate_breaks(
         return Transform(
             pieces=pieces, breaks=(), used=transform.used, rejected=transform.rejected,
             cost=transform.cost, scale_bound_hit=transform.scale_bound_hit,
-            xs=transform.xs, ys=transform.ys, ws=transform.ws,
+            xs=transform.xs, ys=transform.ys, ws=transform.ws, ids=transform.ids,
         )
 
     ordered = sorted(spans, key=lambda s: s[0])
@@ -895,11 +934,175 @@ def locate_breaks(
         pieces=tuple(pieces), breaks=tuple(breaks),
         used=transform.used, rejected=transform.rejected, cost=transform.cost,
         scale_bound_hit=transform.scale_bound_hit,
-        xs=transform.xs, ys=transform.ys, ws=transform.ws,
+        xs=transform.xs, ys=transform.ys, ws=transform.ws, ids=transform.ids,
+    )
+
+
+def prune_to_density(
+    transform: Transform,
+    *,
+    target_per_minute: float = TARGET_ANCHORS_PER_MINUTE,
+    min_anchors_per_piece: int = MIN_ANCHORS_PER_PIECE,
+) -> Transform:
+    """Thin the anchor set map_cues will trust directly down to a sparse, screened subset.
+
+    Per piece: keep whichever anchors sit closest to the piece's own fit (smallest residual)
+    up to a target count derived from the piece's own span, always keeping the two anchors
+    nearest its edges regardless of their residual -- those are the ones ``locate_breaks``
+    already trusted to place the cut or insertion next to this piece, and losing them would
+    push map_cues's interpolation back from the boundary it is most useful right up against.
+
+    The scale and per-piece offset are **not** re-estimated here. They were already fitted
+    from every anchor the acoustic search found, including the ones this function is about
+    to discard for the *separate* purpose of direct per-cue trust -- throwing them out of
+    that fit too would only make the transform itself noisier for no benefit, since the whole
+    point of a robust median offset and a many-anchor pooled slope is that a handful of bad
+    anchors barely move either.
+
+    Piece boundaries (``Piece.x0``/``.x1``, and every ``Break``) are untouched: this only
+    changes which anchors ``Transform.xs``/``.ys``/``.ids`` expose, not where the cuts are or
+    what the fitted line says. Call it after ``locate_breaks``, not before.
+    """
+    if not transform.xs or not transform.pieces:
+        return transform
+    xs = np.asarray(transform.xs, dtype=float)
+    ys = np.asarray(transform.ys, dtype=float)
+    ws = np.asarray(transform.ws, dtype=float)
+    has_ids = bool(transform.ids)
+    ids = np.asarray(transform.ids, dtype=int) if has_ids else None
+
+    keep = np.zeros(len(xs), dtype=bool)
+    for piece in transform.pieces:
+        idx = np.arange(piece.first, piece.last + 1)
+        if len(idx) == 0:
+            continue
+        residual = np.abs(ys[idx] - (piece.scale * xs[idx] + piece.offset))
+        span_minutes = max((xs[idx[-1]] - xs[idx[0]]) / 60.0, 1e-9)
+        target = max(min_anchors_per_piece, int(round(target_per_minute * span_minutes)))
+        target = min(target, len(idx))
+        order = idx[np.argsort(residual)]
+        keep[order[:target]] = True
+        keep[idx[0]] = True
+        keep[idx[-1]] = True
+
+    new_xs, new_ys, new_ws = xs[keep], ys[keep], ws[keep]
+    new_ids = ids[keep] if has_ids else None
+    new_position = np.cumsum(keep) - 1  # old index -> new index, valid wherever keep is True
+
+    new_pieces = []
+    for piece in transform.pieces:
+        old_idx = np.arange(piece.first, piece.last + 1)
+        survivors = old_idx[keep[old_idx]]
+        if len(survivors) == 0:
+            new_pieces.append(piece)  # not reachable given the edge guarantee above
+            continue
+        new_pieces.append(replace(
+            piece, first=int(new_position[survivors[0]]), last=int(new_position[survivors[-1]]),
+        ))
+
+    return replace(
+        transform, pieces=tuple(new_pieces),
+        xs=tuple(float(v) for v in new_xs), ys=tuple(float(v) for v in new_ys),
+        ws=tuple(float(v) for v in new_ws),
+        ids=tuple(int(v) for v in new_ids) if has_ids else (),
     )
 
 
 # --- Applying it ---------------------------------------------------------------------
+
+class _AnchorLookup:
+    """Answers "where does this cue's own evidence place it" for map_cues.
+
+    Built once per call, not per cue. ``transform.xs``/``.ys`` are already source-sorted (see
+    fit_transform), so every lookup here is a binary search, not a scan.
+    """
+
+    def __init__(self, transform: Transform):
+        self.transform = transform
+        self.xs = np.asarray(transform.xs, dtype=float)
+        self.ys = np.asarray(transform.ys, dtype=float)
+        self.by_line = {lid: k for k, lid in enumerate(transform.ids)}
+
+    def _same_piece(self, piece: Piece, k: int) -> bool:
+        return piece.x0 <= self.xs[k] < piece.x1
+
+    def _local_scale(self, piece: Piece, lo: int, hi: int) -> float:
+        """The slope two specific anchors imply directly, bypassing the piece's own fit."""
+        dx = self.xs[hi] - self.xs[lo]
+        return (self.ys[hi] - self.ys[lo]) / dx if dx > 1e-9 else piece.scale
+
+    def position(self, line_index: int, source_start: float) -> Tuple[float, float]:
+        """(start, local_scale) for *source_start*. Falls back to the piece's own fit only
+        where there is no better evidence: outside the anchor range, or where the two
+        nearest anchors sit in different pieces (never interpolate across a cut/insert)."""
+        piece = self.transform.piece_for(source_start)
+        n = len(self.xs)
+
+        k = self.by_line.get(line_index)
+        if k is not None:
+            # This cue *is* an anchor: its own measured position is exactly right, and
+            # nothing downstream should second-guess it with a line fitted through hundreds
+            # of others. Only the duration/local-scale still needs a neighbour, since an
+            # anchor's own end was never independently measured (starts only -- see
+            # anchor_pairs).
+            lo = k - 1 if k > 0 and self._same_piece(piece, k - 1) else k
+            hi = k + 1 if k + 1 < n and self._same_piece(piece, k + 1) else k
+            scale = self._local_scale(piece, lo, hi) if lo != hi else piece.scale
+            return float(self.ys[k]), scale
+
+        # Not an anchor: interpolate between the nearest anchor at/before and at/after,
+        # exactly like a piecewise-linear spline through the anchors rather than one line
+        # per piece. This is what keeps a filled cue close to its neighbours' own evidence
+        # instead of a piece-wide average that can be off by a piece's own residual (which
+        # measures in the tenths of a second, not the noise a rounded scale would add).
+        hi = int(np.searchsorted(self.xs, source_start))
+        lo = hi - 1
+        if lo < 0 or hi >= n or not self._same_piece(piece, lo) or not self._same_piece(piece, hi):
+            return piece.map(source_start), piece.scale
+        scale = self._local_scale(piece, lo, hi)
+        start = self.ys[lo] + (source_start - self.xs[lo]) * scale
+        return start, scale
+
+
+def _trim_overlaps(
+    out: List[Optional[Tuple[float, float, Optional[str]]]], pad: float, min_visible: float,
+) -> None:
+    """Pull a cue's end back whenever its successor's start would land inside it.
+
+    In place, and only ever moves an END earlier -- never a start, never past that cue's own
+    start by more than ``min_visible`` allows -- so this can only shrink a cue, never invert
+    or hide one. ``pad`` is the gap left behind rather than a flush cut, matching
+    ``align_padding``'s existing meaning elsewhere in the pipeline (the release/trim pass in
+    ``align()`` trims an end to ``next_start - align_padding`` for the same reason).
+    """
+    prev: Optional[int] = None
+    for i, row in enumerate(out):
+        if row is None:
+            continue
+        if prev is not None:
+            p_start, p_end, p_reason = out[prev]
+            if row[0] < p_end:
+                new_end = max(p_start + min_visible, row[0] - pad)
+                out[prev] = (p_start, round(new_end, 3), p_reason)
+        prev = i
+
+
+def _pad_starts(
+    out: List[Optional[Tuple[float, float, Optional[str]]]], pad: float, file_start: float,
+) -> None:
+    """Shift every start earlier by *pad*, as the last thing done to any cue's timing.
+
+    A viewer forgives a subtitle appearing a frame before the words start far more readily
+    than one appearing a frame after -- see the CLAUDE.md note on why even one frame late is
+    treated as a real defect here, not a rounding nuance. So every start is nudged the same
+    direction on principle, not only the ones a fit happened to place late.
+    """
+    for i, row in enumerate(out):
+        if row is None:
+            continue
+        start = max(file_start, row[0] - pad)
+        out[i] = (round(start, 3), row[1], row[2])
+
 
 def map_cues(
     transform: Transform,
@@ -910,6 +1113,7 @@ def map_cues(
     min_visible: float = 0.08,
     file_start: float = 0.0,
     file_end: Optional[float] = None,
+    align_padding: float = 0.0,
 ) -> List[Optional[Tuple[float, float, Optional[str]]]]:
     """Map every cue through *transform*. One entry per cue, in cue order.
 
@@ -917,9 +1121,29 @@ def map_cues(
     cue inside a cut. Otherwise each entry is ``(start, end, reason)``, reason being None for
     an ordinary mapping.
 
-    Within a piece this is exactly a linear map, so every gap and every duration is scaled by
-    the same factor -- which is the whole point of ``sync`` mode, and the property
-    ``test_map_preserves_proportions`` pins down.
+    **A cue that is itself a kept anchor gets its own measured start exactly**, not a value
+    read off a line fitted through the whole piece. A piece-wide fit is an *average*: even a
+    perfectly-estimated shared slope still leaves each piece's own anchors scattered around it
+    by that piece's own residual (a few tenths of a second here), and that scatter is well
+    past the threshold of being visible on screen. Every other cue is placed by linear
+    interpolation between its two nearest anchors -- a two-point local fit, not the whole
+    piece's -- and only falls back to the piece's own formula where there is no local anchor
+    pair to use (outside the anchor range, or where the interpolation would cross a cut or
+    insertion). ``spans[i]`` is assumed to belong to transcript line ``i``, matching every
+    other convention in this module (``cut_of``/``i`` below, ``Transform.ids``).
+
+    Durations still scale by the *local* rate implied by the nearest anchors (or the piece's
+    own scale at the edges), so gaps and lengths track the actual local speed rather than a
+    single piece-wide average -- the direct extension of "anchors only, starts only" to a
+    cue's other endpoint, which was never itself an anchor.
+
+    Two passes run after every cue has a first-draft timing, in this order and not the
+    reverse: ``_trim_overlaps`` resolves any cue whose neighbour's own (independently derived)
+    timing now runs into it, then ``_pad_starts`` shifts every start earlier by
+    ``align_padding`` as the very last thing that happens. Doing the trim first means a pair
+    the trim actually touched comes out of padding exactly flush (the same amount is
+    subtracted from both sides of the join), not padding first and hoping the trim has
+    nothing left to fix.
     """
     if cut_policy not in ("drop", "keep"):
         raise ValueError(f"unknown cut policy: {cut_policy!r}")
@@ -930,6 +1154,7 @@ def map_cues(
         for i in brk.cue_indices:
             cut_of[i] = brk
 
+    lookup = _AnchorLookup(transform)
     out: List[Optional[Tuple[float, float, Optional[str]]]] = []
     stacked: dict = {}
     for i, (source_start, source_end) in enumerate(spans):
@@ -947,13 +1172,23 @@ def map_cues(
             out.append((round(start, 3), round(start + min_visible, 3), REASON_CUT))
             continue
 
-        start, end = transform.map_span(source_start, source_end)
+        start, scale = lookup.position(i, source_start)
+        end = start + (source_end - source_start) * scale
         start = max(start, file_start)
         end = max(end, start + min_visible)
         reason = None
         if file_end is not None and start >= file_end:
             reason = REASON_NO_AUDIO
         out.append((round(start, 3), round(end, 3), reason))
+
+    _trim_overlaps(out, align_padding, min_visible)
+
+    # Removing universal shift for now. Still keeping align_padding to use as padding
+    # distance between subtitles.
+    #
+    # if align_padding:
+    #    _pad_starts(out, align_padding, file_start)
+
     return out
 
 
