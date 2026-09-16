@@ -59,7 +59,10 @@ the defaults from `config/cpu.cfg`).
 
 Run `uv run cantocaptions_ai --help` to display the complete flag list.
 
-_Note: If you are running out of VRAM when running, it's recommended to lower `batch_size` and `align_batch_size`._
+**Tips:**
+
+* If you are running out of VRAM, it's recommended to lower `batch_size` and `align_batch_size`
+* If you want to improve subtitle quality and don't mind extra compute time, turn on vocal isolation with `--vocal_isolation_method mbroformer`
 
 ## Configuration
 
@@ -209,6 +212,5 @@ the rest of the file.
 
 * Measure a change to realignment with `scripts/eval_realign.py`, which strips the timings off a
 known-good SRT, realigns its text, and reports how far each cue landed from where it belongs.
-* Set `HF_XET_HIGH_PERFORMANCE=1` to trade RAM/CPU for more model download speed
 
 Thank you to everyone from the CantoCaptions community and Discord for their support and testing on this project.
