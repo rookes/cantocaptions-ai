@@ -91,15 +91,20 @@ important settings to adjust if there are issues with dropped speech:
 transcribes the isolated vocals. Improves subtitle quality significantly, but is very slow. Requires
 ~600 MB download on first use. Off by default.
 
-### Alignment and Post-Processing
+### Alignment
 
 To get an accurate timing for the subtitles, an alignment model is used (`no_align = True` to skip the timing step). 
 By default, the model used is [alvinlii's wav2vec2-BERT model for Cantonese](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese).
 
-After alignment, subtitles are split and re-merged to maintain output standards. Basic post-processing settings:
+## Post-Processing / Text Cleaning
+
+After alignment, subtitles are split and re-merged to maintain output standards. Line segmentation can be manipulated with:
 
 * `min_cue_duration` — the shortest subtitle allowed before it is merged into a neighbour
 * `max_line_width` / `max_line_count` (default: 18 / 2) — control forced line breaks and how text is wrapped
+
+More extensive text processing, such as OpenCC simplified -> traditional options and regex substitutions, are configurable via .toml
+files in `cantocaptions-ai/cantonese`.
 
 ### Speaker separation (diarization)
 
