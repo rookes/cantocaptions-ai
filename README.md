@@ -6,6 +6,13 @@ Transcribe a Cantonese audio or video file and output to a timed subtitle file. 
 consumer hardware. No APIs are queried, and once the model weights are downloaded it works
 entirely offline.
 
+This project is modeled after the [WhisperX ASR library](https://github.com/m-bain/whisperx), and
+shares some of the same [basic architecture](https://raw.githubusercontent.com/m-bain/whisperX/refs/heads/main/figures/pipeline.png).
+However, `cantocaptions_ai` uses rookes's [cantocaptions-cantonese-asr model](https://huggingface.co/rookes/cantocaptions-cantonese-asr) 
+for the transcription step, alvanlii's [wav2vec2-BERT-Cantonese model](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese) for the
+alignment step, and adds a wide array of other subtitling improvements designed specifically for written
+Cantonese. The target written Cantonese standard is the [CantoCaptions standard](https://cantocaptions.com).
+
 ## Prerequisites
 
 - Python 3.10, 3.11, or 3.12
@@ -206,16 +213,5 @@ the rest of the file.
 * Measure a change to realignment with `scripts/eval_realign.py`, which strips the timings off a
 known-good SRT, realigns its text, and reports how far each cue landed from where it belongs.
 * Set `HF_XET_HIGH_PERFORMANCE=1` to trade RAM/CPU for more model download speed
-
-## Project Architecture
-
-This project is modeled after the [WhisperX ASR library](https://github.com/m-bain/whisperx), and
-shares some of the same
-[basic architecture](https://raw.githubusercontent.com/m-bain/whisperX/refs/heads/main/figures/pipeline.png).
-However, `cantocaptions_ai` uses Alibaba Cloud's
-[Qwen3-ASR models](https://github.com/QwenLM/Qwen3-ASR) for the transcription step, alvanlii's
-[wav2vec2-BERT-Cantonese model](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese) for the
-alignment step, and adds a wide array of subtitling improvements designed specifically for written
-Cantonese.
 
 Thank you to everyone from the CantoCaptions community and Discord for their support and testing on this project.
