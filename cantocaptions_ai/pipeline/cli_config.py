@@ -9,6 +9,13 @@ as raw strings and coerced using each argparse action's own ``type=``/
 ``choices=`` metadata (see load_cfg_file) -- no second type table to keep in
 sync with __main__.py's flag definitions.
 
+Both full-line and trailing ``#`` comments are stripped, because the shipped
+config/default.cfg annotates its values inline and configparser does NOT do
+this by default -- an unstripped ``attn_implementation = sdpa # ...`` reaches
+the choices= check as the whole run-on string and aborts the run. The cost is
+that a value cannot itself contain a literal ``#``; nothing the pipeline takes
+(paths, model ids, numbers, enums) plausibly does.
+
 Only PipelineConfig field names are legal cfg-file keys; CLI-only args
 (log_level, log_file, input_dir, recursive, cfg, and the 3 preset dests
 themselves) are rejected as "unknown key" if present in a cfg file.
@@ -109,7 +116,7 @@ def load_cfg_file(path: Path, parser: argparse.ArgumentParser) -> Dict[str, Any]
     which fails fast on a bad manifest/rule file so problems surface at
     pipeline start rather than mid-run.
     """
-    cp = configparser.ConfigParser()
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#",))
     if not cp.read(path, encoding="utf-8"):
         parser.error(f"could not read config file: {path}")
     if not cp.has_section(_SECTION):

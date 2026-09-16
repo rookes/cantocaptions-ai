@@ -239,7 +239,9 @@ temp/
 dump/
 test/
 
-# Local per-machine CLI defaults (auto-generated on first run). Named
-# presets under config/ (e.g. config/cpu.cfg) are intentionally NOT
-# ignored -- only the personal default.cfg is.
-/config/default.cfg
+# config/default.cfg IS tracked: it ships as the annotated starting point users
+# edit instead of retyping flags. It is still auto-generated on first run when
+# absent (see cli_config.ensure_default_cfg_exists), which now only matters for
+# a checkout where it was deleted. Because it is tracked, local edits to it show
+# up in `git status` and can conflict on pull -- `git update-index
+# --skip-worktree config/default.cfg` silences that for a personal copy.

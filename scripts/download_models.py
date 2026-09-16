@@ -39,21 +39,60 @@ FULL_FILES = [
 ]
 
 
-def _asr_repos() -> list:
-    from cantocaptions_ai.pipeline.model_profiles import MODEL_PROFILES
-    repos = []
-    for profile in MODEL_PROFILES.values():
-        hf_id = profile.hf_id
-        # Skip local directories / non-hub paths (e.g. a merged LoRA checkpoint).
-        if os.path.sep in hf_id or (":" in hf_id and not hf_id.count("/") == 1) or os.path.isdir(hf_id):
-            continue
-        repos.append(hf_id)
+def _default_model_name() -> str:
+    """The ``model`` a plain run uses, read off PipelineConfig without calling
+    ``defaults()`` -- that resolves the ``device`` default_factory, which imports torch.
+    It is equal to config/default.cfg's own value by test (test_cli_config.py).
+    """
+    from dataclasses import fields
+    from cantocaptions_ai.pipeline.config import PipelineConfig
+
+    return next(f.default for f in fields(PipelineConfig) if f.name == "model")
+
+
+def _is_hub_id(hf_id: str) -> bool:
+    """True for a fetchable ``org/name``, False for a local directory.
+
+    Do NOT test ``os.path.sep in hf_id`` here -- it is "/" on Linux, which is where this
+    script actually runs, so that skipped every hub id on the one platform that matters
+    and pre-fetched no ASR weights at all.
+    """
+    return (
+        "\\" not in hf_id
+        and ":" not in hf_id
+        and hf_id.count("/") == 1
+        and not os.path.isdir(hf_id)
+    )
+
+
+def _asr_repos(model_name=None, every=False) -> list:
+    """Repos for the ASR model(s) to fetch.
+
+    Only ONE ASR model is fetched by default -- the one a plain run loads. Fetching
+    every registered profile means ~8 GB of checkpoints a user will never load, which
+    is the opposite of what a prefetch step is for. ``every=True`` restores that for a
+    build that wants to serve any --model without a cold download.
+    """
+    from cantocaptions_ai.pipeline.model_profiles import MODEL_PROFILES, get_model_profile
+
+    if every:
+        wanted = [p.hf_id for p in MODEL_PROFILES.values()]
+    else:
+        wanted = [get_model_profile(model_name or _default_model_name()).hf_id]
+
+    seen, repos = set(), []
+    for hf_id in wanted:
+        if _is_hub_id(hf_id) and hf_id not in seen:
+            seen.add(hf_id)
+            repos.append(hf_id)
     return repos
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Pre-fetch cantocaptions-ai model weights.")
     ap.add_argument("--full", action="store_true", help="also fetch roformer, ensemble, LLM, and diarization models")
+    ap.add_argument("--model", default=None, help="ASR model name or hub id to fetch (default: whatever a plain run loads)")
+    ap.add_argument("--all-asr", action="store_true", help="fetch every registered ASR model, not just the default one")
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"), help="HF token for gated models (default: HF_TOKEN env)")
     ap.add_argument("--cache-dir", default=os.environ.get("HF_HOME"), help="HF cache dir (sets HF_HOME; default: HF_HOME env or ~/.cache/huggingface)")
     args = ap.parse_args()
@@ -64,7 +103,7 @@ def main() -> int:
     from huggingface_hub import hf_hub_download, snapshot_download
     token = args.hf_token or None
 
-    repos = list(_asr_repos()) + list(ALWAYS_REPOS)
+    repos = list(_asr_repos(args.model, every=args.all_asr)) + list(ALWAYS_REPOS)
     files = []
     if args.full:
         repos += FULL_REPOS

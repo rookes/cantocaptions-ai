@@ -26,6 +26,12 @@ class PipelineConfig:
     (``cantocaptions_ai/__main__.py``) carries no defaults of its own — it
     reads them from ``PipelineConfig.defaults()`` for ``--help`` display and
     for the config-file/preset layering in ``pipeline/cli_config.py``.
+
+    These are kept in step with the shipped ``config/default.cfg``, which sits
+    one layer above them. They are not redundant: the cfg file is what a CLI
+    user edits, while these are what a library caller and ``--help`` see, so a
+    divergence makes ``--help`` state a default no CLI run actually uses. If
+    you change one, change the other; ``tests/test_cli_config.py`` pins it.
     """
 
     # Core inference
@@ -34,23 +40,23 @@ class PipelineConfig:
     device_index: int = 0
     asr_compute_type: str = "default"
     attn_implementation: str = "sdpa"
-    batch_size: int = 15
+    batch_size: int = 8
     threads: int = 0
     hf_token: Optional[str] = None
     compile: bool = False
 
     # Model loading
-    model: str = "Qwen3-ASR"
+    model: str = "cantocaptions-cantonese-ASR"
     model_dir: Optional[str] = None
     model_cache_only: bool = False
 
     # Output
-    output_dir: str = "."
+    output_dir: str = "output"
     output_format: str = "srt"
     verbose: bool = True
     print_progress: bool = True
-    vram_checks: bool = True
-    vram_headroom_mb: int = 512
+    vram_checks: bool = False
+    vram_headroom_mb: int = 0
     debug_dir: Optional[str] = None
     load_debug_dir: Optional[str] = None
 
@@ -65,7 +71,7 @@ class PipelineConfig:
     vad_pad_onset: float = 1.00
     vad_pad_offset: float = 0.20
     vad_min_duration_off: float = 0.25
-    chunk_size: int = 30
+    chunk_size: int = 28
 
     # Vocal isolation
     # Off by default: the Mel-Band RoFormer stage is a heavy add for a small gain on clean
@@ -103,7 +109,7 @@ class PipelineConfig:
     align_merge_distance: float = 0.08
     min_cue_duration: float = 0.5
     merge_gap: float = 0.25
-    align_batch_size: int = 4
+    align_batch_size: int = 2
     align_compute_type: str = "float16"
     # Substitute an in-vocabulary character for one the align model has no token for, so the
     # trellis can see it at all. "homophone" (same Jyutping reading) is the default because a

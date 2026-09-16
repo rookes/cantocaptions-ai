@@ -49,6 +49,46 @@ class TestPipelineConfigDefaults(unittest.TestCase):
             self.assertEqual(PipelineConfig.defaults()["device"], "cpu")
 
 
+class TestShippedDefaultCfg(unittest.TestCase):
+    """config/default.cfg ships tracked, so it must stay loadable and in step with
+    PipelineConfig -- a divergence makes --help state a default no CLI run uses."""
+
+    def _path(self):
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return Path(root) / "config" / "default.cfg"
+
+    def test_loads_without_error(self):
+        # Regression: configparser does NOT strip trailing '#' comments by default, so
+        # every annotated value used to reach type=/choices= as a run-on string and the
+        # shipped file aborted the run outright.
+        parser = build_parser()
+        with _silent_parser_error():
+            loaded = load_cfg_file(self._path(), parser)
+        self.assertEqual(loaded["attn_implementation"], "sdpa")
+        self.assertEqual(loaded["batch_size"], 8)
+        self.assertEqual(loaded["model"], "cantocaptions-cantonese-ASR")
+        self.assertIsNone(loaded["realign"])
+
+    def test_every_value_matches_the_dataclass_default(self):
+        parser = build_parser()
+        with _silent_parser_error():
+            loaded = load_cfg_file(self._path(), parser)
+        defaults = PipelineConfig.defaults()
+        self.assertEqual(
+            {k: v for k, v in loaded.items() if defaults.get(k) != v}, {}
+        )
+
+    def test_omits_only_device_and_hf_token(self):
+        # device must stay absent so the dataclass's cuda>mps>cpu detection still runs
+        # on a machine without a GPU; hf_token so a secret never lands in a tracked file.
+        parser = build_parser()
+        with _silent_parser_error():
+            loaded = load_cfg_file(self._path(), parser)
+        missing = set(PipelineConfig.defaults()) - set(loaded)
+        self.assertEqual(missing, {"device", "hf_token"})
+
+
 class TestLoadCfgFile(unittest.TestCase):
     def setUp(self):
         self.parser = build_parser()

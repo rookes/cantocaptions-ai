@@ -58,9 +58,34 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertEqual(dict(profile.spotchecks), {})
         self.assertEqual(profile.segmentation.leading_markers, ())
 
+    def test_published_finetune_is_registered_from_the_hub(self):
+        # The published checkpoint needs no env var: it is a plain hub id, always a valid
+        # --model choice, and carries the same clean-slate profile as the local LoRA build.
+        self.assertIn("cantocaptions-cantonese-ASR", MODEL_PROFILES)
+        profile = get_model_profile("cantocaptions-cantonese-ASR")
+        self.assertEqual(profile.hf_id, "rookes/cantocaptions-cantonese-asr")
+        self.assertIsNone(profile.normalization.opencc_config)
+        self.assertFalse(profile.normalization.chars_hk)
+        self.assertEqual(dict(profile.spotchecks), {})
+        self.assertEqual(profile.punctuation, PunctuationConfig())
+        self.assertEqual(profile.segmentation, SegmentationConfig())
+
+    def test_published_finetune_and_lora_share_one_profile_shape(self):
+        # The two differ only in where the weights come from; every downstream field must
+        # stay identical, which is what _finetuned_profile exists to guarantee.
+        import dataclasses
+        from cantocaptions_ai.pipeline.model_profiles import _finetuned_profile
+
+        published = dataclasses.asdict(_finetuned_profile("rookes/x"))
+        local = dataclasses.asdict(_finetuned_profile("/models/lora-merged"))
+        published.pop("hf_id")
+        local.pop("hf_id")
+        self.assertEqual(published, local)
+
     def test_registry_keys_are_the_cli_choices_source(self):
         # __main__ derives --model choices from these keys.
         self.assertIn("Qwen3-ASR", MODEL_PROFILES)
+        self.assertIn("cantocaptions-cantonese-ASR", MODEL_PROFILES)
 
     def test_lora_profile_registered_only_when_env_set(self):
         import os
@@ -77,6 +102,44 @@ class TestGetModelProfile(unittest.TestCase):
             profiles = _build_profiles()
             self.assertIn("Qwen3-ASR-lora", profiles)
             self.assertEqual(profiles["Qwen3-ASR-lora"].hf_id, "/models/lora-merged")
+
+
+class TestDownloadModelsAsrRepos(unittest.TestCase):
+    """scripts/download_models.py reads the registry to decide what to pre-fetch."""
+
+    def _mod(self):
+        import importlib.util
+        import os
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        spec = importlib.util.spec_from_file_location(
+            "_download_models_under_test", os.path.join(root, "scripts", "download_models.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_hub_ids_are_kept_and_local_paths_are_not(self):
+        # Regression: the filter used to test ``os.path.sep in hf_id``, which is "/" on
+        # Linux -- where this script actually runs -- so it rejected every hub id and
+        # pre-fetched no ASR weights at all.
+        is_hub_id = self._mod()._is_hub_id
+        self.assertTrue(is_hub_id("rookes/cantocaptions-cantonese-asr"))
+        self.assertTrue(is_hub_id("Qwen/Qwen3-ASR-1.7B-hf"))
+        self.assertFalse(is_hub_id("/models/lora-merged"))
+        self.assertFalse(is_hub_id(r"C:\models\lora-merged"))
+
+    def test_only_the_default_model_is_fetched(self):
+        # A prefetch that pulls every registered profile is ~8 GB of checkpoints the user
+        # will never load. One plain run needs exactly one ASR model.
+        mod = self._mod()
+        self.assertEqual(mod._asr_repos(), ["rookes/cantocaptions-cantonese-asr"])
+        self.assertEqual(mod._default_model_name(), "cantocaptions-cantonese-ASR")
+
+    def test_explicit_model_and_all_asr(self):
+        mod = self._mod()
+        self.assertEqual(mod._asr_repos("Qwen3-ASR"), ["Qwen/Qwen3-ASR-1.7B-hf"])
+        self.assertEqual(set(mod._asr_repos(every=True)), {p.hf_id for p in MODEL_PROFILES.values()})
 
 
 class TestNormalizeSegmentText(unittest.TestCase):

@@ -84,10 +84,24 @@ _QWEN_SEGMENTATION = SegmentationConfig(leading_markers=(
 ))
 
 
-# Env var pointing at a local fine-tuned/merged LoRA checkpoint directory. Kept out of the
-# source tree so no machine-specific path ships in git: the "Qwen3-ASR-lora" profile is only
-# registered (and only offered as a --model choice) when this is set. See _build_profiles.
+# The published fine-tune and the local LoRA build below share one profile shape: both
+# already emit HK-traditional text and the CantoCaptions final-particle convention, so they
+# take every default — no OpenCC, default punctuation, no spot checks, and the conservative
+# default cleaning manifest rather than Qwen's full chain. Written once so the two cannot
+# drift apart; copy it as the template when adding another fine-tuned checkpoint.
+def _finetuned_profile(hf_id: str) -> ModelProfile:
+    return ModelProfile(hf_id=hf_id)
+
+
+# Env var pointing at a *local* merged-weights directory. Kept out of the source tree so no
+# machine-specific path ships in git: the "Qwen3-ASR-lora" profile is only registered (and
+# only offered as a --model choice) when this is set. It is the personal/debugging escape
+# hatch for an unpublished build — the published checkpoint is "cantocaptions-cantonese-ASR",
+# which is pulled from the hub and needs no env var. See _build_profiles.
 _LORA_MODEL_DIR_ENV = "CANTOCAPTIONS_LORA_MODEL_DIR"
+
+# The published CantoCaptions fine-tune, on the hub like any other model.
+_CANTOCAPTIONS_HF_ID = "rookes/cantocaptions-cantonese-asr"
 
 
 def _build_profiles() -> Dict[str, ModelProfile]:
@@ -106,16 +120,14 @@ def _build_profiles() -> Dict[str, ModelProfile]:
             segmentation=_QWEN_SEGMENTATION,
             cleaning=_QWEN_CLEANING,
         ),
+        "cantocaptions-cantonese-ASR": _finetuned_profile(_CANTOCAPTIONS_HF_ID),
     }
-    # Fine-tuned checkpoint: already emits HK-traditional text and custom final particles,
-    # so it takes all defaults — no OpenCC, default punctuation, no spot checks, and the
-    # conservative default cleaning manifest rather than Qwen's full chain. Copy this
-    # entry as the template when adding a new model. Registered only when the env var points
-    # at a local merged-weights directory; otherwise --model Qwen3-ASR-lora is simply not a
-    # valid choice (clean argparse error) rather than a broken hardcoded path.
+    # Same profile as the published fine-tune above, pointed at a local directory instead.
+    # Registered only when the env var is set; otherwise --model Qwen3-ASR-lora is simply not
+    # a valid choice (clean argparse error) rather than a broken hardcoded path.
     lora_dir = os.environ.get(_LORA_MODEL_DIR_ENV)
     if lora_dir:
-        profiles["Qwen3-ASR-lora"] = ModelProfile(hf_id=lora_dir)
+        profiles["Qwen3-ASR-lora"] = _finetuned_profile(lora_dir)
     return profiles
 
 
