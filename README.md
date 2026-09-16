@@ -1,10 +1,8 @@
 # cantocaptions-ai
 
-An end-to-end speech pipeline for generating high-quality, timed written Cantonese (粵文) subtitles.
-
-Transcribe a Cantonese audio or video file and output to a timed subtitle file. Runs locally on
-consumer hardware. No APIs are queried, and once the model weights are downloaded it works
-entirely offline.
+An end-to-end speech pipeline for generating high-quality, timed written Cantonese (粵文) subtitles. Generate subtitles from any 
+Cantonese audio or video file. Runs locally on consumer hardware. Works entirely offline once models have been downloaded, so no API
+tokens or web-based LLM usage required.
 
 This project is modeled after the [WhisperX ASR library](https://github.com/m-bain/whisperx), and
 shares some of the same [basic architecture](https://raw.githubusercontent.com/m-bain/whisperX/refs/heads/main/figures/pipeline.png).
