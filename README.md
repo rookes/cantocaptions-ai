@@ -2,8 +2,8 @@
 
 An end-to-end speech pipeline for generating high-quality, timed written Cantonese (粵文) subtitles.
 
-You point it at a Cantonese audio or video file and it writes a subtitle file. It runs locally on
-consumer hardware — no APIs are queried, and once the model weights are downloaded it works
+Transcribe a Cantonese audio or video file and output to a timed subtitle file. Runs locally on
+consumer hardware. No APIs are queried, and once the model weights are downloaded it works
 entirely offline.
 
 ## Prerequisites
@@ -35,84 +35,89 @@ uv sync --extra legacy              # ASR via the older qwen_asr package; mutual
 
 ## Usage
 
+To generate a subtitle file easily for a given audio or video file, run:
+
 ```bash
 uv run cantocaptions_ai video.mkv
+uv run cantocaptions_ai audio.wav
 ```
 
-That is the whole thing. It writes `video.srt` into the `output/` directory. The first run also
-downloads the model weights it needs (~6 GB), so it will take noticeably longer than the ones
-after it.
+This will write `<your-file-name>.srt` into the `output/`. The first run also downloads the model 
+weights (~6 GB), so it will take significantly longer than the ones after it.
 
-Any file ffmpeg can read works — `.mkv`, `.mp4`, `.wav`, `.m4a` and so on. Add `--input_dir DIR` to
+Any file ffmpeg can read works: `.mkv`, `.mp4`, `.wav`, `.m4a` and so on. Add `--input_dir DIR` to
 process a whole folder.
 
 ### Configuration
 
-Everything below is a command-line flag, but you rarely want to retype flags.
-**`config/default.cfg` is the file to edit.** It lists every setting with a short comment, grouped
-by what it affects, and its values apply to every run. Anything you type on the command line still
-wins over it, and `--cfg NAME` swaps in a different file from `config/` (for example `--cfg cpu`).
+Everything below is a command-line flag, but you can **set your own defaults in `config/default.cfg`**.
+Anything command line flags you add will override these defaults at runtime. Use the flag `--cfg NAME` 
+to swap in a different file from `config/` (for example `--cfg cpu` to use the defaults from `config/cpu.cfg`).
 
 Run `uv run cantocaptions_ai --help` for the complete flag list.
 
-The single most useful setting is `batch_size`. It is the main VRAM lever — if a run fails with an
-out-of-memory error, lower it before changing anything else.
+If you are running out of VRAM when running, it's recommended to lower `batch_size` and `align_batch_size`.
 
 ### 1. Model selection
 
-`model` picks the transcriber. The default, `cantocaptions-cantonese-ASR`, is
+`model` picks the transcription model. The default, `cantocaptions-cantonese-ASR`, is
 [a fine-tune of Qwen3-ASR](https://huggingface.co/rookes/cantocaptions-cantonese-asr) trained on the
-CantoCaptions dataset: it already writes HK-traditional Cantonese and distinguishes the
-sentence-final particles by tone, so none of the rewriting rules are applied on top of it. The
-alternatives are the stock `Qwen3-ASR` (1.7B) and `Qwen3-ASR-0.6B`, whose Mandarin-flavoured,
-Simplified-derived output is put through the full cleaning chain instead. Prefer the default unless
-you are comparing against a baseline.
+CantoCaptions dataset. It already writes HK-style written Cantonese and even distinguishes sentence-final 
+particles by tone (e.g. 啦 laa1 / 喇 laa3), so less post-processing is necessary to clean things up. This is
+currently the best model by far for this framework, so it is recommended to keep as-is.
+
+Alternatives are the stock `Qwen3-ASR` (1.7B) and `Qwen3-ASR-0.6B`. In order to avoid simplified Chinesee and 
+non-standard written Cantonese, both of these models are put through extensive post-processing when used. 
+Post-processing includes using the alignment model as a phonetic guide to check for certain variants 
+such as gam2 噉 vs. gam3 咁.
 
 ### 2. Speech detection (VAD)
 
-Before transcribing, the pipeline finds where the speech is and cuts it into chunks. Three settings
-matter if it is getting that wrong:
+Before transcribing, the pipeline finds where the speech in the audio is and cuts it into chunks. Three 
+important settings to adjust if there are issues with dropped speech:
 
-- `chunk_size` (28 s) — the longest piece handed to the ASR model. Also a VRAM lever.
-- `vad_onset` / `vad_offset` (0.45 / 0.30) — the detection thresholds. **Lower them if quiet or sung
-  speech is being missed entirely**; raise them if music and effects are being picked up as dialogue.
-- `vad_pad_onset` (1.0 s) — audio kept before each detected region. It is deliberately large, because
+- `chunk_size` — the maximum length of an audio chunk to transcribe. The input audio is split into
+  chunks based on this size.
+- `vad_onset` / `vad_offset` — the detection thresholds. Lower them if speech is being missed entirely.
+  Raise to detect less as speech and speed up inference.
+- `vad_pad_onset` — audio kept before each detected region. It is deliberately large, because
   the detector's own onset lags about a second behind real speech after a silence. Raise it if the
   first word of lines is being clipped.
 
 ### 3. Vocal isolation
 
 `vocal_isolation_method = mbroformer` runs the audio through a Mel-Band RoFormer separator and
-transcribes the isolated vocals. It is worth it on music-heavy or noisy sources — film and TV with a
-score underneath the dialogue — and not worth it on clean speech, where it adds a slow stage and a
-~600 MB download for very little. Off by default.
+transcribes the isolated vocals. Improves subtitle quality significantly, but is very slow. Requires
+~600 MB download on first use. Off by default.
 
-### 4. Alignment
+### 4. Alignment and Post-Processing
 
-Alignment is what puts each character on the timeline, and it runs by default. `no_align = True`
-skips it and falls back to the ASR model's own rough timings: much faster, much less accurate, and
-only sensible when you want a transcript rather than a subtitle.
+To get an accurate timing for the subtitles, an alignment model is used (`no_align = True` to skip the timing step). 
+By default, the model used is [alvinlii's wav2vec2-BERT model for Cantonese](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese).
 
-The settings worth knowing are `min_cue_duration` (0.5 s), the shortest subtitle allowed before it
-is merged into a neighbour, and `max_line_width` / `max_line_count` (18 / 2), which control how the
-text is wrapped on screen.
+After alignment, subtitles are split and re-merged to maintain output standards. Basic post-processing settings:
+
+* `min_cue_duration` — the shortest subtitle allowed before it is merged into a neighbour
+* `max_line_width` / `max_line_count` (default: 18 / 2) — control forced line breaks and how text is wrapped
 
 ### 5. Speaker separation (diarization)
 
-`diarize = True` works out who is speaking. Its main job is to stop one subtitle spanning two
-people — by default it changes where cues are split and nothing else. Add `speaker_labels = True` if
-you also want each line prefixed with `[SPEAKER_00]:`.
+Set `diarize = True` to attempt to check the speaker for each cue. By default, this will only be used to 
+stop one subtitle from being used for two different speakers' dialogue. Lower `speaker_confidence` to split
+more eagerly. Add `speaker_labels = True` if you also want each line prefixed with `[SPEAKER_00]:` 
+(note: speaker identification is currently highly inaccurate).
 
-This downloads a gated model, so you need to accept its terms on HuggingFace and supply a token (see
-below). `speaker_confidence` (0.7) is the dial: lower it to split more eagerly.
+Diarization requires a gated model download, so you need to accept its terms on HuggingFace and supply a 
+token (see below).
 
 ### 6. Debugging
 
-`debug_dir` is off by default. Set it to a directory (`temp`, say) and each stage's output is
-saved there as it runs. Its real use is `load_debug_dir`: point that at a previous run's
-`debug_dir` and the expensive stages (VAD, vocal isolation, transcription) are replayed from disk
-instead of recomputed, so you can iterate on the later ones in seconds. It writes the segmented
-audio too, so expect it to grow large.
+`debug_dir` is off by default. Set it to a directory (e.g. `--debug_dir temp` for `./temp/`) and each 
+stage's output will be saved there as it runs. Useful for testing multiple runs with different settings.
+You can set `load_debug_dir` to the same directory to reload a previous run's data (if it exists) without having
+to recompute anything.
+
+Note that `debug_dir` also outputs segmented audio, so it can grow large quickly.
 
 `--log_file FILE` keeps the console output brief and writes the full log to a file.
 
@@ -134,48 +139,31 @@ To fetch the model weights ahead of time rather than on first run:
 uv run python scripts/download_models.py
 ```
 
-### Faster downloads
-
-Nothing to set up — `hf-xet` comes in automatically with `huggingface_hub`, so model
-downloads are already Xet-backed (chunk-level deduplication, parallel transfer) on any
-mainstream CPU architecture. `scripts/download_models.py` prints whether it is active:
-
-```
-[info] Xet: on (set HF_XET_HIGH_PERFORMANCE=1 to trade RAM/CPU for more speed)
-```
-
-If that line says `OFF`, either you are on an architecture with no `hf-xet` wheel or
-`HF_HUB_DISABLE_XET` is set; downloads still work, just over plain HTTP. Setting
-`HF_XET_HIGH_PERFORMANCE=1` raises throughput further at the cost of more RAM and CPU.
-
 ## Aligning an existing transcript
 
-If you already have the words and only need the timings, you can skip ASR entirely:
+If you already have a transcript and only need the timings, you can skip ASR entirely:
 
 ```bash
 uv run cantocaptions_ai movie.mp4 --realign transcript.txt
 ```
 
-`transcript.txt` is line-delimited — one subtitle cue per line, no timestamps. Those line breaks are
-treated as the authoritative cue boundaries, so the output has one cue per line (interjection-only
-lines aside, which the cleaning rules drop). Text cleaning and the acoustic particle spot-checks
-(喇/啦, 呀/啊/吖, 咁/噉) run as they do on ASR output.
+`transcript.txt` is line-delimited. One subtitle cue per line, no timestamps. Those line breaks are
+treated as the authoritative cue boundaries, so the output has one cue per line. Text cleaning and 
+the acoustic particle spot-checks (喇/啦, 呀/啊/吖, 咁/噉) run as they normally would for ASR output.
 
-### Retiming a subtitle onto a different release
+### Retiming a subtitle
 
 Pass a subtitle that already has timings and `--realign` will keep them as a starting point instead
 of discarding them:
 
 ```bash
-uv run cantocaptions_ai bluray.mkv --realign broadcast.srt
+uv run cantocaptions_ai test.mkv --realign misaligned_subtitle_file.srt
 ```
 
-This is the case where a subtitle was timed against one release and you want it on another — a
-different broadcast, a Blu-ray, a version with the adverts cut out. It finds the lines it is
-confident about acoustically, fits the simplest map between the two timelines, and moves every cue
-through it, so the subtitle's own rhythm survives exactly. The map can express an offset, a speed
-difference (a PAL broadcast runs ~4.3% fast against its 23.976 fps master), and cuts and insertions
-where one release has content the other does not — all of which it reports:
+TThis process finds the lines it is confident about acoustically, then fits the simplest transform between 
+the two timelines, and realigns using that transform rather than manually aligning every subtitle to the audio. 
+The transform can express an offset, a speed difference (e.g. a PAL broadcast runs ~4.3% fast against its 23.976 fps master),
+and cuts and insertions where one release has content the other does not, all of which it reports:
 
 ```
 realign: 956 cue(s) mapped through 3 transform piece(s) from 848 anchor(s) (5 rejected)
@@ -184,11 +172,8 @@ realign: insertion of 2.8s at source 00:09:42 -- this recording has audio the su
 realign: cues moved by a median of +65.98s (largest +127.61s)
 ```
 
-Text cleaning is **off** for a subtitle input — it is already a finished subtitle, so its wording is
-left alone — and on for a bare transcript. Punctuation is still normalized either way, which matters
-because a halfwidth mark beside Chinese text is in neither the align vocabulary nor the pause
-tokens, so the pause it stands for would otherwise go unmodelled. `--realign_normalize False` turns
-even that off.
+Text cleaning is **off** by default for a subtitle input, although punctuation is still normalized. 
+Use `--realign_normalize False` to turn off all realign normalization.
 
 ### Other realign options
 
@@ -208,9 +193,9 @@ even that off.
 
 With `--debug_dir`, `realign/transform.json` records every piece, every edit and where each cue moved
 from and to, and `realign/changes.srt` holds just the cues that did something other than shift with
-the rest of the file — load it beside the video and step through them.
+the rest of the file.
 
-## How it works
+## Project Architecture
 
 This project is modeled after the [WhisperX ASR library](https://github.com/m-bain/whisperx), and
 shares some of the same
@@ -221,22 +206,8 @@ However, `cantocaptions_ai` uses Alibaba Cloud's
 alignment step, and adds a wide array of subtitling improvements designed specifically for written
 Cantonese.
 
-Stages run sequentially, and models are loaded and unloaded between them so the whole pipeline fits
-in limited VRAM. `CLAUDE.md` documents each stage in depth, including what was measured and why the
-defaults are what they are.
+## Additional Features
 
-Measure a change to realignment with `scripts/eval_realign.py`, which strips the timings off a
+* Measure a change to realignment with `scripts/eval_realign.py`, which strips the timings off a
 known-good SRT, realigns its text, and reports how far each cue landed from where it belongs.
-
-## Planned Updates
-
-Current updates planned for the near future:
-
-- [x] Add Cantonese standardization and cleaning scripts (adapted from [rookes/canto-subtitle-cleaner](https://github.com/rookes/canto-subtitle-cleaner))
-- [x] Add [SubER](https://github.com/apptek/SubER) metric calculation compatibility, and use its Levenshtein distance algorithm to parallelize ensemble subs
-- [ ] Add more performant options for vocal isolation
-- [x] Implement the "realign" feature to run alignment on an existing untimed transcript
-- [x] Add error-correction based on a reference standard Chinese subtitle file
-- [x] Check for certain characters that are poorly-handled by Qwen3-ASR (i.e. "喎")
-- [ ] Add better multilingual recognition for Mandarin and English
-- [x] Complete diarization implementation to separate lines from different speakers
+* Set `HF_XET_HIGH_PERFORMANCE=1` to trade RAM/CPU for more model download speed
