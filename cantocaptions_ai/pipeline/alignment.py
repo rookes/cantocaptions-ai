@@ -27,6 +27,7 @@ from cantocaptions_ai.utils.schema import (
 )
 from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION, PunctuationConfig, SpotCheck
 from cantocaptions_ai.pipeline.align_checks import (
+    split_gapped_cues,
     warn_on_gapped_cues,
     warn_on_silent_starts,
     whole_file_region,
@@ -1249,12 +1250,21 @@ def align(
     spotchecks: Optional[Mapping[str, SpotCheck]] = None,
     punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
     timeline=None,
+    split_gap: Optional[float] = None,
 ) -> AlignedTranscriptionResult:
     """Align phoneme recognition predictions to known transcription.
 
     ``spotchecks`` and ``punctuation`` come from the ASR model's profile (see
     ``pipeline/model_profiles.py``); their defaults (no spot checks, standard
     punctuation) keep alignment independent of any specific model.
+
+    ``split_gap`` breaks any cue holding a silence at least that long between two of its own
+    adjacent characters into one cue per utterance (``align_checks.split_gapped_cues``).
+    ``None`` defers to the *align* model's own profile (``AlignProfile.split_gap``), which
+    is itself ``None`` -- never split -- unless a profile sets it; ``0`` turns it off whatever
+    the profile says. A caller that declares its own cue structure should pass ``0``: under
+    ``--realign`` the transcript's line breaks *are* the cue boundaries, and a cue is one
+    whole transcript line by contract.
 
     ``timeline`` (``realign.EmissionTimeline``) replaces the per-chunk emission set: segments
     are then cut out of one continuous timeline, so a segment may span chunk joins and the
@@ -1388,6 +1398,24 @@ def align(
 
         for seg, new_end in zip(aligned_segments, ends):
             seg["end"] = float(new_end)
+
+    # --- Break a cue that turned out to hold two utterances, if this align model's profile
+    # (or the caller) asked for it. Opt-in, and off for every shipped profile: see
+    # align_checks.split_gapped_cues for why reporting such a cue is free and breaking it is
+    # a bet. Runs *after* the release/trim pass so the cut is made against final edges --
+    # each piece keeps the outer edge it was given and takes its inner one from its own
+    # characters, so nothing overlaps and no cue outside the split moves -- and *before* the
+    # checks below, so they judge the cues the rest of the pipeline will see.
+    split_gap = profile.split_gap if split_gap is None else split_gap
+    if split_gap and aligned_segments:
+        aligned_segments, breaks = split_gapped_cues(
+            aligned_segments, split_gap, punctuation.split_chars,
+        )
+        if breaks:
+            logger.info(
+                "Broke %d cue boundary%s out of a silence of %.1fs or more inside a cue",
+                breaks, "" if breaks == 1 else "s", split_gap,
+            )
 
     # --- Validate. Model-agnostic and always on: a cue start sitting on silence is wrong
     # whichever align model produced it. Runs on final timings, after the release/trim

@@ -8,7 +8,7 @@ from cantocaptions_ai.pipeline.config import PipelineConfig
 from cantocaptions_ai.pipeline.model_profiles import MODEL_PROFILES
 from cantocaptions_ai.pipeline.reference_context import CONTEXT_TEMPLATES
 from cantocaptions_ai.utils.output import (LANGUAGES, TO_LANGUAGE_CODE,
-                            optional_int, str2bool)
+                            optional_float, optional_int, str2bool)
 from cantocaptions_ai.utils.log_utils import setup_logging, get_logger
 
 logger = get_logger(__name__)
@@ -164,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     align_grp.add_argument("--align_compute_type", default=argparse.SUPPRESS, type=str, choices=["float32", "float16"], help="compute type (weight dtype) for the alignment model; float16 lowers VRAM usage but may reduce forced-alignment accuracy (falls back to float32 off CUDA)")
     align_grp.add_argument("--align_char_substitution", default=argparse.SUPPRESS, type=str, choices=["off", "variant", "homophone", "near"], help="substitute an in-vocabulary character when the align model has no token for one in the transcript, so it can be timed at all: 'variant' folds Simplified/variant forms, 'homophone' also accepts the same Jyutping reading (default), 'near' also accepts the same syllable on a different tone. The subtitle text is unchanged; only the token used for alignment differs")
     align_grp.add_argument("--align_substitutions", default=argparse.SUPPRESS, type=str, help="TOML file with a [substitutions] table of hand-picked character substitutions, which beat every automatic choice (an empty value leaves that character alone)")
+    align_grp.add_argument("--align_split_gap", type=optional_float, default=argparse.SUPPRESS, metavar="SECONDS", help="break a subtitle in two wherever alignment left a silence of at least this long between two of its own adjacent characters, so a cue holding two utterances becomes one cue each (1.5 is a sensible starting point). Unset defers to the align model's profile, which never splits; 0 forces it off. Ignored under --realign, where the transcript's line breaks are the cue boundaries")
     align_grp.add_argument("--align", "-a", choices=["fast", "quality"], default=argparse.SUPPRESS, help="shorthand for --align_compute_type (fast=float16, quality=float32). Does NOT affect --align_batch_size (no benchmarked safe bump exists for the 'fast' tier — see scripts/bench_alignment_batching.py). The granular --align_compute_type flag always wins if both are given.")
 
     subtitle_grp = parser.add_argument_group("subtitle formatting")

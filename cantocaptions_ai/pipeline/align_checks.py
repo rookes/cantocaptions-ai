@@ -10,6 +10,14 @@ There are two of them. ``find_gapped_cues`` reads the timings alone and needs no
 ``find_silent_starts`` needs the waveform. Neither repairs anything -- both say which cues
 to distrust, which is the thing a 2000-cue file cannot be used without.
 
+``split_gapped_cues`` is the one exception, and it is exception-shaped on purpose: it acts
+on ``find_gapped_cues``' finding by breaking the cue in two, and it is the only thing here
+that is **opt-in**, enabled per align model by ``AlignProfile.split_gap`` or per run by
+``--align_split_gap``. Reporting a doubtful cue costs nothing; inventing a cue boundary
+that was not there does, so the threshold it runs at is deliberately well above the one it
+reports at (see ``SPLIT_INTERNAL_GAP``). The detection is shared -- one scan, two verdicts
+-- so the two can never disagree about what a gap is.
+
 ``find_silent_starts`` catches a cue whose start time lands on audio where nothing is
 being said. Alignment placing a character over silence is always wrong, whatever produced
 it; the failure that motivated the check was ``alvanlii/wav2vec2-BERT-cantonese`` pinning
@@ -24,12 +32,13 @@ over music beds and room tone, which are speechless but not silent. Treat a clea
 """
 
 from dataclasses import dataclass
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
 from cantocaptions_ai.utils.audio import SAMPLE_RATE
 from cantocaptions_ai.utils.log_utils import get_logger
+from cantocaptions_ai.utils.schema import add_note
 
 logger = get_logger(__name__)
 
@@ -63,6 +72,14 @@ MIN_GAP_FRAMES = 4
 # that are written next to each other means one of them was placed somewhere it was not said.
 MAX_INTERNAL_GAP = 1.0
 
+# A suggested starting point for ``split_gapped_cues``, not a default anything uses on its
+# own: splitting is opt-in per align model (``AlignProfile.split_gap``) or per run
+# (``--align_split_gap``). It sits well above MAX_INTERNAL_GAP because reporting and breaking
+# are different bets. At 1.0 s, 45% of the cues flagged are still within half a second of the
+# reference, so a break there would invent a cue boundary about as often as it found one;
+# 1.5 s is long enough that the two halves are not plausibly one utterance.
+SPLIT_INTERNAL_GAP = 1.5
+
 
 @dataclass(frozen=True)
 class GappedCue:
@@ -73,6 +90,43 @@ class GappedCue:
     at: float
     before: str
     after: str
+
+
+class InternalGap(NamedTuple):
+    """One silence inside a cue, carrying indices into that cue's own ``words`` list.
+
+    ``before_idx``/``after_idx`` are positions in the *full* words list, not in the timed
+    subset the scan walks, so a caller can cut the cue at one without having to re-derive
+    where the untimed characters in between belong.
+    """
+
+    before_idx: int
+    after_idx: int
+    gap: float
+    at: float
+    before: str
+    after: str
+
+
+def _internal_gaps(
+    segment: Mapping, max_gap: float, split: set,
+) -> Iterator[InternalGap]:
+    """Every silence over ``max_gap`` between two adjacent *timed* characters of one cue.
+
+    A character the align model has no token for carries no timing at all (see
+    ``align_vocab``), so it is transparent here rather than gap-producing: the question is
+    whether its two timed neighbours were said together, and an untimed character between
+    them is not evidence either way.
+    """
+    timed = [(i, w) for i, w in enumerate(segment.get("words") or [])
+             if w.get("start") is not None and w.get("end") is not None]
+    for (i, before), (j, after) in zip(timed, timed[1:]):
+        if before["word"] in split or after["word"] in split:
+            continue
+        gap = float(after["start"]) - float(before["end"])
+        if gap > max_gap:
+            yield InternalGap(i, j, round(gap, 3), round(float(before["end"]), 3),
+                              before["word"], after["word"])
 
 
 def find_gapped_cues(
@@ -111,18 +165,10 @@ def find_gapped_cues(
     split = set(split_chars)
     hits: List[GappedCue] = []
     for index, segment in enumerate(segments):
-        words = [w for w in (segment.get("words") or [])
-                 if w.get("start") is not None and w.get("end") is not None]
-        worst: Optional[GappedCue] = None
-        for before, after in zip(words, words[1:]):
-            if before["word"] in split or after["word"] in split:
-                continue
-            gap = float(after["start"]) - float(before["end"])
-            if gap > max_gap and (worst is None or gap > worst.gap):
-                worst = GappedCue(index, round(gap, 3), round(float(before["end"]), 3),
-                                  before["word"], after["word"])
+        worst = max(_internal_gaps(segment, max_gap, split),
+                    key=lambda g: g.gap, default=None)
         if worst is not None:
-            hits.append(worst)
+            hits.append(GappedCue(index, worst.gap, worst.at, worst.before, worst.after))
     return hits
 
 
@@ -146,6 +192,116 @@ def warn_on_gapped_cues(
             len(hits), max_gap,
         )
     return hits
+
+
+def _word_offsets(
+    text: str, words: Sequence[Mapping],
+) -> Optional[List[Tuple[int, int]]]:
+    """Where each word sits in the cue's own text, as (start, end) offsets.
+
+    ``None`` if the two disagree — a word that cannot be found where it should be means the
+    text was rewritten after alignment, and a caller that cannot locate a word cannot cut
+    beside it either. Refusing is the only safe answer: a wrong offset would split the text
+    at one place and the characters at another.
+    """
+    spans: List[Tuple[int, int]] = []
+    cursor = 0
+    for word in words:
+        token = str(word.get("word", ""))
+        if not token:
+            spans.append((cursor, cursor))
+            continue
+        at = text.find(token, cursor)
+        if at < 0:
+            return None
+        spans.append((at, at + len(token)))
+        cursor = at + len(token)
+    return spans
+
+
+def _split_one(segment: Mapping, gaps: Sequence[InternalGap]) -> Optional[List[dict]]:
+    """Cut one cue at each of ``gaps``. ``None`` if it cannot be done safely."""
+    text = str(segment.get("text", ""))
+    words = list(segment.get("words") or [])
+    spans = _word_offsets(text, words)
+    if spans is None:
+        logger.debug("Not splitting cue %r: its words do not match its text", text[:40])
+        return None
+    # chars is 1:1 with text (every character of the cue, spaces included), so the same
+    # offsets cut both. Anything else and the cue is left whole rather than desynchronised.
+    chars = segment.get("chars")
+    chars = list(chars) if chars is not None and len(chars) == len(text) else None
+
+    pieces: List[dict] = []
+    word_from, text_from = 0, 0
+    start = float(segment["start"])
+
+    def piece(word_to: Optional[int], text_to: Optional[int], end: float) -> dict:
+        out = dict(segment)
+        out["text"] = text[text_from:text_to]
+        out["words"] = words[word_from:word_to]
+        if chars is not None:
+            out["chars"] = chars[text_from:text_to]
+        out["start"] = round(start, 3)
+        out["end"] = round(end, 3)
+        out["notes"] = list(segment.get("notes") or [])
+        return out
+
+    for gap in gaps:
+        # Untimed characters between the two neighbours go with the head: they were never
+        # placed, so there is no evidence they belong to the clause after the silence.
+        head = piece(gap.after_idx, spans[gap.after_idx - 1][1],
+                     float(words[gap.before_idx]["end"]))
+        if not head["text"].strip():
+            return None
+        add_note(head, f"split_gap:{gap.gap:.1f}s after {gap.before}")
+        pieces.append(head)
+        word_from, text_from = gap.after_idx, spans[gap.after_idx][0]
+        start = float(words[gap.after_idx]["start"])
+
+    tail = piece(None, None, float(segment["end"]))
+    if not tail["text"].strip() or tail["end"] < tail["start"]:
+        return None
+    add_note(tail, f"split_gap:{gaps[-1].gap:.1f}s before {gaps[-1].after}")
+    pieces.append(tail)
+    return pieces
+
+
+def split_gapped_cues(
+    segments: Sequence[Mapping],
+    min_gap: float = SPLIT_INTERNAL_GAP,
+    split_chars: Iterable[str] = (),
+) -> Tuple[List[dict], int]:
+    """Break every cue holding a silence of ``min_gap`` or more into one cue per utterance.
+
+    The one place in this module that *repairs* rather than reports, and the only one that
+    is opt-in — because breaking a cue is a bet, where saying "distrust this one" is not.
+    See ``find_gapped_cues`` for the measurement: at the 1 s reporting threshold, 45% of the
+    cues flagged are still within half a second of the reference, so a break there would be
+    wrong about as often as it was right. Above ``SPLIT_INTERNAL_GAP`` the two halves are
+    not plausibly one utterance, and each half's own timings are the ones alignment actually
+    measured — a cue spanning the silence has a start or an end that was never spoken.
+
+    The cut is exactly the silence: the head keeps the cue's own start and ends on its last
+    timed character before the gap, the tail begins on its first timed character after it
+    and keeps the cue's own end. Nothing is retimed and nothing outside the cue moves, so a
+    caller's release/trim pass and the non-overlap guarantee both survive untouched.
+
+    Returns the new cue list (segments are copied, never mutated) and how many breaks were
+    made. A cue whose words cannot be located in its own text is passed through whole.
+    """
+    split = set(split_chars)
+    out: List[dict] = []
+    breaks = 0
+    for segment in segments:
+        gaps = list(_internal_gaps(segment, min_gap, split))
+        pieces = _split_one(segment, gaps) if gaps else None
+        if pieces is None:
+            out.append(dict(segment))
+            continue
+        breaks += len(pieces) - 1
+        out.extend(pieces)
+    return out, breaks
 
 
 @dataclass(frozen=True)

@@ -7,7 +7,10 @@ align model with no entry runs exactly as it did before this module existed — 
 one is a single ``ALIGN_PROFILES`` entry with no edits to ``alignment.py``.
 
 Contrast ``pipeline/align_checks.py``, which is deliberately *not* per-model: it validates
-alignment output for every model, including ones with no profile here.
+alignment output for every model, including ones with no profile here. The division holds
+even where the two meet — ``split_gap`` below says *whether and at what threshold* this
+model's cues should be broken at an internal silence, while the code that finds the silence
+and does the breaking stays model-agnostic over there, taking the number as an argument.
 """
 
 from dataclasses import dataclass
@@ -84,6 +87,17 @@ class AlignProfile:
     # to the model, not to the pipeline. Loaded by align_vocab.bundled_substitutions and
     # merged *under* the caller'"'"'s --align_substitutions file; see pipeline/align_vocab.py.
     substitutions: Optional[str] = None
+    # The least silence (seconds) between two adjacent characters of one cue at which this
+    # model's alignment should be read as two separate utterances, so the cue is broken in
+    # two. None -- the default -- never splits, which is the behaviour every caller had
+    # before this field existed.
+    #
+    # It belongs to the align model because it is a statement about *that model's* emission:
+    # how long a hole between two characters it will leave when it has nothing to place one
+    # of them on. A model that dwells differently wants a different number, and one with no
+    # measured number should not inherit another's. align_checks.SPLIT_INTERNAL_GAP is the
+    # suggested starting point; --align_split_gap overrides whatever is set here.
+    split_gap: Optional[float] = None
 
 
 DEFAULT_ALIGN_PROFILE = AlignProfile()

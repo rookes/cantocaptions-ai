@@ -78,6 +78,7 @@ def _run_alignment(
     vram_checks: bool = True,
     spotchecks=None,
     punctuation=DEFAULT_PUNCTUATION,
+    split_gap: Optional[float] = None,
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.alignment import align
     if progress_callback is not None:
@@ -105,6 +106,7 @@ def _run_alignment(
                 spotchecks=spotchecks,
                 punctuation=punctuation,
                 timeline=item.get('emission_timeline'),
+                split_gap=split_gap,
             )
             aligned_result['language'] = result['language']
         else:
@@ -1096,6 +1098,11 @@ def _execute_pipeline(
                     progress_callback=stage.reporter,
                     vram_checks=cfg.vram_checks,
                     spotchecks=profile.spotchecks,
+                    # 0, not cfg.align_split_gap: under --realign the transcript's line
+                    # breaks are the cue boundaries and a cue is one whole line by contract,
+                    # so nothing here may break one in two -- not even an align profile that
+                    # asked for it on the ASR path.
+                    split_gap=0,
                     # Not profile.punctuation: realign needs the space, the newline and the
                     # line sentinel to be pause tokens, and declares its cue boundaries
                     # through cue_spans rather than letting punctuation derive them.
@@ -1283,6 +1290,8 @@ def _execute_pipeline(
                     punctuation=(
                         REALIGN_PUNCTUATION if cfg.realign else profile.punctuation
                     ),
+                    # See the realign call site above for why this is forced off there.
+                    split_gap=0 if cfg.realign else cfg.align_split_gap,
                 )
                 if cfg.realign:
                     for item in items:

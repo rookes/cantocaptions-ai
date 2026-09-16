@@ -113,6 +113,12 @@ class PipelineConfig:
     align_char_substitution: str = "homophone"
     # TOML file of hand-curated substitutions that beat every automatic tier.
     align_substitutions: Optional[str] = None
+    # Break a cue in two wherever alignment left a silence of at least this many seconds
+    # between two of its own adjacent characters -- a cue that holds two utterances has a
+    # start or an end that was never spoken. None defers to the align model's own profile
+    # (AlignProfile.split_gap, itself None for every shipped model, so: never); 0 forces it
+    # off whatever the profile says. See pipeline/align_checks.py:split_gapped_cues.
+    align_split_gap: Optional[float] = None
 
     # Subtitle formatting
     max_line_width: Optional[int] = 18
