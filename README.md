@@ -33,7 +33,7 @@ uv sync --extra transformers_qwen   # ASR via official transformers Qwen3-ASR su
 uv sync --extra legacy              # ASR via the older qwen_asr package; mutually exclusive with transformers_qwen
 ```
 
-## Usage
+## Basic Usage
 
 To generate a subtitle file easily for a given audio or video file, run:
 
@@ -48,17 +48,18 @@ weights (~6 GB), so it will take significantly longer than the ones after it.
 Any file ffmpeg can read works: `.mkv`, `.mp4`, `.wav`, `.m4a` and so on. Add `--input_dir DIR` to
 process a whole folder.
 
-### Configuration
+You can configure more extensively using command-line flags (see below), but, more conveniently, you can also 
+**set your own defaults in `config/default.cfg`**. Any command line flags you add will override these defaults 
+at runtime. Use the flag `--cfg NAME` to swap in a different file from `config/` (for example `--cfg cpu` to use 
+the defaults from `config/cpu.cfg`).
 
-Everything below is a command-line flag, but you can **set your own defaults in `config/default.cfg`**.
-Anything command line flags you add will override these defaults at runtime. Use the flag `--cfg NAME` 
-to swap in a different file from `config/` (for example `--cfg cpu` to use the defaults from `config/cpu.cfg`).
+Run `uv run cantocaptions_ai --help` to display the complete flag list.
 
-Run `uv run cantocaptions_ai --help` for the complete flag list.
+_Note: If you are running out of VRAM when running, it's recommended to lower `batch_size` and `align_batch_size`._
 
-If you are running out of VRAM when running, it's recommended to lower `batch_size` and `align_batch_size`.
+## Configuration
 
-### 1. Model selection
+### ASR Model selection
 
 `model` picks the transcription model. The default, `cantocaptions-cantonese-ASR`, is
 [a fine-tune of Qwen3-ASR](https://huggingface.co/rookes/cantocaptions-cantonese-asr) trained on the
@@ -71,7 +72,7 @@ non-standard written Cantonese, both of these models are put through extensive p
 Post-processing includes using the alignment model as a phonetic guide to check for certain variants 
 such as gam2 噉 vs. gam3 咁.
 
-### 2. Speech detection (VAD)
+### Speech detection (VAD)
 
 Before transcribing, the pipeline finds where the speech in the audio is and cuts it into chunks. Three 
 important settings to adjust if there are issues with dropped speech:
@@ -84,13 +85,13 @@ important settings to adjust if there are issues with dropped speech:
   the detector's own onset lags about a second behind real speech after a silence. Raise it if the
   first word of lines is being clipped.
 
-### 3. Vocal isolation
+### Vocal isolation
 
 `vocal_isolation_method = mbroformer` runs the audio through a Mel-Band RoFormer separator and
 transcribes the isolated vocals. Improves subtitle quality significantly, but is very slow. Requires
 ~600 MB download on first use. Off by default.
 
-### 4. Alignment and Post-Processing
+### Alignment and Post-Processing
 
 To get an accurate timing for the subtitles, an alignment model is used (`no_align = True` to skip the timing step). 
 By default, the model used is [alvinlii's wav2vec2-BERT model for Cantonese](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese).
@@ -100,7 +101,7 @@ After alignment, subtitles are split and re-merged to maintain output standards.
 * `min_cue_duration` — the shortest subtitle allowed before it is merged into a neighbour
 * `max_line_width` / `max_line_count` (default: 18 / 2) — control forced line breaks and how text is wrapped
 
-### 5. Speaker separation (diarization)
+### Speaker separation (diarization)
 
 Set `diarize = True` to attempt to check the speaker for each cue. By default, this will only be used to 
 stop one subtitle from being used for two different speakers' dialogue. Lower `speaker_confidence` to split
@@ -110,7 +111,7 @@ more eagerly. Add `speaker_labels = True` if you also want each line prefixed wi
 Diarization requires a gated model download, so you need to accept its terms on HuggingFace and supply a 
 token (see below).
 
-### 6. Debugging
+### Debugging
 
 `debug_dir` is off by default. Set it to a directory (e.g. `--debug_dir temp` for `./temp/`) and each 
 stage's output will be saved there as it runs. Useful for testing multiple runs with different settings.
@@ -139,7 +140,7 @@ To fetch the model weights ahead of time rather than on first run:
 uv run python scripts/download_models.py
 ```
 
-## Aligning an existing transcript
+## Realign Feature
 
 If you already have a transcript and only need the timings, you can skip ASR entirely:
 
@@ -195,6 +196,12 @@ With `--debug_dir`, `realign/transform.json` records every piece, every edit and
 from and to, and `realign/changes.srt` holds just the cues that did something other than shift with
 the rest of the file.
 
+## Additional Features
+
+* Measure a change to realignment with `scripts/eval_realign.py`, which strips the timings off a
+known-good SRT, realigns its text, and reports how far each cue landed from where it belongs.
+* Set `HF_XET_HIGH_PERFORMANCE=1` to trade RAM/CPU for more model download speed
+
 ## Project Architecture
 
 This project is modeled after the [WhisperX ASR library](https://github.com/m-bain/whisperx), and
@@ -206,8 +213,4 @@ However, `cantocaptions_ai` uses Alibaba Cloud's
 alignment step, and adds a wide array of subtitling improvements designed specifically for written
 Cantonese.
 
-## Additional Features
-
-* Measure a change to realignment with `scripts/eval_realign.py`, which strips the timings off a
-known-good SRT, realigns its text, and reports how far each cue landed from where it belongs.
-* Set `HF_XET_HIGH_PERFORMANCE=1` to trade RAM/CPU for more model download speed
+Thank you to everyone from the CantoCaptions community and Discord for their support and testing on this project.
