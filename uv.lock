@@ -324,7 +324,6 @@ full = [
     { name = "bitsandbytes", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
     { name = "faster-whisper", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "hf-xet", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
     { name = "transformers", version = "5.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
     { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "triton-windows", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
@@ -339,9 +338,6 @@ transformers-qwen = [
     { name = "transformers", version = "5.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin'" },
     { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "triton-windows", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
-]
-xet = [
-    { name = "hf-xet", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or sys_platform == 'darwin' or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-16-cantocaptions-ai-full' and extra == 'extra-16-cantocaptions-ai-legacy') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-16-cantocaptions-ai-legacy' and extra == 'extra-16-cantocaptions-ai-transformers-qwen') or (sys_platform == 'linux' and extra == 'extra-16-cantocaptions-ai-full' and extra == 'extra-16-cantocaptions-ai-legacy') or (sys_platform == 'linux' and extra == 'extra-16-cantocaptions-ai-legacy' and extra == 'extra-16-cantocaptions-ai-transformers-qwen') or (sys_platform == 'win32' and extra == 'extra-16-cantocaptions-ai-full' and extra == 'extra-16-cantocaptions-ai-legacy') or (sys_platform == 'win32' and extra == 'extra-16-cantocaptions-ai-legacy' and extra == 'extra-16-cantocaptions-ai-transformers-qwen')" },
 ]
 
 [package.dev-dependencies]
@@ -360,9 +356,7 @@ requires-dist = [
     { name = "faster-whisper", marker = "extra == 'full'", specifier = ">=1.0.0" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'flash-attn'", specifier = ">=2.0.0" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'full'", specifier = ">=2.0.0" },
-    { name = "hf-xet", marker = "extra == 'full'" },
-    { name = "hf-xet", marker = "extra == 'xet'" },
-    { name = "huggingface-hub", specifier = ">=0.34.0" },
+    { name = "huggingface-hub", specifier = ">=0.36.2" },
     { name = "librosa", specifier = ">=0.10.0" },
     { name = "nltk", specifier = ">=3.9.1" },
     { name = "numpy", specifier = ">=2.1.0" },
@@ -393,7 +387,7 @@ requires-dist = [
     { name = "triton-windows", marker = "sys_platform == 'win32' and extra == 'full'", specifier = "<3.7" },
     { name = "triton-windows", marker = "sys_platform == 'win32' and extra == 'transformers-qwen'", specifier = "<3.7" },
 ]
-provides-extras = ["ensemble", "llm", "transformers-qwen", "legacy", "flash-attn", "xet", "full"]
+provides-extras = ["ensemble", "llm", "transformers-qwen", "legacy", "flash-attn", "full"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "subtitle-edit-rate", specifier = ">=0.4.0" }]

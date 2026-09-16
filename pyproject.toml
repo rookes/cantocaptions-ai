@@ -14,7 +14,10 @@ dependencies = [
     "numpy>=2.1.0",
     "pandas>=2.2.3",
     "pyannote-audio>=4.0.0",
-    "huggingface-hub>=0.34.0",
+    # >=0.36.2 because from there huggingface_hub depends on hf-xet unconditionally
+    # (gated on CPU architecture, not on an extra), so every install gets Xet-backed
+    # downloads with no opt-in. See the "Faster downloads" note in the README.
+    "huggingface-hub>=0.36.2",
     "torch>=2.0.0",
     "torchaudio>=2.0.0",
     "opencc>=1.0.0",
@@ -48,7 +51,6 @@ legacy = ["qwen-asr>=0.0.6"]
 flash-attn = [
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
-xet = ["hf-xet"]
 # Everything except `legacy`, which conflicts with transformers_qwen's transformers pin.
 full = [
     "faster-whisper>=1.0.0",
@@ -57,7 +59,6 @@ full = [
     "triton; sys_platform == 'linux'",
     "triton-windows<3.7; sys_platform == 'win32'",
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "hf-xet",
 ]
 
 [project.scripts]

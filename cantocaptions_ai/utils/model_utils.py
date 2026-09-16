@@ -563,11 +563,15 @@ def ensure_hf_model_downloaded(repo_id: str, cache_dir=None, local_files_only: b
             snapshot_download(repo_id, cache_dir=cache_dir, tqdm_class=_DownloadProgressLogger)
             return
 
+        # hf-xet is a hard dependency of huggingface_hub (gated on CPU architecture, not
+        # on an extra), so it needs no opt-in and this branch is not a missing install to
+        # nag about: it means no wheel exists for this machine, where "pip install hf_xet"
+        # would fail too. Say what is actually true instead of suggesting a fix that isn't.
         try:
             import hf_xet  # noqa: F401
             xet_hint = ""
         except ImportError:
-            xet_hint = " (tip: pip install hf_xet for faster downloads)"
+            xet_hint = " (without Xet acceleration -- no hf-xet build for this architecture)"
 
         logger.info("Downloading %r from HuggingFace Hub%s", repo_id, xet_hint)
         snapshot_download(repo_id, cache_dir=cache_dir, tqdm_class=_DownloadProgressLogger)

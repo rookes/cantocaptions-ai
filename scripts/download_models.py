@@ -88,6 +88,32 @@ def _asr_repos(model_name=None, every=False) -> list:
     return repos
 
 
+def _xet_status() -> str:
+    """One line on whether Xet-backed downloads are active.
+
+    hf-xet needs no setup: huggingface_hub depends on it unconditionally (gated on CPU
+    architecture, not on an extra), so a plain install already has it. This exists for the
+    cases where it is genuinely absent -- an architecture with no hf-xet wheel, or
+    HF_HUB_DISABLE_XET set -- so "downloads are slow" is diagnosable rather than a mystery.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("hf_xet") is None:
+        return "Xet: OFF (hf-xet not installed -- no wheel for this architecture?); downloads use plain HTTP"
+
+    try:
+        from huggingface_hub import constants
+
+        if getattr(constants, "HF_HUB_DISABLE_XET", False):
+            return "Xet: OFF (HF_HUB_DISABLE_XET is set); downloads use plain HTTP"
+        high_perf = getattr(constants, "HF_XET_HIGH_PERFORMANCE", False)
+    except Exception:  # noqa: BLE001 -- a status line must never break the download
+        high_perf = False
+
+    extra = "" if high_perf else " (set HF_XET_HIGH_PERFORMANCE=1 to trade RAM/CPU for more speed)"
+    return f"Xet: on{extra}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Pre-fetch cantocaptions-ai model weights.")
     ap.add_argument("--full", action="store_true", help="also fetch roformer, ensemble, LLM, and diarization models")
@@ -102,6 +128,8 @@ def main() -> int:
 
     from huggingface_hub import hf_hub_download, snapshot_download
     token = args.hf_token or None
+
+    print(f"[info] {_xet_status()}", flush=True)
 
     repos = list(_asr_repos(args.model, every=args.all_asr)) + list(ALWAYS_REPOS)
     files = []

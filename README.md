@@ -134,6 +134,20 @@ To fetch the model weights ahead of time rather than on first run:
 uv run python scripts/download_models.py
 ```
 
+### Faster downloads
+
+Nothing to set up — `hf-xet` comes in automatically with `huggingface_hub`, so model
+downloads are already Xet-backed (chunk-level deduplication, parallel transfer) on any
+mainstream CPU architecture. `scripts/download_models.py` prints whether it is active:
+
+```
+[info] Xet: on (set HF_XET_HIGH_PERFORMANCE=1 to trade RAM/CPU for more speed)
+```
+
+If that line says `OFF`, either you are on an architecture with no `hf-xet` wheel or
+`HF_HUB_DISABLE_XET` is set; downloads still work, just over plain HTTP. Setting
+`HF_XET_HIGH_PERFORMANCE=1` raises throughput further at the cost of more RAM and CPU.
+
 ## Aligning an existing transcript
 
 If you already have the words and only need the timings, you can skip ASR entirely:

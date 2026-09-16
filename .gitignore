@@ -239,6 +239,9 @@ temp/
 dump/
 test/
 
+# Default output_dir: subtitles this tool writes are the user's, not the repo's.
+output/
+
 # config/default.cfg IS tracked: it ships as the annotated starting point users
 # edit instead of retyping flags. It is still auto-generated on first run when
 # absent (see cli_config.ensure_default_cfg_exists), which now only matters for
