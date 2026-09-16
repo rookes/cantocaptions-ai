@@ -103,7 +103,7 @@ transcribes the isolated vocals. Improves subtitle quality significantly, but is
 To get an accurate timing for the subtitles, an alignment model is used (`no_align = True` to skip the timing step). 
 By default, the model used is [alvinlii's wav2vec2-BERT model for Cantonese](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese).
 
-## Post-Processing / Text Cleaning
+### Post-Processing / Text Cleaning
 
 After alignment, subtitles are split and re-merged to maintain output standards. Line segmentation can be manipulated with:
 
