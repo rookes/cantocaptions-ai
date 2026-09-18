@@ -1020,6 +1020,7 @@ def _execute_pipeline(
                 vad_out = VadProcessor.load_cache(vad_items, cfg.load_debug_dir)
         for i, out in zip(vad_indices, vad_out):
             items[i] = out
+        flush_vram()
 
     # Stage 2: Vocal Isolation (conditional)
     if need_vocal_isolation:
