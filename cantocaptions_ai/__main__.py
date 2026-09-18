@@ -15,7 +15,7 @@ logger = get_logger(__name__)
 
 _MEDIA_EXTENSIONS = {
     '.mp4', '.mkv', '.avi', '.mov', '.webm', '.ts', '.m2ts',
-    '.wav', '.mp3', '.flac', '.aac', '.ogg', '.m4a', '.opus',
+    '.wav', '.mp3', '.flac', '.aac', '.ogg', '.m4a', '.opus', '.mka',
 }
 
 
