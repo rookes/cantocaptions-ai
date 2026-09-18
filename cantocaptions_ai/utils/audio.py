@@ -356,6 +356,55 @@ def normalize_gain(audio: np.ndarray, sr: int = SAMPLE_RATE,
     return min(target_db - level, ceiling_db - 20.0 * float(np.log10(peak)))
 
 
+#: Announces that :func:`load_audio` puts sample 0 at the container's zero, so a
+#: caller does not have to correct for a muxed audio delay itself -- and, more to
+#: the point, so one that used to can stop and not double-correct. Read it with
+#: ``getattr(audio, "HONOURS_CONTAINER_DELAY", False)``: a consumer pinned to an
+#: older build of this package sees the absence and keeps its own correction.
+HONOURS_CONTAINER_DELAY = True
+
+
+def container_audio_delay(file: str, audio_track: int = 0) -> float:
+    """Seconds of silence ffmpeg omits from the front of *file*'s audio track.
+
+    A container may hold its audio later than its video -- Peppa Pig S1 puts the
+    Cantonese dub at 1.000 s against video at 0.041 s. A player honours that and
+    shows a subtitle at the time the subtitle says. ffmpeg decoding to a RAW
+    format has no muxer to honour it and rebases the stream onto its own first
+    packet, so the lead is dropped rather than padded and every later sample
+    answers to a timestamp this much too small.
+
+    The number is `audio_start_time - container_start_time`, and it is constant
+    for the file -- this is a fixed mux offset, not drift, so nothing here has to
+    track how far in we are. It is clamped at 0 because the container's start is
+    the minimum over its streams, which leaves the audio unable to lead it.
+
+    Returns 0.0 for anything unreadable rather than raising: a file ffprobe
+    cannot parse has a much louder problem waiting one line later in the decode,
+    and reporting it from here would blame the delay for it.
+    """
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+           "-show_streams", "-select_streams", "a", "-show_format", file]
+    try:
+        data = json.loads(subprocess.run(cmd, capture_output=True,
+                                         check=False).stdout)
+    except (OSError, json.JSONDecodeError):
+        return 0.0
+
+    streams = data.get("streams") or []
+    if not streams:
+        return 0.0
+    stream = streams[audio_track] if audio_track < len(streams) else streams[0]
+
+    def _start(obj) -> float:
+        try:
+            return float(obj.get("start_time"))
+        except (TypeError, ValueError):
+            return 0.0
+
+    return max(_start(stream) - _start(data.get("format") or {}), 0.0)
+
+
 def _clip_ffmpeg_args(audio_start: Optional[float], audio_end: Optional[float]) -> tuple:
     """Return (pre_input_args, post_input_args) implementing an [start, end) clip.
 
@@ -443,6 +492,45 @@ def validate_input_file(
     return duration
 
 
+def _restore_container_delay(audio: np.ndarray, file: str, audio_track: int,
+                             audio_start: Optional[float],
+                             audio_end: Optional[float], sr: int) -> np.ndarray:
+    """Put `audio`'s sample 0 back at the container time the caller asked for.
+
+    Both decode shapes need this and they need different amounts of it, which is
+    why it is one function rather than a branch at each call site:
+
+    * No ``-ss``. ffmpeg starts at the first audio packet, so the whole delay is
+      missing and the whole delay is prepended.
+    * ``-ss t`` with ``t`` at or past the delay. ffmpeg seeks on the container
+      timeline and is already right; nothing is prepended. This is the ordinary
+      case, and it is why the bug survived so long -- the clipped path, which is
+      the one people reach for when a timing looks wrong, quietly disagreed with
+      the unclipped one instead of being wrong alongside it.
+    * ``-ss t`` with ``t`` inside the delay. There is no packet to seek to, so
+      ffmpeg clamps to the first one and returns audio from `delay` while the
+      caller believes it starts at `t`. The shortfall is `delay - t`.
+
+    ``max`` covers all three: the first is `t = 0`, the second goes negative and
+    clamps to nothing. The trim afterwards keeps the promise ``audio_end`` makes
+    about LENGTH -- ffmpeg measured its ``-t`` from the clamp point, so padding
+    the front without it would hand back a clip longer than the window asked
+    for. It is skipped entirely when no padding happened, so a file with no
+    delay decodes to the same samples, and the same count, it always did.
+    """
+    if not file or not os.path.exists(file):
+        return audio                      # not a path we can probe; leave it be
+    delay = container_audio_delay(file, audio_track)
+    pad = int(round(max(delay - (audio_start or 0.0), 0.0) * sr))
+    if pad <= 0:
+        return audio
+    logger.debug("%s: restoring %.3fs of container audio delay", file, pad / sr)
+    audio = np.concatenate([np.zeros(pad, dtype=audio.dtype), audio])
+    if audio_end is not None:
+        audio = audio[:int(round((audio_end - (audio_start or 0.0)) * sr))]
+    return audio
+
+
 def load_audio(file: str,
                sr: int = SAMPLE_RATE,
                audio_track: int = 0,
@@ -491,6 +579,11 @@ def load_audio(file: str,
     Returns
     -------
     A NumPy array containing the audio waveform, in float32 dtype.
+
+    Sample 0 is the container's zero -- the instant a player starts counting,
+    and therefore the instant a subtitle file counts from -- or ``audio_start``
+    where one is given. On a container that muxes its audio with a delay that is
+    NOT what ffmpeg returns on its own; see ``_restore_container_delay``.
     """
     pre_input, post_input = _clip_ffmpeg_args(audio_start, audio_end)
     filter_args = _downmix_ffmpeg_args(file, audio_track, downmix)
@@ -505,6 +598,8 @@ def load_audio(file: str,
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
 
     audio = np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+    audio = _restore_container_delay(audio, file, audio_track, audio_start,
+                                     audio_end, sr)
     if normalize:
         gain = normalize_gain(audio, sr)
         if gain:
@@ -532,17 +627,36 @@ def extract_clip_to_wav(
     file by path (diarization, speaker verification). Output timestamps are relative
     to the clip start; the caller offsets them by ``audio_start`` to map back to the
     source timeline. Returns ``dst``.
+
+    Decodes through ``load_audio`` and writes the samples here, rather than
+    letting ffmpeg write the file, so that the clipped path and the whole-file
+    path cannot drift apart. They already had: this function is what
+    ``--audio_start`` goes through, and before the container-delay correction the
+    two disagreed by the delay -- so the same media transcribed with the flag and
+    without it produced subtitles a second apart. One decoder is the only way
+    that stays fixed.
+
+    Written with the stdlib ``wave`` module for the same reason the decode is a
+    subprocess: this is a core path, and soundfile reaches this package only
+    transitively through librosa.
     """
-    pre_input, post_input = _clip_ffmpeg_args(audio_start, audio_end)
-    filter_args = _downmix_ffmpeg_args(src, audio_track, downmix)
-    cmd = ["ffmpeg", "-nostdin", "-y", "-threads", "0", *pre_input, "-i", src]
-    if audio_track != 0:
-        cmd += ["-map", f"0:a:{audio_track}"]
-    cmd += [*post_input, *filter_args, "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), dst]
+    import wave
+
+    audio = load_audio(src, sr=sr, audio_track=audio_track,
+                       audio_start=audio_start, audio_end=audio_end,
+                       downmix=downmix)
+    # Exact, not merely close: load_audio built these by dividing int16 by
+    # 32768, a power of two, so every value is back to the integer it came from
+    # with no rounding to argue about.
+    samples = np.clip(audio * 32768.0, -32768.0, 32767.0).astype("<i2")
     try:
-        subprocess.run(cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to extract audio clip: {e.stderr.decode()}") from e
+        with wave.open(dst, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(sr)
+            out.writeframes(samples.tobytes())
+    except OSError as e:
+        raise RuntimeError(f"Failed to extract audio clip: {e}") from e
     return dst
 
 
