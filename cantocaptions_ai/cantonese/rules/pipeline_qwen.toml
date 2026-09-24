@@ -13,6 +13,12 @@
 #
 # This order mirrors the legacy canto_subtitle_cleaner clean_subtitle() chain and
 # is load-bearing: rules assume the transformations of every step before them.
+#
+# `pre_align` steps run on the raw ASR text before alignment; see pipeline.toml.
+
+[[pre_align]]
+type = "rules"
+file = "comma_conjunctions.toml"
 
 [[steps]]
 type = "builtin"

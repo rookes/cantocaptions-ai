@@ -24,6 +24,19 @@
 # which made a line-final repeat ("係咁多啦…係咁多啦") pass through this manifest
 # untouched. That dependency now lives in repeated_speech.toml itself as a pair of
 # `$`-anchored rules, so this chain collapses the same runs the Qwen one does.
+#
+# linebreak and trim are layout, not dialect correction, so they close this chain
+# exactly as they close the Qwen one: without them a long cue went out as a single
+# over-width line, and a comma left on the end of a cue was never stripped.
+#
+# `pre_align` steps run on the raw ASR text before alignment, in the same format.
+# comma_conjunctions goes there so the clause commas it adds (嘅話，/，雖然) are
+# boundaries alignment can end or start a cue on; it also stays in `steps`, where it
+# is a no-op on commas already inserted.
+
+[[pre_align]]
+type = "rules"
+file = "comma_conjunctions.toml"
 
 [[steps]]
 type = "rules"
@@ -48,3 +61,11 @@ file = "interjection_noise.toml"
 [[steps]]
 type = "rules"
 file = "repeated_speech.toml"
+
+[[steps]]
+type = "builtin"
+name = "linebreak"
+
+[[steps]]
+type = "builtin"
+name = "trim"

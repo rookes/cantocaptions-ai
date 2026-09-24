@@ -437,6 +437,29 @@ def _offset_result_times(result: dict, offset: float) -> None:
                 token[key] += offset
 
 
+def _pre_align_clean(items: List[ProcessingItem], cleaner) -> List[ProcessingItem]:
+    """Apply the cleaning manifest's ``pre_align`` steps to each ASR segment's text.
+
+    Runs after the ASR (and any correction) cache loads rather than inside the ASR
+    backend, so a --load_debug_dir replay picks up rule edits without re-running ASR.
+    Punctuation added here is what alignment splits sentences on, so a clause comma
+    such as 嘅話， can end one cue and start the next instead of trailing on a line.
+    """
+    changed = 0
+    for item in items:
+        segments = []
+        for seg in item['result']['segments']:
+            text = cleaner.pre_align(seg['text'])
+            if text != seg['text']:
+                changed += 1
+                seg = {**seg, 'text': text}
+            segments.append(seg)
+        item['result']['segments'] = segments
+    if changed:
+        logger.info("Pre-alignment cleaning: updated %d segment(s)", changed)
+    return items
+
+
 def _merge_and_write(
     items: List[ProcessingItem],
     writer,
@@ -837,8 +860,9 @@ def _execute_pipeline(
                 "realign_mode auto resolved to %r for: %s", realign_mode, cfg.realign,
             )
 
-    # Text cleaning runs on the final merged segments just before writing.
-    # Constructed eagerly so bad rule files fail before any model inference.
+    # Text cleaning runs on the final merged segments just before writing, apart from the
+    # manifest's pre_align steps, which run on the ASR text before alignment (see
+    # _pre_align_clean). Constructed eagerly so bad rule files fail before any model inference.
     #
     # What decides it is what the input *is*, not which feature is running. A bare transcript
     # wants the rule files as much as ASR output does, so realign_mode 'transcript' cleans; a
@@ -1263,6 +1287,11 @@ def _execute_pipeline(
                     normalize=cfg.realign_normalize,
                     debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir,
                 )
+
+        # Not under --realign: the transcript's cue_spans index its text, so inserting a
+        # character would shift every span after it -- and that text is the user's anyway.
+        if cleaner is not None and not cfg.realign:
+            items = _pre_align_clean(items, cleaner)
 
         # Stage 4: Alignment
         if not cfg.no_align:

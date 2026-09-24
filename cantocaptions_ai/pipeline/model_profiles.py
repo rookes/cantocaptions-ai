@@ -73,12 +73,13 @@ _QWEN_SPOTCHECKS: Mapping[str, SpotCheck] = {
 # rather than the conservative default manifest a fine-tuned checkpoint gets.
 _QWEN_CLEANING = CleaningConfig(manifest="pipeline_qwen.toml")
 
-# Qwen punctuates leading discourse markers off as their own clause ("嗱，你知啦，" -> "嗱，"
-# + "你知啦，"), so alignment gives them a standalone subsegment that CTC then squeezes to a
-# few frames. Listing them here rejoins them onto the sentence they introduce.
+# Both Qwen and the fine-tunes built on it punctuate leading discourse markers off as their
+# own clause ("嗱，你知啦，" -> "嗱，" + "你知啦，"), so alignment gives them a standalone
+# subsegment that CTC then squeezes to a few frames. Listing them here rejoins them onto the
+# sentence they introduce.
 # Deliberately excludes 呀/啦/吓: those double as final particles, so they attach backwards
 # about as often as forwards and are better left to the generic duration-based rescue.
-_QWEN_SEGMENTATION = SegmentationConfig(leading_markers=(
+_LEADING_MARKER_SEGMENTATION = SegmentationConfig(leading_markers=(
     "嗱", "喂", "咦", "哦", "唉", "誒", "哎",
     "哎呀", "哎吔", "哇", "嚇", "嗯", "好啦",
 ))
@@ -86,11 +87,13 @@ _QWEN_SEGMENTATION = SegmentationConfig(leading_markers=(
 
 # The published fine-tune and the local LoRA build below share one profile shape: both
 # already emit HK-traditional text and the CantoCaptions final-particle convention, so they
-# take every default — no OpenCC, default punctuation, no spot checks, and the conservative
-# default cleaning manifest rather than Qwen's full chain. Written once so the two cannot
-# drift apart; copy it as the template when adding another fine-tuned checkpoint.
+# need no OpenCC, default punctuation, no spot checks, and the conservative default cleaning
+# manifest rather than Qwen's full chain. Cue assembly is the exception: they still clause
+# off leading markers the way Qwen does, so they take Qwen's marker list too. Written once
+# so the two cannot drift apart; copy it as the template when adding another fine-tuned
+# checkpoint.
 def _finetuned_profile(hf_id: str) -> ModelProfile:
-    return ModelProfile(hf_id=hf_id)
+    return ModelProfile(hf_id=hf_id, segmentation=_LEADING_MARKER_SEGMENTATION)
 
 
 # Env var pointing at a *local* merged-weights directory. Kept out of the source tree so no
@@ -110,14 +113,14 @@ def _build_profiles() -> Dict[str, ModelProfile]:
             hf_id="Qwen/Qwen3-ASR-1.7B-hf",
             normalization=_QWEN_NORMALIZATION,
             spotchecks=_QWEN_SPOTCHECKS,
-            segmentation=_QWEN_SEGMENTATION,
+            segmentation=_LEADING_MARKER_SEGMENTATION,
             cleaning=_QWEN_CLEANING,
         ),
         "Qwen3-ASR-0.6B": ModelProfile(
             hf_id="Qwen/Qwen3-ASR-0.6B-hf",
             normalization=_QWEN_NORMALIZATION,
             spotchecks=_QWEN_SPOTCHECKS,
-            segmentation=_QWEN_SEGMENTATION,
+            segmentation=_LEADING_MARKER_SEGMENTATION,
             cleaning=_QWEN_CLEANING,
         ),
         "cantocaptions-cantonese-ASR": _finetuned_profile(_CANTOCAPTIONS_HF_ID),

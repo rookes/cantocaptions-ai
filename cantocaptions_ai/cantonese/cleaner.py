@@ -13,6 +13,11 @@ rule sets entirely.
 
 Cleaning may return an empty string (noise-only lines); callers should drop those
 subtitles (see ``text.is_removable``).
+
+A manifest may also declare ``[[pre_align]]`` steps, in the same format. Those run on
+the raw ASR text *before* alignment (``SubtitleCleaner.pre_align``), so punctuation
+they insert becomes a clause boundary alignment can split a cue on, rather than
+landing mid-cue or on a cue's end after the cues are already cut.
 """
 
 from pathlib import Path
@@ -63,9 +68,11 @@ class SubtitleCleaner:
         self.max_line_count = max_line_count
         # Fails fast on a missing/invalid manifest, rule file, or regex so problems
         # surface at pipeline start rather than after hours of ASR.
-        self._steps = self._load_steps()
+        manifest_path, manifest = self._load_manifest()
+        self._steps = self._load_steps(manifest_path, manifest, "steps")
+        self._pre_align_steps = self._load_steps(manifest_path, manifest, "pre_align")
 
-    def _load_steps(self) -> List[Tuple[str, Callable[[str], str]]]:
+    def _load_manifest(self) -> Tuple[Path, dict]:
         manifest_path = self.rules_dir / self.manifest
         # An override directory supplies whatever rule set the caller wrote and need not
         # know which manifest the chosen model asks for, so fall back to the documented
@@ -82,21 +89,24 @@ class SubtitleCleaner:
             raise ValueError(f"Cleaning manifest not found: {manifest_path}")
 
         with open(manifest_path, "rb") as f:
-            manifest = tomllib.load(f)
+            return manifest_path, tomllib.load(f)
 
+    def _load_steps(
+        self, manifest_path: Path, manifest: dict, key: str,
+    ) -> List[Tuple[str, Callable[[str], str]]]:
         steps: List[Tuple[str, Callable[[str], str]]] = []
-        for i, entry in enumerate(manifest.get("steps", [])):
+        for i, entry in enumerate(manifest.get(key, [])):
             step_type = entry.get("type")
             if step_type == "rules":
                 file = entry.get("file")
                 if not file:
-                    raise ValueError(f"{manifest_path}: step #{i + 1} is missing 'file'")
+                    raise ValueError(f"{manifest_path}: {key} #{i + 1} is missing 'file'")
                 if self.rules_dir == BUILTIN_RULES_DIR:
                     rules = get_builtin_ruleset(Path(file).stem)
                 else:
                     rule_path = self.rules_dir / file
                     if not rule_path.is_file():
-                        raise ValueError(f"{manifest_path}: step #{i + 1} rule file not found: {rule_path}")
+                        raise ValueError(f"{manifest_path}: {key} #{i + 1} rule file not found: {rule_path}")
                     rules = load_ruleset(rule_path)
                 steps.append((file, lambda text, _rules=rules: apply_ruleset(text, _rules)))
             elif step_type == "builtin":
@@ -108,14 +118,20 @@ class SubtitleCleaner:
                 elif name in self.BUILTIN_STEPS:
                     steps.append((name, self.BUILTIN_STEPS[name]))
                 else:
-                    raise ValueError(f"{manifest_path}: step #{i + 1} has unknown builtin '{name}'")
+                    raise ValueError(f"{manifest_path}: {key} #{i + 1} has unknown builtin '{name}'")
             else:
-                raise ValueError(f"{manifest_path}: step #{i + 1} has unknown type '{step_type}'")
+                raise ValueError(f"{manifest_path}: {key} #{i + 1} has unknown type '{step_type}'")
 
         return steps
 
     def clean(self, text: str) -> str:
         """Clean a single subtitle line. May return an empty string (drop the subtitle)."""
         for _name, step in self._steps:
+            text = step(text)
+        return text
+
+    def pre_align(self, text: str) -> str:
+        """Apply the manifest's ``pre_align`` steps to raw ASR text (a no-op if it has none)."""
+        for _name, step in self._pre_align_steps:
             text = step(text)
         return text

@@ -71,8 +71,39 @@ class TestRuleLoader(unittest.TestCase):
                 "chinese_numbers",
                 "interjection_noise.toml",
                 "repeated_speech.toml",
+                "linebreak",
+                "trim",
             ],
         )
+
+    def test_both_manifests_insert_clause_commas_before_alignment(self):
+        for name in ("pipeline.toml", "pipeline_qwen.toml"):
+            with self.subTest(manifest=name):
+                cleaner = SubtitleCleaner(manifest=name, max_line_count=2)
+                self.assertEqual(
+                    [name for name, _ in cleaner._pre_align_steps],
+                    ["comma_conjunctions.toml"],
+                )
+                self.assertEqual(cleaner.pre_align("係咁嘅話我哋走先"), "係咁嘅話，我哋走先")
+
+    def test_manifest_without_pre_align_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "pipeline.toml").write_text(
+                '[[steps]]\ntype = "builtin"\nname = "trim"\n', encoding="utf-8"
+            )
+            cleaner = SubtitleCleaner(rules_dir=tmp)
+            self.assertEqual(cleaner.pre_align("係咁嘅話我哋走先"), "係咁嘅話我哋走先")
+
+    def test_default_manifest_breaks_long_lines(self):
+        cleaner = SubtitleCleaner(line_max_length=18, max_line_count=2)
+        # 26 chars: within the two-line budget cue assembly caps a cue at.
+        text = cleaner.clean("雖然話大家係親戚,不過,我哋其實只係遠房親戚。")
+        self.assertIn("\n", text)
+        self.assertTrue(all(len(line) <= 18 for line in text.split("\n")))
+
+    def test_default_manifest_leaves_no_trailing_comma(self):
+        cleaner = SubtitleCleaner(max_line_count=2)
+        self.assertEqual(cleaner.clean("我哋今日要走，"), "我哋今日要走")
 
     def test_grouped_number_commas_survive_the_default_chain(self):
         """A converted value >= 10,000 keeps its half-width commas.
@@ -182,6 +213,41 @@ class TestCleanerConstruction(unittest.TestCase):
             self.assertEqual(cleaner.clean("幾好嘛"), "你好嘛")
             # Built-in steps are not applied with an override manifest
             self.assertEqual(cleaner.clean("吓？？"), "吓？？")
+
+
+# ---------------------------------------------------------------------------
+# comma_conjunctions.toml
+# ---------------------------------------------------------------------------
+
+class TestCommaConjunctions(unittest.TestCase):
+
+    def setUp(self):
+        from cantocaptions_ai.cantonese.rules import apply_ruleset
+        rules = load_ruleset(BUILTIN_RULES_DIR / "comma_conjunctions.toml")
+        self.apply = lambda text: apply_ruleset(text, rules)
+
+    def test_ge_waa_takes_a_comma_mid_line(self):
+        self.assertEqual(self.apply("係咁嘅話我哋走先"), "係咁嘅話，我哋走先")
+
+    def test_ge_waa_takes_no_comma_at_line_end(self):
+        self.assertEqual(self.apply("如果係咁嘅話"), "如果係咁嘅話")
+
+    def test_seoi_jin_takes_a_comma_after_a_clause(self):
+        self.assertEqual(self.apply("好攰雖然做完"), "好攰，雖然做完")
+
+    def test_pronoun_subject_reads_into_seoi_jin(self):
+        for text in ("我雖然好攰", "你雖然贏咗", "佢雖然走咗", "你哋雖然贏咗", "佢哋雖然好叻"):
+            with self.subTest(text=text):
+                self.assertEqual(self.apply(text), text)
+
+    def test_existing_half_width_mark_is_respected(self):
+        # pre_align runs before punctuation.toml, so the model's own "," may still be there.
+        self.assertEqual(self.apply("佢好叻,雖然"), "佢好叻,雖然")
+        self.assertEqual(self.apply("係咁嘅話,我哋走先"), "係咁嘅話,我哋走先")
+
+    def test_idempotent(self):
+        once = self.apply("好攰雖然做完但係係咁嘅話我哋走先")
+        self.assertEqual(self.apply(once), once)
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +537,22 @@ class TestCleanSubtitle(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # _merge_and_write integration
 # ---------------------------------------------------------------------------
+
+class TestPreAlignClean(unittest.TestCase):
+
+    def test_inserts_clause_commas_without_touching_timings(self):
+        from cantocaptions_ai.pipeline.transcribe import _pre_align_clean
+
+        seg = {"start": 1.0, "end": 3.0, "text": "係咁嘅話我哋走先"}
+        items = [{"audio_path": "a.wav", "result": {"segments": [seg]}}]
+        out = _pre_align_clean(items, SubtitleCleaner(max_line_count=2))
+
+        self.assertEqual(
+            out[0]["result"]["segments"],
+            [{"start": 1.0, "end": 3.0, "text": "係咁嘅話，我哋走先"}],
+        )
+        self.assertEqual(seg["text"], "係咁嘅話我哋走先")  # input dict not mutated
+
 
 class TestMergeAndWrite(unittest.TestCase):
 

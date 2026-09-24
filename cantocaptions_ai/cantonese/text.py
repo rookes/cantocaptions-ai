@@ -88,7 +88,7 @@ class CleaningConfig:
 
     ``manifest`` names a file in the rules directory (the packaged ``cantonese/rules/``,
     or a ``--clean_rules_dir`` override). The default manifest is conservative --
-    character variants, punctuation, and noise -- because a model fine-tuned to emit
+    character variants, punctuation, noise and line layout -- because a model fine-tuned to emit
     the target convention already writes what the heavier rules exist to impose.
 
     A model that writes generic Mandarin-flavoured output needs the full legacy chain

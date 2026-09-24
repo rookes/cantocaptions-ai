@@ -51,12 +51,11 @@ class TestGetModelProfile(unittest.TestCase):
 
     def test_finetuned_lora_is_clean_slate(self):
         # Whether registered (env set) or resolved as a passthrough (env unset), the
-        # LoRA model gets all-default no-op downstream behavior.
+        # LoRA model gets no text normalization or spot checks.
         profile = get_model_profile("Qwen3-ASR-lora")
         self.assertIsNone(profile.normalization.opencc_config)
         self.assertFalse(profile.normalization.chars_hk)
         self.assertEqual(dict(profile.spotchecks), {})
-        self.assertEqual(profile.segmentation.leading_markers, ())
 
     def test_published_finetune_is_registered_from_the_hub(self):
         # The published checkpoint needs no env var: it is a plain hub id, always a valid
@@ -68,7 +67,11 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertFalse(profile.normalization.chars_hk)
         self.assertEqual(dict(profile.spotchecks), {})
         self.assertEqual(profile.punctuation, PunctuationConfig())
-        self.assertEqual(profile.segmentation, SegmentationConfig())
+        # Cue assembly matches Qwen's: the fine-tune clauses off 嗱/喂 the same way.
+        self.assertEqual(
+            profile.segmentation, get_model_profile("Qwen3-ASR").segmentation,
+        )
+        self.assertIn("嗱", profile.segmentation.leading_markers)
 
     def test_published_finetune_and_lora_share_one_profile_shape(self):
         # The two differ only in where the weights come from; every downstream field must
