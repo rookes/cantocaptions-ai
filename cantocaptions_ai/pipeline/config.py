@@ -16,6 +16,11 @@ def _detect_default_device() -> str:
     return "cpu"
 
 
+# Kept here rather than in pipeline/vads so the CLI can offer it as choices without
+# importing torch at startup.
+VAD_METHODS = ("pyannote", "silero")
+
+
 @dataclass
 class PipelineConfig:
     """Configuration for the cantocaptions-ai pipeline.

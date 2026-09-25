@@ -4,7 +4,7 @@ import importlib.metadata
 import platform
 
 from cantocaptions_ai.pipeline.cli_config import ConfigAwareHelpFormatter, resolve_pipeline_args
-from cantocaptions_ai.pipeline.config import PipelineConfig
+from cantocaptions_ai.pipeline.config import PipelineConfig, VAD_METHODS
 from cantocaptions_ai.pipeline.model_profiles import MODEL_PROFILES
 from cantocaptions_ai.pipeline.reference_context import CONTEXT_TEMPLATES
 from cantocaptions_ai.utils.output import (LANGUAGES, TO_LANGUAGE_CODE,
@@ -109,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     audio_grp.add_argument("--no_audio_normalize", dest="audio_normalize", action="store_false", default=argparse.SUPPRESS, help="do not level the file before processing. Levelling is on by default because the training corpus is cut that way; turn it off only to reproduce an older run, since an unlevelled file is a different input distribution than the model was trained on.")
 
     vad_grp = parser.add_argument_group("vad")
-    vad_grp.add_argument("--vad_method", type=str, default=argparse.SUPPRESS, choices=["pyannote"], help="VAD method to be used")
+    vad_grp.add_argument("--vad_method", type=str, default=argparse.SUPPRESS, choices=list(VAD_METHODS), help="VAD model: pyannote (segmentation-3.0; best, and fast on a GPU) or silero (Silero VAD v6; CPU only, lighter on a CPU-only machine). The thresholds are calibrated per model: see config/cpu.cfg for silero's")
     vad_grp.add_argument("--vad_onset", type=float, default=argparse.SUPPRESS, help="Onset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected")
     vad_grp.add_argument("--vad_offset", type=float, default=argparse.SUPPRESS, help="Offset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected.")
     vad_grp.add_argument("--vad_pad_onset", type=float, default=argparse.SUPPRESS, help="seconds of audio to keep before each detected speech region, so word onsets are not clipped at the threshold crossing")

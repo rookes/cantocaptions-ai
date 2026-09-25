@@ -88,9 +88,20 @@ important settings to adjust if there are issues with dropped speech:
   chunks based on this size.
 - `vad_onset` / `vad_offset` — the detection thresholds. Lower them if speech is being missed entirely.
   Raise to detect less as speech and speed up inference.
-- `vad_pad_onset` — audio kept before each detected region. It is deliberately large, because
-  the detector's own onset lags about a second behind real speech after a silence. Raise it if the
-  first word of lines is being clipped.
+- `vad_pad_onset` — audio kept before each detected region. Raise it if the first word of lines
+  is being clipped.
+
+`vad_method` picks the detector:
+
+- `pyannote` (default) — pyannote segmentation-3.0. Fast on a GPU (~2.5 s per hour of audio) and
+  the most accurate option.
+- `silero` — Silero VAD v6, a small model built for CPUs (~23 s per hour of audio on two cores,
+  where pyannote on a CPU takes ~38 s across every core). `--cfg cpu` uses it. It drops somewhat
+  more speech than pyannote.
+
+Both models' scores go through the same thresholds, padding and chunking, but they are calibrated
+differently: the `vad_*` values in `config/default.cfg` are tuned for pyannote and the ones in
+`config/cpu.cfg` for silero, so copy the whole set when switching models.
 
 ### Vocal isolation
 

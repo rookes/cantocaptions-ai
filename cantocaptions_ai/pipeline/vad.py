@@ -14,7 +14,8 @@ from cantocaptions_ai.utils.log_utils import get_logger
 # triton-not-found warning from torch.utils.flop_counter.
 logger = get_logger(__name__)
 
-from cantocaptions_ai.pipeline.vads import Vad, Pyannote
+from cantocaptions_ai.pipeline.vads import Vad, Pyannote, Silero
+from cantocaptions_ai.pipeline.vads.curve import frame_middles
 
 
 class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
@@ -144,8 +145,7 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
             # Hand over the raw probability curve too: when a unioned run exceeds
             # chunk_size and contains no silent gap, the least damaging cut is the
             # lowest-scoring frame -- the same signal Binarize._split_long uses.
-            window = raw_segments.sliding_window
-            times = np.array([window[i].middle for i in range(raw_segments.data.shape[0])])
+            times = np.array(frame_middles(raw_segments))
             merged = expand_intervals_to_reference(
                 merged,
                 self.reference_cues,
@@ -219,6 +219,8 @@ def load_vad(
                 vad_offset=vad_offset,
                 chunk_size=chunk_size,
             )
+        elif vad_method == "silero":
+            vad_model = Silero(vad_onset=vad_onset)
         else:
             raise ValueError(f"Invalid vad_method: {vad_method}")
 

@@ -228,6 +228,48 @@ class TestCoverChunks(unittest.TestCase):
         self.assertLessEqual(cuts[0], 26.0)
 
 
+def reference_hysteresis(onset, offset, timestamps, k_scores):
+    """The frame-by-frame loop Binarize._hysteresis replaced, kept as its specification."""
+    regions = []
+    start = timestamps[0]
+    is_active = k_scores[0] > onset
+    t = start
+    for t, y in zip(timestamps[1:], k_scores[1:]):
+        if is_active:
+            if y < offset:
+                regions.append((start, t))
+                is_active = False
+        elif y > onset:
+            start = t
+            is_active = True
+    if is_active:
+        regions.append((start, t))
+    return regions
+
+
+class TestHysteresisMatchesFrameLoop(unittest.TestCase):
+    def test_random_curves(self):
+        rng = np.random.default_rng(0)
+        for trial in range(300):
+            n = int(rng.integers(1, 400))
+            # Mix smooth and jagged curves so runs of every length occur.
+            y = rng.random(n) if trial % 2 else np.clip(np.cumsum(rng.normal(0, 0.15, n)), 0, 1)
+            y = y.astype(np.float32)
+            t = [i * FRAME + FRAME / 2 for i in range(n)]
+            onset = float(rng.uniform(0.2, 0.8))
+            # Includes offset > onset, where the closing frame must not re-open a region.
+            offset = float(rng.uniform(0.05, 0.9))
+            got = Binarize(onset=onset, offset=offset)._hysteresis(t, y)
+            self.assertEqual(got, reference_hysteresis(onset, offset, t, y), (trial, onset, offset))
+
+    def test_scores_exactly_at_threshold_neither_open_nor_close(self):
+        t = [0.0, 1.0, 2.0, 3.0, 4.0]
+        y = np.array([0.5, 0.6, 0.3, 0.2, 0.7], dtype=np.float32)
+        got = Binarize(onset=0.5, offset=0.3)._hysteresis(t, y)
+        self.assertEqual(got, reference_hysteresis(0.5, 0.3, t, y))
+        self.assertEqual(got, [(1.0, 3.0), (4.0, 4.0)])
+
+
 class TestNoSpeech(unittest.TestCase):
     def test_all_silence_yields_no_regions(self):
         out = Binarize(onset=0.5, offset=0.3, pad_onset=0.2, min_duration_off=0.25,
