@@ -66,9 +66,9 @@ class PipelineConfig:
 
     # VAD
     vad_method: str = "pyannote"
-    vad_onset: float = 0.450
-    vad_offset: float = 0.300
-    vad_pad_onset: float = 1.00
+    vad_onset: float = 0.15
+    vad_offset: float = 0.15
+    vad_pad_onset: float = 0.25
     vad_pad_offset: float = 0.20
     vad_min_duration_off: float = 0.25
     chunk_size: int = 28
