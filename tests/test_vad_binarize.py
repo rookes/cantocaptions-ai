@@ -175,6 +175,66 @@ class TestMinSplitDuration(unittest.TestCase):
         self.assertAlmostEqual(cuts[0], 7.01, places=1)
 
 
+class TestNoSliverAfterACut(unittest.TestCase):
+    """A region only just over max_duration must not be cut in its own trailing pad.
+
+    The frames after the speech stops score lowest, so an unbounded search cut there and left
+    a few-millisecond piece that became its own VAD chunk. Under 240 samples, alignment's
+    feature extractor raised "negative dimensions are not allowed" and lost a whole batch of
+    files. The curve here is that case: speech, then a tail falling away into silence, then a
+    second region long enough that the sliver could not share a chunk with it.
+    """
+
+    STEP = 0.016875  # pyannote segmentation-3.0's frame step
+
+    def _curve(self, speech_s, total_s=80.0):
+        n = int(total_s / self.STEP)
+        t = np.arange(n) * self.STEP
+        data = np.full((n, 1), 0.02, dtype=np.float32)
+        end = 5.0 + speech_s
+        data[(t >= 5.0) & (t < end), 0] = 0.9
+        tail = (t >= end) & (t < end + 0.4)
+        data[tail, 0] = np.linspace(0.14, 0.01, tail.sum())
+        data[(t >= end + 3.0) & (t < end + 29.5), 0] = 0.9
+        return SlidingWindowFeature(data, SlidingWindow(start=0.0, duration=self.STEP, step=self.STEP))
+
+    # The pyannote settings before and after 287d846; both reach the bug.
+    SETTINGS = {
+        "old": dict(onset=0.45, offset=0.30, pad_onset=1.00, pad_offset=0.20, min_duration_off=0.25),
+        "new": dict(onset=0.15, offset=0.15, pad_onset=0.25, pad_offset=0.20, min_duration_off=0.25),
+    }
+
+    def test_no_chunk_is_shorter_than_the_split_floor(self):
+        chunk_size = 28
+        for name, cfg in self.SETTINGS.items():
+            floor = cfg["pad_onset"] + cfg["pad_offset"] + cfg["min_duration_off"]
+            # Sweep the padded region's length across the few frames either side of chunk_size,
+            # where the cut used to land in the tail.
+            first = chunk_size - cfg["pad_onset"] - cfg["pad_offset"]
+            for speech_s in np.arange(first - 0.1, first + 0.1, 0.001):
+                chunks = Pyannote.merge_chunks(self._curve(speech_s), chunk_size, **cfg)
+                for c in chunks:
+                    with self.subTest(settings=name, speech_s=round(float(speech_s), 3)):
+                        self.assertGreaterEqual(c["end"] - c["start"], floor - 1e-6)
+
+    def test_the_cut_moves_before_the_tail_rather_than_leaving_a_region_whole(self):
+        # The fix must still cut an over-long region; only where it cuts changes.
+        cfg = self.SETTINGS["new"]
+        out = Binarize(max_duration=28, min_split_duration=0.7, **cfg)(self._curve(27.56))
+        for start, end in regions(out):
+            self.assertLessEqual(end - start, 28 + 1e-6)
+            self.assertGreaterEqual(end - start, 0.7 - 1e-6)
+
+    def test_cover_chunks_leaves_no_short_last_piece(self):
+        # Contiguous chunking used to allow a short final piece; it now meets the same floor.
+        for duration in (28.2, 28.5, 56.1, 60.0):
+            chunks = Pyannote.cover_chunks(scores_from([(2.0, 8.0)], duration), 28, duration)
+            for c in chunks:
+                with self.subTest(duration=duration):
+                    self.assertGreaterEqual(c["end"] - c["start"], 14 - 1e-6)
+                    self.assertLessEqual(c["end"] - c["start"], 28 + 1e-6)
+
+
 class TestClamping(unittest.TestCase):
     def test_padding_never_produces_a_negative_start(self):
         # A negative start becomes a negative sample index when the caller slices the

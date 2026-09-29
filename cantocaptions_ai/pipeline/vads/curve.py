@@ -213,6 +213,16 @@ class Binarize:
         docstring for why that guarantee must not move) preserves the original
         ``max_duration / 2`` behaviour exactly.
 
+        The floor applies at **both** ends of the region: a cut is never closer than ``floor`` to
+        the region's end either. Without that, a region only just over ``max_duration`` puts
+        its trailing ``pad_offset`` inside the search window -- the frames after the speech has
+        stopped, which score lowest of all -- so the cut lands there and leaves a sliver of a few
+        milliseconds after it. ``Vad.merge_chunks`` emits the sliver as a chunk of its own when
+        the next region is too long to share one, and a chunk under 240 samples makes the
+        alignment feature extractor fail (``ValueError: negative dimensions are not allowed``,
+        reported on a batch of anime episodes). Since the region is longer than
+        ``max_duration`` and ``floor`` is at most half of it, the window is never empty.
+
         The split timestamp both ends one piece and starts the next, so no audio is dropped.
         """
         if self.max_duration == float("inf"):
@@ -224,7 +234,7 @@ class Binarize:
         for start, end in regions:
             while end - start > self.max_duration:
                 lo = bisect.bisect_left(timestamps, start + floor)
-                hi = bisect.bisect_right(timestamps, start + self.max_duration)
+                hi = bisect.bisect_right(timestamps, min(start + self.max_duration, end - floor))
                 if hi <= lo:
                     break
                 split_t = timestamps[lo + int(np.argmin(k_scores[lo:hi]))]
@@ -283,9 +293,9 @@ class CurveVad(Vad):
         lowest-scoring frame in the second half of each over-long window. Because a split
         timestamp both ends one piece and starts the next, the result tiles the file exactly.
 
-        Each piece is between ``chunk_size / 2`` and ``chunk_size`` seconds (the last one may
-        be shorter), and cuts land in the quietest frame available, so a chunk boundary
-        rarely falls mid-word.
+        Each piece is between ``chunk_size / 2`` and ``chunk_size`` seconds (only a file shorter
+        than that is one shorter piece), and cuts land in the quietest frame available, so a
+        chunk boundary rarely falls mid-word.
         """
         assert chunk_size > 0
         timestamps = frame_middles(segments)

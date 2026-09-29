@@ -12,7 +12,11 @@ import unittest
 import numpy as np
 import torch
 
-from cantocaptions_ai.pipeline.alignment import _compute_vad_emissions_batched
+from cantocaptions_ai.pipeline.alignment import (
+    MIN_ALIGN_SAMPLES,
+    _compute_vad_emissions,
+    _compute_vad_emissions_batched,
+)
 
 
 def _make_segments(lengths):
@@ -206,6 +210,61 @@ class TestAdapterFrameRateConversion(unittest.TestCase):
 
         for i, expected_len in enumerate(lengths):
             self.assertEqual(results[i][0].shape[0], expected_len)
+
+
+def _strict_bert_processor(wavs, **kwargs):
+    """_fake_bert_processor, but failing on short audio the way the real extractor does."""
+    for w in wavs:
+        if 1 + (len(w) - 400) // 160 < 0:
+            raise ValueError("negative dimensions are not allowed")
+    return _fake_bert_processor(wavs, **kwargs)
+
+
+class TestTooShortToAlign(unittest.TestCase):
+    """A VAD segment under one feature frame gets an empty emission instead of crashing the
+    whole run (the extractor raises below 240 samples)."""
+
+    def _run(self, lengths, primer=None):
+        segments = _make_segments(lengths)
+        return _compute_vad_emissions(
+            segments, _FakeModel(), "huggingface", _strict_bert_processor, "cpu",
+            batch_size=2, vram_checks=False, primer=primer,
+        )
+
+    def test_short_segments_get_empty_emissions_and_the_rest_are_untouched(self):
+        lengths = [1600, 230, 800, 0, 399, 400]
+        results = self._run(lengths)
+        self.assertEqual(len(results), len(lengths))
+        for length, (emission, rate) in zip(lengths, results):
+            if length < MIN_ALIGN_SAMPLES:
+                self.assertEqual(emission.shape[0], 0)
+                self.assertEqual(rate, 0.0)
+            else:
+                self.assertEqual(emission.shape[0], length)
+        # Same vocab width as the real emissions, so nothing downstream sees a ragged shape.
+        self.assertEqual(results[1][0].shape[1], results[0][0].shape[1])
+
+    def test_primed_run_skips_them_too(self):
+        # The report's case: the primed pass survived a 230-sample sliver and the unprimed
+        # length measurement did not.
+        from cantocaptions_ai.pipeline.align_profiles import TailPrimer
+
+        results = self._run([1600, 230], primer=TailPrimer(seconds=1.0))
+        self.assertEqual(results[1][0].shape[0], 0)
+        self.assertEqual(results[0][0].shape[0], 1600)
+
+    def test_all_short_returns_empties(self):
+        results = self._run([10, 0])
+        self.assertEqual([r[0].shape[0] for r in results], [0, 0])
+
+    def test_an_empty_emission_is_skipped_by_the_timeline(self):
+        from cantocaptions_ai.pipeline.alignment import EmissionTimeline
+
+        segments = _make_segments([1600, 230])
+        results = self._run([1600, 230])
+        timeline = EmissionTimeline.from_computed(segments, results)
+        emission, times = timeline.slice(segments[1]["start"], segments[1]["end"])
+        self.assertEqual(emission.shape[0], 0)
 
 
 if __name__ == "__main__":

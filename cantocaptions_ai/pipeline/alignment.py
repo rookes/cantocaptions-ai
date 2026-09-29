@@ -63,6 +63,10 @@ logger = get_logger(__name__)
 _ALIGN_MODEL_VRAM_ESTIMATE_MB = 1200
 _ALIGN_REMEDIATION = "pass --no_align to skip alignment, or free VRAM used by other processes/stages"
 
+# One 25 ms fbank frame at 16 kHz: the shortest audio the aligner's feature extractor turns
+# into anything. Below 400 samples it yields no frames, and below 240 it raises.
+MIN_ALIGN_SAMPLES = 400
+
 DEFAULT_ALIGN_MODELS_TORCH = {
     "en": "WAV2VEC2_ASR_BASE_960H",
     "fr": "VOXPOPULI_ASR_BASE_10K_FR",
@@ -666,9 +670,27 @@ def _compute_vad_emissions(
         return []
     start = time.perf_counter()
     logger.info("Computing alignment emissions for %d VAD segments...", len(vad_segments))
-    if model_type == "huggingface" and bert_processor is not None:
-        results = _compute_vad_emissions_batched(
-            vad_segments, model, bert_processor, device, batch_size,
+
+    # A segment too short for one feature frame gets an empty emission rather than a trip
+    # through the feature extractor, which fails outright below 240 samples. VAD should no
+    # longer produce one (Binarize._split_long), but a crash here costs a whole batch of
+    # files, and there is no speech in 25 ms to align anyway. Downstream already copes with
+    # an empty emission: EmissionTimeline skips it, so a line there is treated as unmatched.
+    usable = [i for i, seg in enumerate(vad_segments) if len(seg["audio"]) >= MIN_ALIGN_SAMPLES]
+    if len(usable) < len(vad_segments):
+        short = [seg for seg in vad_segments if len(seg["audio"]) < MIN_ALIGN_SAMPLES]
+        logger.warning(
+            "Skipping %d VAD segment(s) shorter than one alignment frame (%d samples): %s",
+            len(short), MIN_ALIGN_SAMPLES,
+            ", ".join(f"{s['start']:.3f}-{s['end']:.3f}s" for s in short[:5]),
+        )
+    segments = [vad_segments[i] for i in usable]
+
+    if not segments:
+        computed = []
+    elif model_type == "huggingface" and bert_processor is not None:
+        computed = _compute_vad_emissions_batched(
+            segments, model, bert_processor, device, batch_size,
             vram_checks=vram_checks, primer=primer,
         )
     else:
@@ -678,7 +700,12 @@ def _compute_vad_emissions(
                 "sequential path, which does not apply it. First-character timings may be "
                 "pinned to each segment's start."
             )
-        results = _compute_vad_emissions_sequential(vad_segments, model, model_type, bert_processor, device)
+        computed = _compute_vad_emissions_sequential(segments, model, model_type, bert_processor, device)
+
+    vocab = computed[0][0].shape[-1] if computed else 0
+    results: List[Tuple[torch.Tensor, float]] = [(torch.zeros((0, vocab)), 0.0)] * len(vad_segments)
+    for i, result in zip(usable, computed):
+        results[i] = result
     logger.info("Alignment emissions computed in %.1fs", time.perf_counter() - start)
     return results
 
