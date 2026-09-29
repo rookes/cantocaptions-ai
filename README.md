@@ -245,6 +245,15 @@ uv sync --extra transformers_qwen --group dev
 uv run pytest
 ```
 
+`tests/test_pipeline_e2e.py` runs the whole pipeline with fake models (`tests/_pipeline_fakes.py`:
+synthetic audio that encodes its own transcript, so alignment is exact) and compares the result to
+`tests/golden/`. After a deliberate output change, regenerate the goldens with
+`UPDATE_GOLDEN=1 uv run pytest tests/test_pipeline_e2e.py` and review the diff.
+
+For a check on real models and real audio, `scripts/build_eval_episodes.py` stitches
+cantocaptions-dataset test-split clips into episodes with an exact reference SRT, and
+`scripts/score_subtitles.py` scores runs against it (CER, cue coverage, start error) or diffs two runs.
+
 ### Architecture
 
 The pipeline (`cantocaptions_ai/pipeline/transcribe.py`, `_execute_pipeline`) runs a fixed sequence of
