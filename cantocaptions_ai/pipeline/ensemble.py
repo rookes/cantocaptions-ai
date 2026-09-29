@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
 from cantocaptions_ai.utils.model_utils import PipelineStage
@@ -9,14 +9,22 @@ from cantocaptions_ai.utils.log_utils import get_logger
 logger = get_logger(__name__)
 
 
+# The second-opinion model per language: (hub repo, CTranslate2 subfolder in it).
+# validate_config refuses ensemble_model for a language with no entry.
+ENSEMBLE_MODELS: Dict[str, Tuple[str, str]] = {
+    "yue": ("alvanlii/whisper-small-cantonese", "cts"),
+}
+
+
 class FasterWhisperEnsemble(PipelineStage["List[VadAudioSegment]", "List[str]"]):
     """Second ASR model (faster-whisper) for ensemble transcription."""
 
     debug_stage = "ensemble"
 
-    def __init__(self, model, device: str) -> None:
+    def __init__(self, model, device: str, language: str = "yue") -> None:
         self._model = model
         self._device = device
+        self._language = language
 
     @staticmethod
     def read_debug(audio_path, debug_dir): return load_ensemble_debug(audio_path, debug_dir)
@@ -47,7 +55,7 @@ class FasterWhisperEnsemble(PipelineStage["List[VadAudioSegment]", "List[str]"])
             try:
                 segments_iter, _ = self._model.transcribe(
                     seg['audio'],
-                    language="yue",
+                    language=self._language,
                     beam_size=5,
                     vad_filter=False,
                 )
@@ -61,20 +69,26 @@ class FasterWhisperEnsemble(PipelineStage["List[VadAudioSegment]", "List[str]"])
 
 
 def load_faster_whisper(
-    model_id: str = "alvanlii/whisper-small-cantonese",
-    model_subfolder: str = "cts",
+    model_id: Optional[str] = None,
+    model_subfolder: Optional[str] = None,
     device: str = "cuda",
     device_index: int = 0,
     model_dir: Optional[str] = None,
     local_files_only: bool = False,
+    language: str = "yue",
 ) -> FasterWhisperEnsemble:
     """Load faster-whisper (CTranslate2) model and return a FasterWhisperEnsemble.
+
+    ``model_id``/``model_subfolder`` default to the language's entry in ENSEMBLE_MODELS.
 
     The CTranslate2 model files are expected in the `model_subfolder` of the HuggingFace repo
     (default: 'cts' subfolder of alvanlii/whisper-small-cantonese).
 
     Raises ImportError if faster-whisper is not installed.
     """
+    default_id, default_subfolder = ENSEMBLE_MODELS.get(language, ENSEMBLE_MODELS["yue"])
+    model_id = model_id or default_id
+    model_subfolder = model_subfolder or default_subfolder
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -114,4 +128,4 @@ def load_faster_whisper(
         device_index=device_index,
         compute_type=compute_type,
     )
-    return FasterWhisperEnsemble(model=model, device=device)
+    return FasterWhisperEnsemble(model=model, device=device, language=language)

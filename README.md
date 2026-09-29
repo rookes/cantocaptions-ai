@@ -64,8 +64,14 @@ holding only the keys you want to change). Settings are layered, each overriding
 4. the `--vocal_isolation` / `--asr` / `--align` presets
 5. flags you type
 
-`language` defaults to `yue`. Other languages are accepted but not yet supported end to end: every
-stage after transcription (alignment, text cleaning, line breaking) currently assumes written Cantonese.
+`language` defaults to `yue`, the one language supported end to end. Another language runs as a raw
+pipeline -- transcribed, aligned, split into cues and laid out with that language's conventions (spaces
+between words, Latin punctuation, word-wrapped lines), but not cleaned -- and needs you to supply what is
+Cantonese-specific: a `--model` that transcribes it, an `--align_model` if there is no built-in default for
+it (most languages have one), and `--no_clean_text`. The error message names whatever is missing.
+
+For video files, the audio track is chosen from the stream tags by language (for `yue`: a Cantonese
+track, then any Chinese one). Pass `--audio_track N` when a release's tags are missing or wrong.
 
 Run `uv run cantocaptions_ai --help` to display the complete flag list.
 
@@ -265,12 +271,19 @@ Behaviour that depends on a particular model is looked up rather than hard-coded
 
 * `pipeline/model_profiles.py` — per ASR model: text normalization, punctuation, particle spot-checks,
   cue-assembly markers and which cleaning manifest to use.
-* `pipeline/align_profiles.py` — per alignment model: audio primer, hand-picked character substitutions,
-  internal-gap splitting. The model's own processor comes with it from `load_align_model`.
+* `pipeline/align_profiles.py` — per alignment model: audio primer, hand-picked character substitutions
+  and the default substitution level (Jyutping homophones only for the Cantonese model), internal-gap
+  splitting, minimum input length. The model's own processor and emission frame rate come with it from
+  `load_align_model`.
 
-Cantonese-specific text handling lives in `cantocaptions_ai/cantonese/` (cleaning rules, numerals, line
-breaking, particles). Some Cantonese and CJK assumptions still sit outside it — sentence splitting,
-character-count line widths, Jyutping-based vocabulary repair, audio-track selection — and are being moved
-behind the profiles.
+How a language is *written* is described by the value types in `cantocaptions_ai/text_profiles.py`:
+`PunctuationConfig`, and `ScriptConfig` (what joins two pieces of text, the default line width, which line
+breaker). A model profile may pin them; `ModelProfile.for_language` fills in whatever it leaves unset from
+the run's language, and cue assembly, alignment, realign and line layout all take them as arguments.
+
+Cantonese-specific text handling lives in `cantocaptions_ai/cantonese/` (cleaning rules and builtin
+steps, numerals, the CJK line breaker, particles). What remains tied to one language is registered per
+language and checked by `validate_config`: `model_profiles.FULLY_SUPPORTED_LANGUAGES`, the LLM correction
+prompts (`llm_correction.CORRECTION_PROMPTS`) and the ensemble model (`ensemble.ENSEMBLE_MODELS`).
 
 Thank you to everyone from the CantoCaptions community and Discord for their support and testing on this project.

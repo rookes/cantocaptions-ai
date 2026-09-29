@@ -20,6 +20,31 @@ from cantocaptions_ai.cantonese.text import (
     standardize_chars_hk,
 )
 from cantocaptions_ai.pipeline.model_profiles import MODEL_PROFILES, get_model_profile
+from cantocaptions_ai.text_profiles import (
+    CJK_PUNCTUATION,
+    CJK_SCRIPT,
+    LATIN_PUNCTUATION,
+)
+
+
+class TestForLanguage(unittest.TestCase):
+    """Language-dependent fields a profile leaves unset come from the run's language."""
+
+    def test_cantonese_keeps_the_cjk_conventions(self):
+        profile = get_model_profile("cantocaptions-cantonese-ASR").for_language("yue")
+        self.assertEqual(profile.punctuation, CJK_PUNCTUATION)
+        self.assertEqual(profile.script, CJK_SCRIPT)
+
+    def test_a_space_separated_language_gets_latin_conventions(self):
+        profile = get_model_profile("some/english-model").for_language("en")
+        self.assertEqual(profile.punctuation, LATIN_PUNCTUATION)
+        self.assertEqual(profile.script.word_separator, " ")
+        self.assertEqual(profile.script.layout, "word")
+
+    def test_fields_the_profile_sets_win(self):
+        import dataclasses
+        custom = dataclasses.replace(get_model_profile("x"), punctuation=LATIN_PUNCTUATION)
+        self.assertEqual(custom.for_language("yue").punctuation, LATIN_PUNCTUATION)
 
 
 class TestGetModelProfile(unittest.TestCase):
@@ -31,8 +56,8 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertFalse(profile.normalization.chars_hk)
         # No alignment spot checks.
         self.assertEqual(dict(profile.spotchecks), {})
-        # Standard punctuation.
-        self.assertEqual(profile.punctuation, PunctuationConfig())
+        # Punctuation is left to the language (see TestForLanguage).
+        self.assertIsNone(profile.punctuation)
         # No discourse markers get a widened rescue window.
         self.assertEqual(profile.segmentation, SegmentationConfig())
 
@@ -66,7 +91,7 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertIsNone(profile.normalization.opencc_config)
         self.assertFalse(profile.normalization.chars_hk)
         self.assertEqual(dict(profile.spotchecks), {})
-        self.assertEqual(profile.punctuation, PunctuationConfig())
+        self.assertEqual(profile.for_language("yue").punctuation, PunctuationConfig())
         # Cue assembly matches Qwen's: the fine-tune clauses off 嗱/喂 the same way.
         self.assertEqual(
             profile.segmentation, get_model_profile("Qwen3-ASR").segmentation,

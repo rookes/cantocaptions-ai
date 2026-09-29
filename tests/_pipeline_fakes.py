@@ -34,7 +34,8 @@ FRAME_S = FRAME / SR
 CHAR_FRAMES = 4              # frames per character: one peak, then blank
 PAUSE_FRAMES = 5             # blank frames a punctuation mark stands for
 BLANK = "<pad>"
-PUNCTUATION = set("，。？！；…")
+PUNCTUATION = set("，。？！；…,.?!;")
+WORD_DELIMITER = "|"  # what a space is spoken as, like a real wav2vec2 CTC vocabulary
 
 # Three utterances of plain written Cantonese the default cleaning manifest leaves alone
 # (no numerals, no clause-comma triggers, no interjection-only lines).
@@ -65,8 +66,8 @@ class ScriptedAudio:
     char_times: List[List[Tuple[str, float, float]]] = field(init=False)  # per utterance
 
     def __post_init__(self):
-        chars = sorted({c for _, text in self.script for c in text if c not in PUNCTUATION}
-                       | set(self.extra_vocab))
+        chars = sorted({self._token_char(c) for _, text in self.script for c in text
+                        if c not in PUNCTUATION} | set(self.extra_vocab))
         self.dictionary = {BLANK: 0, **{c: i + 1 for i, c in enumerate(chars)}}
         audio = np.zeros(int(self.duration * SR), dtype=np.float32)
         self.char_times = []
@@ -78,13 +79,18 @@ class ScriptedAudio:
                 if c in PUNCTUATION:
                     ids = [0] * PAUSE_FRAMES
                 else:
-                    ids = [self.dictionary[c]] + [0] * (CHAR_FRAMES - 1)
-                    times.append((c, frame * FRAME_S, (frame + 1) * FRAME_S))
+                    ids = [self.dictionary[self._token_char(c)]] + [0] * (CHAR_FRAMES - 1)
+                    if c != " ":
+                        times.append((c, frame * FRAME_S, (frame + 1) * FRAME_S))
                 for token in ids:
                     audio[frame * FRAME:(frame + 1) * FRAME] = _level(token)
                     frame += 1
             self.char_times.append(times)
         self.samples = audio
+
+    @staticmethod
+    def _token_char(c: str) -> str:
+        return WORD_DELIMITER if c == " " else c.lower()
 
     def utterance_span(self, i: int) -> Tuple[float, float]:
         return self.char_times[i][0][1], self.char_times[i][-1][2]
@@ -204,6 +210,7 @@ def fake_align_model(scripted: ScriptedAudio, language: str = "yue"):
         "dictionary": dictionary,
         "type": "huggingface",
         "processor": fake_processor,
+        "frame_rate": 1.0 / FRAME_S,
         "vocab_repair": VocabRepair(dictionary, LEVEL_OFF),
         "profile": DEFAULT_ALIGN_PROFILE,
     }

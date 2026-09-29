@@ -109,11 +109,13 @@ class PipelineConfig:
     align_batch_size: int = 2
     align_compute_type: str = "float16"
     # Substitute an in-vocabulary character for one the align model has no token for, so the
-    # trellis can see it at all. "homophone" (same Jyutping reading) is the default because a
-    # dropped character contributes no evidence whatsoever; "near" also accepts the same
-    # syllable on another tone, "variant" folds Simplified forms only, "off" disables it.
-    # See pipeline/align_vocab.py.
-    align_char_substitution: str = "homophone"
+    # trellis can see it at all. "homophone" (same Jyutping reading) because a dropped
+    # character contributes no evidence whatsoever; "near" also accepts the same syllable on
+    # another tone, "variant" folds Simplified forms only, "off" disables it. None (the
+    # default) takes the align model's profile: homophone for the Cantonese model, off for
+    # any other, since the homophone tiers read Cantonese pronunciations.
+    # See pipeline/align_vocab.py and align_profiles.AlignProfile.char_substitution.
+    align_char_substitution: Optional[str] = None
     # TOML file of hand-curated substitutions that beat every automatic tier.
     align_substitutions: Optional[str] = None
     # Break a cue in two wherever alignment left a silence of at least this many seconds
@@ -213,6 +215,10 @@ class PipelineConfig:
     # channel alone, which on a film soundtrack is largely the dialogue stem; it falls
     # back to a full downmix for any layout without one. See utils/audio.py.
     audio_downmix: str = "mix"
+
+    # 0-based audio stream to transcribe. None picks one from the stream tags by language
+    # (utils/audio.select_track); set it when a release's tags are missing or wrong.
+    audio_track: Optional[int] = None
 
     # Bring each file's speech to a fixed level with one linear gain before any
     # stage sees it. On by default because the TRAINING corpus is cut this way:

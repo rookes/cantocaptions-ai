@@ -30,7 +30,7 @@ _STAGE_FIELDS: Dict[str, Tuple[str, ...]] = {
     "vad": (
         "vad_method", "vad_onset", "vad_offset", "vad_pad_onset", "vad_pad_offset",
         "vad_min_duration_off", "chunk_size", "audio_start", "audio_end", "audio_downmix",
-        "audio_normalize",
+        "audio_normalize", "audio_track",
     ),
     "vocal_isolation": (
         "vocal_isolation_method", "vocal_isolation_segment_mode", "vocal_isolation_compute_type",
@@ -179,8 +179,11 @@ def checkpoint_is_current(
         return False
     _warned_stale.add(stale_key)
     before = recorded.get("settings") or {}
-    changed = sorted(k for k in set(before) | set(settings) if before.get(k) != settings.get(k))
-    detail = ", ".join(f"{k}: {before.get(k)!r} -> {settings.get(k)!r}" for k in changed[:6])
+    missing = "<not recorded>"
+    changed = sorted(k for k in set(before) | set(settings)
+                     if before.get(k, missing) != settings.get(k, missing))
+    detail = ", ".join(f"{k}: {before.get(k, missing)!r} -> {settings.get(k, missing)!r}"
+                       for k in changed[:6])
     if len(changed) > 6:
         detail += f", and {len(changed) - 6} more"
     logger.warning(

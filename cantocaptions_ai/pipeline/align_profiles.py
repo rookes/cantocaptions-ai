@@ -98,6 +98,13 @@ class AlignProfile:
     # measured number should not inherit another's. align_checks.SPLIT_INTERNAL_GAP is the
     # suggested starting point; --align_split_gap overrides whatever is set here.
     split_gap: Optional[float] = None
+    # The shortest segment (in 16 kHz samples) the model's front end turns into a frame.
+    # Shorter ones are skipped rather than crashing the extractor; see alignment.
+    min_samples: int = 400
+    # The --align_char_substitution level used when the config leaves it unset. Homophone
+    # substitution reads Cantonese (Jyutping) pronunciations, so it is only right for a
+    # Cantonese model's vocabulary; everything else defaults to no substitution.
+    char_substitution: str = "off"
 
 
 DEFAULT_ALIGN_PROFILE = AlignProfile()
@@ -106,6 +113,7 @@ ALIGN_PROFILES: Dict[str, AlignProfile] = {
     "alvanlii/wav2vec2-BERT-cantonese": AlignProfile(
         primer=TailPrimer(),
         substitutions="wav2vec2-bert-cantonese.toml",
+        char_substitution="homophone",
     ),
 }
 

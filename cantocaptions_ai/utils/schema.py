@@ -232,8 +232,16 @@ def add_note(segment: SingleAlignedSegment, note: str) -> None:
         notes.append(note)
 
 
-def merge_segments(seg1: SingleAlignedSegment, seg2: SingleAlignedSegment) -> SingleAlignedSegment:
+def merge_segments(
+    seg1: SingleAlignedSegment,
+    seg2: SingleAlignedSegment,
+    join: Optional[Callable[[str, str], str]] = None,
+) -> SingleAlignedSegment:
     """Merge two adjacent aligned segments into one.
+
+    ``join`` combines the two texts -- ``ScriptConfig.join`` from the language's script, so a
+    space-separated language gets a space between them. The default concatenates, as CJK text
+    wants.
 
     Starts from a copy of ``seg1`` so keys attached by later stages (and anything else a
     caller carries) survive the merge; only the fields that a merge actually redefines are
@@ -251,7 +259,7 @@ def merge_segments(seg1: SingleAlignedSegment, seg2: SingleAlignedSegment) -> Si
     merged.update({
         "start": seg1["start"],
         "end": seg2["end"],
-        "text": seg1["text"] + seg2["text"],
+        "text": join(seg1["text"], seg2["text"]) if join else seg1["text"] + seg2["text"],
         "avg_logprob": None,
         "words": seg1["words"] + seg2["words"],
         "chars": s3_chars or None,

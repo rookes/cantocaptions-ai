@@ -15,23 +15,28 @@ Every field defaults to a no-op, so:
     alignment code.
 
 This replaces the former ``_MODEL_IDS`` dict in ``_asr_native.py``. The value objects
-themselves (``TextNormalization``, ``PunctuationConfig``, ``SpotCheck``,
-``CleaningConfig``) live in
-``cantonese/text.py`` so that module stays free of any ``pipeline`` import.
+themselves (``TextNormalization``, ``PunctuationConfig``, ``ScriptConfig``, ``SpotCheck``,
+``CleaningConfig``) live in ``text_profiles.py``, which imports nothing from ``pipeline``.
+
+``punctuation`` and ``script`` are about the *language* as much as the model, so a profile
+may leave them unset and ``ModelProfile.for_language`` fills them in from the run's
+language: CJK conventions for yue/zh/ja, space-separated ones otherwise.
 """
 import os
-from dataclasses import dataclass, field
-from typing import Dict, Mapping
+from dataclasses import dataclass, field, replace
+from typing import Dict, Mapping, Optional
 
-from cantocaptions_ai.cantonese.text import (
+from cantocaptions_ai.text_profiles import (
     DEFAULT_CLEANING,
-    DEFAULT_PUNCTUATION,
     DEFAULT_SEGMENTATION,
     CleaningConfig,
     PunctuationConfig,
+    ScriptConfig,
     SegmentationConfig,
     SpotCheck,
     TextNormalization,
+    punctuation_for_script,
+    script_for_language,
 )
 
 
@@ -44,10 +49,25 @@ class ModelProfile:
     """
     hf_id: str
     normalization: TextNormalization = TextNormalization()
-    punctuation: PunctuationConfig = DEFAULT_PUNCTUATION
+    # None -> the language's default (see for_language).
+    punctuation: Optional[PunctuationConfig] = None
     spotchecks: Mapping[str, SpotCheck] = field(default_factory=dict)
     segmentation: SegmentationConfig = DEFAULT_SEGMENTATION
     cleaning: CleaningConfig = DEFAULT_CLEANING
+    script: Optional[ScriptConfig] = None
+
+    def for_language(self, language: Optional[str]) -> "ModelProfile":
+        """This profile with its language-dependent fields resolved for *language*.
+
+        Fields the profile sets itself win; unset ones take the language's defaults, so a
+        Cantonese fine-tune keeps CJK conventions and an unregistered model run on English
+        gets space-separated ones.
+        """
+        script = self.script or script_for_language(language)
+        return replace(
+            self, script=script,
+            punctuation=self.punctuation or punctuation_for_script(script),
+        )
 
 
 # Vanilla Qwen3-ASR outputs Simplified characters and generic particles, so it needs the
@@ -94,6 +114,15 @@ _LEADING_MARKER_SEGMENTATION = SegmentationConfig(leading_markers=(
 # checkpoint.
 def _finetuned_profile(hf_id: str) -> ModelProfile:
     return ModelProfile(hf_id=hf_id, segmentation=_LEADING_MARKER_SEGMENTATION)
+
+
+# Languages the pipeline supports end to end: a default ASR model, cleaning rules, a line
+# breaker and cue conventions written for them. Any other language runs only as a raw
+# pipeline, with a model the user names and text cleaning off (see validate_config).
+FULLY_SUPPORTED_LANGUAGES = frozenset({"yue"})
+
+# Profiles tuned for Cantonese output: running one on another language produces nonsense.
+CANTONESE_MODELS = frozenset({"cantocaptions-cantonese-ASR", "Qwen3-ASR-lora"})
 
 
 # Env var pointing at a *local* merged-weights directory. Kept out of the source tree so no
