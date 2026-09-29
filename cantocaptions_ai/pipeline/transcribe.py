@@ -1270,6 +1270,10 @@ def _execute_pipeline(
                 ) as model:
                     stage.mark_inference_start()
                     items = model.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
+                    # Drop this frame's reference so model_scope's exit frees the model; a
+                    # name bound by `as` outlives the block and held the ASR model on the
+                    # GPU through alignment and diarization.
+                    del model
         else:
             from cantocaptions_ai.pipeline.asr import QwenPipeline
             items = QwenPipeline.load_cache(items, cfg.load_debug_dir)
@@ -1288,6 +1292,7 @@ def _execute_pipeline(
                     ) as ensemble:
                         stage.mark_inference_start()
                         items = ensemble.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
+                        del ensemble  # see the ASR stage
             else:
                 from cantocaptions_ai.pipeline.ensemble import FasterWhisperEnsemble
                 items = FasterWhisperEnsemble.load_cache(items, cfg.load_debug_dir)
@@ -1325,6 +1330,7 @@ def _execute_pipeline(
                     ) as corrector:
                         stage.mark_inference_start()
                         items = corrector.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
+                        del corrector  # see the ASR stage
             else:
                 from cantocaptions_ai.pipeline.llm_correction import LLMCorrector
                 items = LLMCorrector.load_cache(items, cfg.load_debug_dir)
