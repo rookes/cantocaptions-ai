@@ -23,11 +23,17 @@ recommendation and an incremental path.
 > Still open (deferred): fully collapsing the `vram_checks`/`vram_headroom_mb`
 > parameter threading (config→`__main__`→`load_*`) into an injected `MemoryPolicy`
 > everywhere; a `BatchExecutor` output-sink to make the off-GPU boundary a single
-> owned step; and the `log_vram_delta` per-batch instrumentation helper. The
-> +3.5 GB higher peak in the full program vs. the bench points at cross-stage
-> allocator residue — `BatchExecutor.flush_every` is the available knob (default
-> off to preserve the throughput win), but the real fix is stage-handoff hygiene
-> (`model_scope`), not per-batch flushing.
+> owned step; and the `log_vram_delta` per-batch instrumentation helper.
+>
+> **Resolved:** the "+3.5 GB higher peak in the full program vs. the bench" was
+> not allocator residue but the ASR model itself, still resident. `with
+> model_scope(...) as model:` bound a name in `_execute_pipeline` that outlived
+> the block, so `model_scope`'s cleanup never freed it and it sat on the GPU
+> through alignment and diarization. Each stage now `del`s its model inside the
+> block; alignment's peak on a 60 s clip fell from 6.6 GB to 2.6 GB with
+> identical output. Side effect: with that VRAM free, pyannote at
+> `diarize_batch_size` 8 falls off its workspace cliff (9.4 GB, ~6x slower);
+> the shipped default of 4 does not (0.3 GB).
 
 Related: `scripts/bench_asr_native.py` (the diagnostic harness),
 `tests/test_batch_executor.py`, `tests/test_asr_batching.py`, and the shared

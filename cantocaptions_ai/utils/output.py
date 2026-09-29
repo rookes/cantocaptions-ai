@@ -340,6 +340,17 @@ class WriteSRT(SubtitlesWriter):
             print(f"{i}\n{start} --> {end}\n{text}\n", file=file, flush=True)
 
 
+def _single_line(text: str) -> str:
+    """A cue's text as one row: tabs to spaces, line breaks removed.
+
+    TSV and Audacity labels are one row per cue, so the break the line-layout step put into
+    a two-line cue would otherwise split the row in two. The break is layout only -- the
+    current (CJK) line breaker inserts it without removing anything -- so dropping it
+    restores the text. A script that breaks on spaces will need a space here instead.
+    """
+    return "".join(text.strip().replace("\t", " ").splitlines())
+
+
 class WriteTSV(ResultWriter):
     extension: str = "tsv"
 
@@ -348,7 +359,7 @@ class WriteTSV(ResultWriter):
         for segment in result["segments"]:
             print(round(1000 * segment["start"]), file=file, end="\t")
             print(round(1000 * segment["end"]), file=file, end="\t")
-            print(segment["text"].strip().replace("\t", " "), file=file, flush=True)
+            print(_single_line(segment["text"]), file=file, flush=True)
 
 class WriteAudacity(ResultWriter):
     extension: str = "aud"
@@ -358,7 +369,7 @@ class WriteAudacity(ResultWriter):
         for segment in result["segments"]:
             print(segment["start"], file=file, end=ARROW)
             print(segment["end"], file=file, end=ARROW)
-            text = segment["text"].strip().replace("	", " ")
+            text = _single_line(segment["text"])
             print(_with_speaker(segment, text, options, fmt="[[{speaker}]]{text}"), file=file, flush=True)
 
 

@@ -25,7 +25,7 @@ from cantocaptions_ai.pipeline.align_profiles import (
     get_align_profile,
 )
 from cantocaptions_ai.pipeline.alignment import _compute_vad_emissions_batched
-from tests.test_alignment_batching import _FakeModel, _make_segments
+from test_alignment_batching import _FakeModel, _make_segments
 
 SR = 16000
 

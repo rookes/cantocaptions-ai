@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The suite runs on CPU with fakes in place of every model; a test that reaches for the
+      # hub should fail (or skip) here, not quietly download gigabytes.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # The lock pins torch to the CUDA 12.8 wheels on Linux (they run fine on CPU), and those
+      # pull several GB of nvidia libraries -- more than the runner's default free space.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra transformers_qwen --group dev
+
+      - name: Run tests
+        run: uv run --frozen pytest --cov=cantocaptions_ai --cov-report=term --cov-fail-under=75

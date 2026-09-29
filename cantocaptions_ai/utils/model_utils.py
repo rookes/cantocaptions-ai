@@ -300,6 +300,10 @@ def model_scope(load_fn: Callable[..., _ModelT], *args, **kwargs) -> Generator[_
 
     The load goes through load_with_offline_fallback so a cached model still loads
     when the machine is offline (the hub revision check is retried against the cache).
+
+    Only this generator's own reference is dropped on exit. ``with model_scope(...) as m:``
+    binds a second one that outlives the block, so the caller must ``del m`` inside the
+    block for the memory to actually be freed here.
     """
     model = load_with_offline_fallback(load_fn, *args, **kwargs)
     try:
