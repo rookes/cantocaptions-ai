@@ -239,5 +239,17 @@ class TestLoadModelNativeWithSuppliedParts(unittest.TestCase):
         self.assertIs(pipe.processor, processor)
 
 
+
+class TestNormalizeLanguage(unittest.TestCase):
+    def test_code_maps_to_qwen_name(self):
+        from cantocaptions_ai.pipeline.asr import _normalize_language
+        self.assertEqual(_normalize_language("yue"), "Cantonese")
+
+    def test_missing_language_is_an_error_not_cantonese(self):
+        from cantocaptions_ai.pipeline.asr import _normalize_language
+        with self.assertRaises(ValueError):
+            _normalize_language(None)
+
+
 if __name__ == "__main__":
     unittest.main()

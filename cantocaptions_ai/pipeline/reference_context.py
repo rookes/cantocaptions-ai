@@ -43,7 +43,7 @@ logger = get_logger(__name__)
 # timeline, but no segment carries a context, so ``_infer_batch`` takes the ordinary
 # ``apply_transcription_request`` path and the decode is byte-identical to a run with no
 # reference at all. It exists to answer "is the measured gain the prompt, or just the
-# extra speech VAD expansion recovered?" -- see "Measured results" in CLAUDE.md.
+# extra speech VAD expansion recovered?" (measure it with scripts/eval_asr_context.py).
 CONTEXT_TEMPLATES: Dict[str, str] = {
     "none": "",
     "bare": "{text}",

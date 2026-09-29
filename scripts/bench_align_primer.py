@@ -44,7 +44,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from cantocaptions_ai.pipeline.align_checks import find_silent_starts
 from cantocaptions_ai.pipeline.align_profiles import AlignProfile, TailPrimer
-from cantocaptions_ai.pipeline.alignment import align, load_align_model, load_bert_processor
+from cantocaptions_ai.pipeline.alignment import align, load_align_model
 from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 
 
@@ -88,7 +88,6 @@ def main():
     args = parser.parse_args()
 
     align_model, metadata = load_align_model(args.language, args.device)
-    bert_processor = load_bert_processor()
     asr_profile = get_model_profile(args.asr_model)
     primer = TailPrimer(seconds=args.primer_seconds, reverse=not args.no_reverse)
 
@@ -99,7 +98,6 @@ def main():
             metadata = {**metadata, "profile": AlignProfile(primer=configured)}
             aligned = align(
                 transcript, align_model, metadata, vad_segments, args.device,
-                bert_processor=bert_processor,
                 spotchecks=asr_profile.spotchecks, punctuation=asr_profile.punctuation,
             )["segments"]
             runs[label] = (_first_cue_deltas(vad_segments, aligned),

@@ -109,8 +109,8 @@ class TestRuleLoader(unittest.TestCase):
         """A converted value >= 10,000 keeps its half-width commas.
 
         punctuation.toml rewrites ',' -> '，', so it has to run *before* chinese_numbers
-        and nothing after may touch a half-width comma. CLAUDE.md records this as an
-        ordering constraint for a custom --clean_rules_dir; it applies to both manifests.
+        and nothing after may touch a half-width comma. The header of rules/pipeline.toml
+        documents this ordering constraint, which a custom --clean_rules_dir must keep too.
         """
         default = SubtitleCleaner(line_max_length=21, max_line_count=2)
         qwen = SubtitleCleaner(
@@ -613,6 +613,34 @@ class TestMergeAndWrite(unittest.TestCase):
         }]
         _merge_and_write(items, fake_writer, "yue", 0.12, 0.04, {})
         self.assertEqual(written["segments"][0]["text"], "吓？？")
+
+    def test_layout_breaks_lines_without_a_cleaner(self):
+        # --no_clean_text turns off rewriting, not the user's line limits: line breaking
+        # used to live only inside the cleaner, so it silently stopped with it.
+        from cantocaptions_ai.cantonese.cleaner import linebreak_step
+        from cantocaptions_ai.pipeline.transcribe import _merge_and_write
+
+        written = {}
+
+        def fake_writer(result, audio_path, options):
+            written["segments"] = result["segments"]
+
+        text = "我哋今日去咗好多地方，之後仲食咗好多嘢添"
+        items = [{
+            "audio_path": "episode.wav",
+            "result": {
+                "language": "yue",
+                "segments": [{"start": 0.0, "end": 4.0, "text": text, "words": []}],
+            },
+        }]
+        _merge_and_write(items, fake_writer, "yue", 0.12, 0.04, {},
+                         layout=linebreak_step(12, 2))
+        self.assertEqual(written["segments"][0]["text"].replace("\n", ""), text)
+        self.assertIn("\n", written["segments"][0]["text"])
+
+    def test_single_line_limit_has_no_linebreak_step(self):
+        from cantocaptions_ai.cantonese.cleaner import linebreak_step
+        self.assertIsNone(linebreak_step(12, 1))
 
 
 if __name__ == "__main__":

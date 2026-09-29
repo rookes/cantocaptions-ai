@@ -12,9 +12,9 @@ import unittest
 
 from cantocaptions_ai.errors import ConfigError, InputError
 from cantocaptions_ai.pipeline.config import PipelineConfig
-from cantocaptions_ai.pipeline.transcribe import validate_config, _offset_result_times
+from cantocaptions_ai.pipeline.transcribe import validate_config, _extract_timestamps, _offset_result_times
 from cantocaptions_ai.utils.audio import _clip_ffmpeg_args, validate_input_file
-from cantocaptions_ai.utils.output import render_result
+from cantocaptions_ai.utils.output import render_result, writer_args
 
 
 class TestValidateConfig(unittest.TestCase):
@@ -37,6 +37,17 @@ class TestValidateConfig(unittest.TestCase):
         cfg = PipelineConfig(language="YUE")
         validate_config(cfg)
         self.assertEqual(cfg.language, "yue")
+
+    def test_missing_language_raises(self):
+        # There is no auto-detection; None used to fall through to Cantonese silently.
+        with self.assertRaises(ConfigError):
+            validate_config(PipelineConfig(language=None))
+
+    def test_ensemble_requires_llm_correction(self):
+        # LLM correction is the ensemble's only consumer.
+        with self.assertRaises(ConfigError):
+            validate_config(PipelineConfig(ensemble_model="whisper"))
+        validate_config(PipelineConfig(ensemble_model="whisper", llm_correction=True))
 
     def test_valid_config_passes(self):
         validate_config(PipelineConfig())  # defaults must be valid
@@ -156,6 +167,34 @@ class TestRenderResult(unittest.TestCase):
     def test_all_is_rejected(self):
         with self.assertRaises(ValueError):
             render_result(self.RESULT, "all", {})
+
+    def test_speaker_labels_reach_the_in_memory_render(self):
+        # The service renders through writer_args(cfg); it used to omit speaker_labels,
+        # so the same config labelled speakers in the CLI's files but not over the API.
+        result = {
+            "segments": [{"start": 0.0, "end": 1.5, "text": "你好", "speaker": "SPEAKER_00"}],
+            "language": "yue",
+        }
+        options = writer_args(PipelineConfig(speaker_labels=True, diarize=True))
+        self.assertIn("[SPEAKER_00]: 你好", render_result(result, "srt", options))
+
+
+class TestExtractTimestamps(unittest.TestCase):
+    """--no_align timings: neither Qwen backend emits per-character time_stamps."""
+
+    def test_falls_back_to_the_segments_own_span(self):
+        # This used to raise KeyError('time_stamps') on every --no_align run.
+        items = [{"audio_path": "a.wav", "result": {"segments": [
+            {"start": 1.0, "end": 3.5, "text": "你好"}]}}]
+        seg = _extract_timestamps(items)[0]["result"]["segments"][0]
+        self.assertEqual((seg["start"], seg["end"], seg["words"]), (1.0, 3.5, []))
+
+    def test_uses_character_timestamps_when_present(self):
+        items = [{"audio_path": "a.wav", "result": {"segments": [
+            {"start": 1.0, "end": 3.5, "text": "你好", "time_stamps": [
+                {"text": "你", "start": 1.2, "end": 1.5}, {"text": "好", "start": 1.5, "end": 2.0}]}]}}]
+        seg = _extract_timestamps(items)[0]["result"]["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (1.2, 2.0))
 
 
 class TestOffsetTimes(unittest.TestCase):

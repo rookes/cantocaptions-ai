@@ -50,12 +50,22 @@ This will write `<your-file-name>.srt` into the `output/`. The first run also do
 weights (~6 GB), so it will take significantly longer than the ones after it.
 
 Any file ffmpeg can read works: `.mkv`, `.mp4`, `.wav`, `.m4a` and so on. Add `--input_dir DIR` to
-process a whole folder.
+process a whole folder (and `--recursive` to include its subfolders). Output mirrors the input
+tree, so `DIR/s1/ep01.mkv` and `DIR/s2/ep01.mkv` become `output/s1/ep01.srt` and `output/s2/ep01.srt`.
 
-You can configure more extensively using command-line flags (see below), but, more conveniently, you can also 
-**set your own defaults in `config/default.cfg`**. Any command line flags you add will override these defaults 
-at runtime. Use the flag `--cfg NAME` to swap in a different file from `config/` (for example `--cfg cpu` to use 
-the defaults from `config/cpu.cfg`).
+You can configure more extensively using command-line flags (see below), but, more conveniently, you can also
+**put your own defaults in `config/user.cfg`** (not tracked by git; same format as `config/default.cfg`,
+holding only the keys you want to change). Settings are layered, each overriding the one before:
+
+1. built-in defaults
+2. `config/default.cfg` (tracked; documents the shipped defaults), or the file picked with `--cfg NAME`
+   (for example `--cfg cpu` for `config/cpu.cfg`)
+3. `config/user.cfg`
+4. the `--vocal_isolation` / `--asr` / `--align` presets
+5. flags you type
+
+`language` defaults to `yue`. Other languages are accepted but not yet supported end to end: every
+stage after transcription (alignment, text cleaning, line breaking) currently assumes written Cantonese.
 
 Run `uv run cantocaptions_ai --help` to display the complete flag list.
 
@@ -74,7 +84,7 @@ CantoCaptions dataset. It already writes HK-style written Cantonese and even dis
 particles by tone (e.g. 啦 laa1 / 喇 laa3), so less post-processing is necessary to clean things up. This is
 currently the best model by far for this framework, so it is recommended to keep as-is.
 
-Alternatives are the stock `Qwen3-ASR` (1.7B) and `Qwen3-ASR-0.6B`. In order to avoid simplified Chinesee and 
+Alternatives are the stock `Qwen3-ASR` (1.7B) and `Qwen3-ASR-0.6B`. In order to avoid simplified Chinese and 
 non-standard written Cantonese, both of these models are put through extensive post-processing when used. 
 Post-processing includes using the alignment model as a phonetic guide to check for certain variants 
 such as gam2 噉 vs. gam3 咁.
@@ -112,7 +122,7 @@ transcribes the isolated vocals. Improves subtitle quality significantly, but is
 ### Alignment
 
 To get an accurate timing for the subtitles, an alignment model is used (`no_align = True` to skip the timing step). 
-By default, the model used is [alvinlii's wav2vec2-BERT model for Cantonese](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese).
+By default, the model used is [alvanlii's wav2vec2-BERT model for Cantonese](https://huggingface.co/alvanlii/wav2vec2-BERT-cantonese).
 
 ### Post-Processing / Text Cleaning
 
@@ -139,7 +149,9 @@ token (see below).
 `debug_dir` is off by default. Set it to a directory (e.g. `--debug_dir temp` for `./temp/`) and each 
 stage's output will be saved there as it runs. Useful for testing multiple runs with different settings.
 You can set `load_debug_dir` to the same directory to reload a previous run's data (if it exists) without having
-to recompute anything.
+to recompute anything. Each stage's checkpoint records the settings that produced it (`meta.json`), so a stage
+whose settings changed since, or whose inputs came from a stage that changed, is recomputed rather than replayed;
+the log names the settings that differ.
 
 Note that `debug_dir` also outputs segmented audio, so it can grow large quickly.
 
@@ -154,8 +166,8 @@ use on HuggingFace. Pass a token once if you hit that:
 uv run cantocaptions_ai video.mkv --hf_token hf_...
 ```
 
-You can also set the `HF_TOKEN` environment variable. Prefer either over putting the token in
-`config/default.cfg`, which is tracked by git.
+You can also set the `HF_TOKEN` environment variable. Prefer either over putting the token in a
+config file; if you must, use the untracked `config/user.cfg`, never `config/default.cfg`.
 
 To fetch the model weights ahead of time rather than on first run:
 
@@ -184,7 +196,7 @@ of discarding them:
 uv run cantocaptions_ai test.mkv --realign misaligned_subtitle_file.srt
 ```
 
-TThis process finds the lines it is confident about acoustically, then fits the simplest transform between 
+This process finds the lines it is confident about acoustically, then fits the simplest transform between 
 the two timelines, and realigns using that transform rather than manually aligning every subtitle to the audio. 
 The transform can express an offset, a speed difference (e.g. a PAL broadcast runs ~4.3% fast against its 23.976 fps master),
 and cuts and insertions where one release has content the other does not, all of which it reports:
@@ -223,5 +235,33 @@ the rest of the file.
 
 * Measure a change to realignment with `scripts/eval_realign.py`, which strips the timings off a
 known-good SRT, realigns its text, and reports how far each cue landed from where it belongs.
+
+## Development
+
+Run the test suite (CPU only; no model downloads):
+
+```bash
+uv sync --extra transformers_qwen --group dev
+uv run pytest
+```
+
+### Architecture
+
+The pipeline (`cantocaptions_ai/pipeline/transcribe.py`, `_execute_pipeline`) runs a fixed sequence of
+stages over every input file: VAD → vocal isolation (optional) → ASR → ensemble / LLM correction
+(optional) → forced alignment → diarization (optional) → cue assembly and text cleaning → writers.
+Each model-backed stage is a `PipelineStage` (`utils/model_utils.py`) with its own debug checkpoint.
+
+Behaviour that depends on a particular model is looked up rather than hard-coded:
+
+* `pipeline/model_profiles.py` — per ASR model: text normalization, punctuation, particle spot-checks,
+  cue-assembly markers and which cleaning manifest to use.
+* `pipeline/align_profiles.py` — per alignment model: audio primer, hand-picked character substitutions,
+  internal-gap splitting. The model's own processor comes with it from `load_align_model`.
+
+Cantonese-specific text handling lives in `cantocaptions_ai/cantonese/` (cleaning rules, numerals, line
+breaking, particles). Some Cantonese and CJK assumptions still sit outside it — sentence splitting,
+character-count line widths, Jyutping-based vocabulary repair, audio-track selection — and are being moved
+behind the profiles.
 
 Thank you to everyone from the CantoCaptions community and Discord for their support and testing on this project.

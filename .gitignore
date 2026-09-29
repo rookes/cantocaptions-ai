@@ -242,9 +242,7 @@ test/
 # Default output_dir: subtitles this tool writes are the user's, not the repo's.
 output/
 
-# config/default.cfg IS tracked: it ships as the annotated starting point users
-# edit instead of retyping flags. It is still auto-generated on first run when
-# absent (see cli_config.ensure_default_cfg_exists), which now only matters for
-# a checkout where it was deleted. Because it is tracked, local edits to it show
-# up in `git status` and can conflict on pull -- `git update-index
-# --skip-worktree config/default.cfg` silences that for a personal copy.
+# config/default.cfg IS tracked: it documents the shipped defaults (a test pins
+# it to PipelineConfig). Personal settings go in config/user.cfg, which layers on
+# top of it and stays out of git.
+config/user.cfg

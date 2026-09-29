@@ -34,6 +34,7 @@ from cantocaptions_ai.utils.model_utils import (
     PipelineStage,
     flush_vram,
     partition_by_cache,
+    write_checkpoint,
     vram_stats,
 )
 from cantocaptions_ai.utils.schema import (
@@ -80,6 +81,8 @@ class _BaseDiarization(PipelineStage):
     Subclasses supply ``_extract`` (what slice of the item they need) and ``process`` (how
     they drive the model over it).
     """
+
+    debug_stage = "diarization"
 
     scope: str
 
@@ -298,7 +301,7 @@ class SegmentDiarization(_BaseDiarization):
         single ``set_total`` up front spans every file (``StageTimer._start_determinate``
         closes and replaces the bar on each call, so it must only be called once).
         """
-        cached, to_compute = partition_by_cache(items, self.read_debug, load_debug_dir)
+        cached, to_compute = partition_by_cache(items, self, load_debug_dir)
 
         if progress_callback is not None:
             progress_callback.set_total(
@@ -308,8 +311,7 @@ class SegmentDiarization(_BaseDiarization):
         results = dict(cached)
         for index, item in to_compute:
             result = self.process(self._extract(item), progress_callback=progress_callback)
-            if debug_dir:
-                self.write_debug(item['audio_path'], result, debug_dir)
+            write_checkpoint(self, item, result, debug_dir)
             results[index] = result
 
         return [self._pack(item, results[i]) for i, item in enumerate(items)]

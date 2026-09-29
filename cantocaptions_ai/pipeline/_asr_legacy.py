@@ -12,7 +12,7 @@ from typing import List, Optional
 from cantocaptions_ai.pipeline.asr import QwenPipeline, _normalize_language
 from cantocaptions_ai.utils.audio import resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
-from cantocaptions_ai.utils.model_utils import partition_by_cache, ensure_hf_model_downloaded
+from cantocaptions_ai.utils.model_utils import partition_by_cache, ensure_hf_model_downloaded, write_checkpoint
 from cantocaptions_ai.cantonese.text import DEFAULT_NORMALIZATION, TextNormalization, normalize_segment_text
 from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 from cantocaptions_ai.utils.log_utils import get_logger
@@ -36,7 +36,7 @@ class QwenPipelineLegacy(QwenPipeline):
 
     def __init__(self, model, language: str = "yue", normalization: TextNormalization = DEFAULT_NORMALIZATION):
         self._model = model
-        self._language = _normalize_language(language or "yue")
+        self._language = _normalize_language(language)
         self.normalization = normalization
 
     @staticmethod
@@ -62,7 +62,7 @@ class QwenPipelineLegacy(QwenPipeline):
         """
         logger.info("Performing transcription (legacy backend)...")
         language = self._language
-        cached, to_compute = partition_by_cache(items, self.read_debug, load_debug_dir)
+        cached, to_compute = partition_by_cache(items, self, load_debug_dir)
 
         total_segs = sum(len(item['vad_segments']) for _, item in to_compute)
         if progress_callback is not None:
@@ -89,8 +89,7 @@ class QwenPipelineLegacy(QwenPipeline):
                 ]
                 result: TranscriptionResult = {"segments": segments, "language": language}
                 computed[idx] = result
-                if debug_dir is not None:
-                    self.write_debug(item['audio_path'], result, debug_dir)
+                write_checkpoint(self, item, result, debug_dir)
 
             if progress_callback is not None:
                 progress_callback.advance(total_segs)

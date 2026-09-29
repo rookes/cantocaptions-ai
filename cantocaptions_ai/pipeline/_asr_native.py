@@ -13,6 +13,7 @@ from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
 from cantocaptions_ai.utils.model_utils import (
     partition_by_cache,
+    write_checkpoint,
     BatchExecutor,
     MemoryPolicy,
     ensure_hf_model_downloaded,
@@ -148,15 +149,15 @@ class QwenPipelineNative(QwenPipeline):
         batches pack work from different files (no half-empty tail batch per file).
         """
         logger.info("Performing transcription (native backend)...")
-        language = _normalize_language(self.preset_language or "yue")
-        cached, to_compute = partition_by_cache(items, self.read_debug, load_debug_dir)
+        language = _normalize_language(self.preset_language)
+        cached, to_compute = partition_by_cache(items, self, load_debug_dir)
 
         # jobs are (item_idx, seg_idx); texts scattered back into per-item buffers.
         jobs: List = []
-        buffers = {}  # idx -> {'segs': List[VadAudioSegment], 'texts': List[Optional[str]], 'audio_path': str}
+        buffers = {}  # idx -> {'segs': List[VadAudioSegment], 'texts': List[Optional[str]], 'item': dict}
         for idx, item in to_compute:
             segs = item['vad_segments']
-            buffers[idx] = {'segs': segs, 'texts': [None] * len(segs), 'audio_path': item['audio_path']}
+            buffers[idx] = {'segs': segs, 'texts': [None] * len(segs), 'item': item}
             jobs.extend((idx, sdx) for sdx in range(len(segs)))
 
         if progress_callback is not None:
@@ -186,8 +187,7 @@ class QwenPipelineNative(QwenPipeline):
             ]
             result: TranscriptionResult = {"segments": segments, "language": language}
             computed[idx] = result
-            if debug_dir is not None:
-                self.write_debug(buf['audio_path'], result, debug_dir)
+            write_checkpoint(self, buf['item'], result, debug_dir)
 
         result_items = []
         for idx, item in enumerate(items):
@@ -202,7 +202,7 @@ class QwenPipelineNative(QwenPipeline):
         progress_callback: ProgressCallback = None,
     ) -> TranscriptionResult:
         """Transcribe a single file's segments (library/single-file entry point)."""
-        language = _normalize_language(self.preset_language or "yue")
+        language = _normalize_language(self.preset_language)
         texts: List[Optional[str]] = [None] * len(input)
         jobs = list(range(len(input)))
 
@@ -395,7 +395,7 @@ def load_model_native(
 
     if device == "cuda" and compile_enabled:
         try:
-            _compile_and_warmup(hf_model, processor, _normalize_language(language or "yue"), batch_size)
+            _compile_and_warmup(hf_model, processor, _normalize_language(language), batch_size)
             logger.info("torch.compile enabled for ASR model")
         except Exception as e:
             logger.warning(

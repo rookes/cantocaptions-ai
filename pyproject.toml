@@ -128,4 +128,13 @@ explicit = true
 [dependency-groups]
 dev = [
     "subtitle-edit-rate>=0.4.0",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "ffmpeg: needs ffmpeg/ffprobe on PATH",
+    "slow: takes more than a few seconds",
 ]

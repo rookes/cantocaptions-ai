@@ -83,9 +83,16 @@ def delayed_media(tmp_path_factory):
     return delayed, plain
 
 
+#: One AAC frame of encoder priming at 48 kHz. Some muxers (ffmpeg 8's mkv) shift the
+#: container start by the priming so its packet is not negative, which moves the probed
+#: offset by this much -- the decode still lands correctly because it emits the priming.
+AAC_PRIMING_S = 1024 / 48000
+
+
 def test_container_audio_delay_reads_the_mux_offset(delayed_media):
     delayed, plain = delayed_media
-    assert container_audio_delay(str(delayed)) == pytest.approx(DELAY_S, abs=1e-3)
+    assert container_audio_delay(str(delayed)) == pytest.approx(
+        DELAY_S, abs=AAC_PRIMING_S + 1e-3)
     assert container_audio_delay(str(plain)) == 0.0
 
 

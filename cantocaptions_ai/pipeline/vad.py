@@ -19,6 +19,8 @@ from cantocaptions_ai.pipeline.vads.curve import frame_middles
 
 
 class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
+    debug_stage = "vad"
+
     def __init__(
         self,
         vad_model: Vad,
@@ -63,14 +65,7 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
 
     @staticmethod
     def _pack(item, result):
-        out = {'audio_path': item['audio_path'], 'vad_segments': result}
-        if 'audio_track' in item:
-            out['audio_track'] = item['audio_track']
-        if 'audio_downmix' in item:
-            out['audio_downmix'] = item['audio_downmix']
-        if 'audio_normalize' in item:
-            out['audio_normalize'] = item['audio_normalize']
-        return out
+        return {**item, 'vad_segments': result}
 
     def process(self, input: np.ndarray, *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
         """Run VAD on audio and return merged audio segments with timestamps."""

@@ -4,7 +4,8 @@ import os
 import re
 import sys
 import zlib
-from typing import Callable, Optional, TextIO, List
+from pathlib import Path
+from typing import Callable, Dict, Iterable, Optional, TextIO, List
 
 LANGUAGES = {
     "en": "english",
@@ -229,18 +230,54 @@ def _with_speaker(
     return fmt.format(speaker=speaker, text=text)
 
 
+def output_names(paths: Iterable[str], input_dir: Optional[str] = None) -> Dict[str, str]:
+    """The name each input's outputs and debug checkpoints are written under.
+
+    A name is the file's stem, or with ``input_dir`` its path relative to that directory
+    without the extension (``s1/ep01`` for ``input_dir/s1/ep01.mkv``), always with ``/``
+    separators. Mirroring the input tree is what lets a recursive run hold two
+    ``ep01.mkv`` from different seasons: keyed by stem they would overwrite each other's
+    subtitles and share one debug cache.
+
+    Raises ConfigError if two inputs would still share a name (two files passed directly
+    from different folders, or ``a.mkv`` beside ``a.mp4``).
+    """
+    from cantocaptions_ai.errors import ConfigError
+
+    names: Dict[str, str] = {}
+    for path in paths:
+        if input_dir is not None:
+            rel = Path(os.path.relpath(path, input_dir))
+            name = rel.with_name(rel.stem.strip()).as_posix()
+        else:
+            name = Path(path).stem.strip()
+        names[path] = name
+
+    by_name: Dict[str, List[str]] = {}
+    for path, name in names.items():
+        by_name.setdefault(name, []).append(path)
+    clashes = {name: ps for name, ps in by_name.items() if len(ps) > 1}
+    if clashes:
+        detail = "; ".join(f"{name!r}: {', '.join(ps)}" for name, ps in sorted(clashes.items()))
+        hint = "" if input_dir is not None else " (pass their parent folder as --input_dir instead)"
+        raise ConfigError(f"Inputs would overwrite each other's output{hint}: {detail}")
+    return names
+
+
 class ResultWriter:
     extension: str
 
     def __init__(self, output_dir: str):
         self.output_dir = output_dir
 
-    def __call__(self, result: dict, audio_path: str, options: dict):
-        audio_basename = os.path.basename(audio_path)
-        audio_basename = os.path.splitext(audio_basename)[0].strip()
-        output_path = os.path.join(
-            self.output_dir, audio_basename + "." + self.extension
-        )
+    def __call__(self, result: dict, name: str, options: dict):
+        """Write *result* to ``output_dir/<name>.<extension>``.
+
+        ``name`` comes from :func:`output_names`, and may hold ``/`` for a mirrored
+        subfolder, which is created as needed.
+        """
+        output_path = os.path.join(self.output_dir, *name.split("/")) + "." + self.extension
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
         with open(output_path, "w", encoding="utf-8") as f:
             self.write_result(result, file=f, options=options)
@@ -330,6 +367,19 @@ class WriteJSON(ResultWriter):
 
     def write_result(self, result: dict, file: TextIO, options: dict):
         json.dump(result, file, ensure_ascii=False)
+
+
+def writer_args(cfg) -> dict:
+    """The writer ``options`` dict for a PipelineConfig.
+
+    The one place both output paths build it from -- the CLI's file writers and the
+    service's in-memory ``render_result`` -- so the two cannot drift apart.
+    """
+    return {
+        "max_line_count": cfg.max_line_count,
+        "max_line_width": cfg.max_line_width,
+        "speaker_labels": cfg.speaker_labels,
+    }
 
 
 def get_writer(

@@ -35,7 +35,6 @@ from cantocaptions_ai.pipeline.alignment import (
     _compute_vad_emissions_batched,
     _compute_vad_emissions_sequential,
     load_align_model,
-    load_bert_processor,
 )
 from cantocaptions_ai.utils.audio import SAMPLE_RATE
 
@@ -65,8 +64,8 @@ def main() -> None:
         raise SystemExit("This benchmark requires a CUDA GPU (pass --device cpu to run without one).")
 
     device = args.device
-    model, _ = load_align_model("yue", device, model_cache_only=True)
-    bert_processor = load_bert_processor(model_cache_only=True)
+    model, metadata = load_align_model("yue", device, model_cache_only=True)
+    processor = metadata["processor"]
     model.eval()  # dropout must be off for the sequential/batched outputs to be comparable at all
 
     rng = np.random.default_rng(args.seed)
@@ -74,14 +73,14 @@ def main() -> None:
     print(f"n_segments={args.n_segments}  device={device}")
 
     # Warm up (kernel compilation/cuDNN autotune) before timing either path.
-    _compute_vad_emissions_sequential(segments[:2], model, "huggingface", bert_processor, device)
+    _compute_vad_emissions_sequential(segments[:2], model, "huggingface", processor, device)
     if device == "cuda":
         torch.cuda.synchronize()
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
-    sequential = _compute_vad_emissions_sequential(segments, model, "huggingface", bert_processor, device)
+    sequential = _compute_vad_emissions_sequential(segments, model, "huggingface", processor, device)
     if device == "cuda":
         torch.cuda.synchronize()
     old_time = time.perf_counter() - t0
@@ -96,7 +95,7 @@ def main() -> None:
         if device == "cuda":
             torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
-        batched = _compute_vad_emissions_batched(segments, model, bert_processor, device, batch_size)
+        batched = _compute_vad_emissions_batched(segments, model, processor, device, batch_size)
         if device == "cuda":
             torch.cuda.synchronize()
         new_time = time.perf_counter() - t0

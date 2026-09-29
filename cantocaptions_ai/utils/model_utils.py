@@ -9,7 +9,8 @@ from typing import Any, Callable, Dict, Generator, Generic, List, Optional, Tupl
 
 from tqdm import tqdm as _TqdmBase
 
-from cantocaptions_ai.utils.schema import ProgressCallback
+from cantocaptions_ai.utils.checkpoints import checkpoint_is_current, write_checkpoint_meta
+from cantocaptions_ai.utils.schema import ProgressCallback, item_name
 from cantocaptions_ai.utils.log_utils import get_active_stage_timer, get_logger
 
 logger = get_logger(__name__)
@@ -36,21 +37,44 @@ def resolve_torch_compute_dtype(compute_type: str, device: str, stage: str) -> t
     return torch.float32
 
 
-def _load_or_compute(audio_path, load_debug_dir, debug_dir, load_fn, write_fn, compute_fn):
-    """Load a stage result from the debug cache, or compute and optionally save it."""
-    if load_debug_dir:
-        cached = load_fn(audio_path, load_debug_dir)
-        if cached is not None:
-            return cached
-    result = compute_fn()
-    if debug_dir:
-        write_fn(audio_path, result, debug_dir)
-    return result
+def _checkpoint_settings(stage, item: dict) -> Optional[dict]:
+    """The settings this run expects *stage*'s checkpoint for *item* to have been made with.
+
+    ``_execute_pipeline`` attaches them as ``item['checkpoints']`` (see utils/checkpoints.py);
+    None -- an item from a direct stage call -- disables the check.
+    """
+    debug_stage = getattr(stage, "debug_stage", None)
+    checkpoints = item.get("checkpoints")
+    if debug_stage is None or not checkpoints:
+        return None
+    return checkpoints.get(debug_stage)
+
+
+def read_checkpoint(stage, item: dict, load_debug_dir: Optional[str]) -> Any:
+    """*stage*'s cached result for *item*, or None if absent or made under other settings."""
+    if not load_debug_dir:
+        return None
+    name = item_name(item)
+    settings = _checkpoint_settings(stage, item)
+    if not checkpoint_is_current(load_debug_dir, name, stage.debug_stage, settings):
+        return None
+    return stage.read_debug(name, load_debug_dir)
+
+
+def write_checkpoint(stage, item: dict, result: Any, debug_dir: Optional[str]) -> None:
+    """Save *stage*'s result for *item*, recording the settings that produced it."""
+    if not debug_dir:
+        return
+    name = item_name(item)
+    stage.write_debug(name, result, debug_dir)
+    settings = _checkpoint_settings(stage, item)
+    if settings is not None:
+        write_checkpoint_meta(debug_dir, name, stage.debug_stage, settings)
 
 
 def partition_by_cache(
     items: List[dict],
-    read_debug: Callable[[str, str], Any],
+    stage,
     load_debug_dir: Optional[str],
 ) -> Tuple[Dict[int, Any], List[Tuple[int, dict]]]:
     """Split items into cached results and items still needing compute.
@@ -59,12 +83,14 @@ def partition_by_cache(
     loaded stage result, and ``to_compute`` is a list of ``(index, item)`` for the
     items whose cache was absent. Used by batched stages so a partial ``--load_debug_dir``
     (some files cached, some not) is handled without recomputing the cached ones.
+    ``stage`` is the PipelineStage (class or instance) whose checkpoints are read; a
+    checkpoint made under different settings counts as absent (see read_checkpoint).
     """
     cached: Dict[int, Any] = {}
     to_compute: List[Tuple[int, dict]] = []
     for idx, item in enumerate(items):
         if load_debug_dir:
-            result = read_debug(item['audio_path'], load_debug_dir)
+            result = read_checkpoint(stage, item, load_debug_dir)
             if result is not None:
                 cached[idx] = result
                 continue
@@ -185,11 +211,16 @@ def run_adaptive_batches(
 class PipelineStage(ABC, Generic[InputT, OutputT]):
     """Abstract base for pipeline stages: implement process() to transform InputT → OutputT.
 
+    ``debug_stage`` names the stage's checkpoint directory (``<debug_dir>/<name>/<stage>``)
+    and its entry in utils/checkpoints.py, which decides when a checkpoint is stale.
+
     Subclasses must also implement four static methods that plug into the run() machinery:
     - read_debug / write_debug: load and save stage checkpoints
     - _extract: pull this stage's input out of the pipeline item carrier dict
     - _pack: merge this stage's output back into the carrier dict
     """
+
+    debug_stage: Optional[str] = None
 
     @abstractmethod
     def process(self, input: InputT, *, progress_callback: ProgressCallback = None) -> OutputT:
@@ -197,14 +228,15 @@ class PipelineStage(ABC, Generic[InputT, OutputT]):
 
     @staticmethod
     @abstractmethod
-    def read_debug(audio_path: str, debug_dir: str) -> Any:
-        """Load this stage's checkpoint for audio_path from debug_dir, or None on miss."""
+    def read_debug(name: str, debug_dir: str) -> Any:
+        """Load this stage's checkpoint for the item called *name* (``schema.item_name``)
+        from debug_dir, or None on miss."""
         ...
 
     @staticmethod
     @abstractmethod
-    def write_debug(audio_path: str, result: Any, debug_dir: str) -> None:
-        """Save this stage's result for audio_path to debug_dir."""
+    def write_debug(name: str, result: Any, debug_dir: str) -> None:
+        """Save this stage's result for the item called *name* to debug_dir."""
         ...
 
     @staticmethod
@@ -230,7 +262,7 @@ class PipelineStage(ABC, Generic[InputT, OutputT]):
         debug_dir must be non-None in practice (guarded by need_* checks in transcribe.py).
         """
         assert debug_dir, "load_cache called with no debug_dir"
-        return [cls._pack(item, cls.read_debug(item['audio_path'], debug_dir)) for item in items]
+        return [cls._pack(item, cls.read_debug(item_name(item), debug_dir)) for item in items]
 
     def run(
         self,
@@ -242,7 +274,7 @@ class PipelineStage(ABC, Generic[InputT, OutputT]):
     ) -> List[dict]:
         """Run this stage over all pipeline items with debug caching.
 
-        For each item, _load_or_compute tries the cache first; _extract and process()
+        For each item, read_checkpoint tries the cache first; _extract and process()
         are only called on a cache miss. Progress is reported per file (one unit per
         item) so the bar spans all files in the stage; stages that batch work units
         across files (ASR, vocal isolation) override run() for finer-grained progress.
@@ -252,12 +284,10 @@ class PipelineStage(ABC, Generic[InputT, OutputT]):
             progress_callback.set_total(len(items), unit="file")
         result_items = []
         for item in items:
-            audio_path = item['audio_path']
-            result = _load_or_compute(
-                audio_path, load_debug_dir, debug_dir,
-                cls.read_debug, cls.write_debug,
-                lambda item=item: self.process(cls._extract(item)),
-            )
+            result = read_checkpoint(cls, item, load_debug_dir)
+            if result is None:
+                result = self.process(cls._extract(item))
+                write_checkpoint(cls, item, result, debug_dir)
             result_items.append(cls._pack(item, result))
             if progress_callback is not None:
                 progress_callback.advance(1)

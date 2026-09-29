@@ -18,7 +18,6 @@ import pytest
 from cantocaptions_ai.pipeline.timefit import (
     MIN_SEGMENT_ANCHORS,
     TransformError,
-    _pad_starts,
     _trim_overlaps,
     describe_transform,
     fit_transform,
@@ -571,26 +570,14 @@ def test_trim_overlaps_skips_dropped_cues():
     assert out[1] is None
 
 
-def test_pad_starts_shifts_every_start_earlier():
-    out = [(1.0, 2.0, None), (5.0, 6.0, "cut")]
-    _pad_starts(out, pad=0.04, file_start=0.0)
-    assert out[0] == (0.96, 2.0, None)
-    assert out[1] == (4.96, 6.0, "cut")
-
-
-def test_pad_starts_does_not_go_negative():
-    out = [(0.02, 1.0, None)]
-    _pad_starts(out, pad=0.04, file_start=0.0)
-    assert out[0][0] == 0.0
-
-
-def test_map_cues_with_padding_trims_then_pads_flush():
-    """A pair the trim pass actually touches comes out exactly flush, not overlapping."""
+def test_map_cues_with_padding_leaves_a_gap_and_keeps_starts():
+    """A pair the trim pass touches is left `align_padding` apart; starts are not shifted."""
     t = locate_breaks(fit_transform(pairs(lambda x: x + 1.0, count=40, step=20.0)), [])
     # Two spans placed so the first cue's own duration runs into the second's start.
     spans = [(5.0, 30.0), (25.0, 26.0)]
     out = map_cues(t, spans, align_padding=0.04)
-    assert out[0][1] == pytest.approx(out[1][0], abs=1e-9)
+    assert out[1][0] == pytest.approx(26.0, abs=1e-6)
+    assert out[0][1] == pytest.approx(out[1][0] - 0.04, abs=1e-9)
 
 
 def test_map_cues_without_padding_does_not_shift_starts():

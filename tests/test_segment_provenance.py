@@ -6,7 +6,6 @@ re-derived downstream -- by then the pre-expansion timeline is gone -- so it has
 persist through the VAD and vocal-isolation manifests, both of which otherwise rebuild
 segment dicts as exactly {start, end, audio}.
 """
-import os
 import shutil
 import tempfile
 import unittest
@@ -21,7 +20,7 @@ from cantocaptions_ai.utils.debug import (_PERSISTED_SEGMENT_KEYS, load_isolatio
 class TestProvenanceRoundTrip(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.audio = os.path.join(self.tmp, "clip.wav")
+        self.audio = "clip"  # the input's output name; see utils.output.output_names
         self.segments = [
             {"start": 0.0, "end": 1.0, "audio": np.zeros(16000, dtype=np.float32),
              "expanded": [[0.4, 0.8]]},

@@ -9,11 +9,14 @@ import contextlib
 import io
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
 from cantocaptions_ai.__main__ import build_parser
+from cantocaptions_ai.pipeline import cli_config
 from cantocaptions_ai.pipeline.cli_config import (
+    default_config_dir,
     ensure_default_cfg_exists,
     load_cfg_file,
     resolve_cfg_path,
@@ -106,9 +109,20 @@ class TestLoadCfgFile(unittest.TestCase):
         self.assertEqual(result, {"device": "cpu", "batch_size": 8})
 
     def test_bool_flag_coerced(self):
-        path = self._write("[pipeline]\nsuppress_numerals = True\n")
+        path = self._write("[pipeline]\nno_align = True\n")
         result = load_cfg_file(path, self.parser)
-        self.assertIs(result["suppress_numerals"], True)
+        self.assertIs(result["no_align"], True)
+
+    def test_removed_key_is_skipped_with_a_warning(self):
+        # A cfg written before a field was deleted must still load, not abort the run.
+        # catch_warnings, not assertWarns: assertWarns walks sys.modules and trips over
+        # transformers' lazy submodules once another test has imported transformers.
+        path = self._write("[pipeline]\nfp16 = True\nbatch_size = 4\n")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = load_cfg_file(path, self.parser)
+        self.assertEqual(result, {"batch_size": 4})
+        self.assertTrue(any("fp16" in str(w.message) for w in caught))
 
     def test_unknown_key_fails_fast(self):
         path = self._write("[pipeline]\nnot_a_real_field = 1\n")
@@ -236,6 +250,57 @@ class TestResolvePipelineArgs(unittest.TestCase):
         with _silent_parser_error():
             with self.assertRaises(SystemExit):
                 resolve_pipeline_args(self.parser, {"cfg": "does_not_exist"}, self.config_dir)
+
+    def test_user_cfg_overrides_the_selected_cfg(self):
+        self.config_dir.mkdir(parents=True)
+        (self.config_dir / "cpu.cfg").write_text(
+            "[pipeline]\ndevice = cpu\nbatch_size = 2\n", encoding="utf-8")
+        (self.config_dir / "user.cfg").write_text(
+            "[pipeline]\nbatch_size = 24\n", encoding="utf-8")
+        merged = resolve_pipeline_args(self.parser, {"cfg": "cpu"}, self.config_dir)
+        self.assertEqual((merged["device"], merged["batch_size"]), ("cpu", 24))
+
+    def test_presets_and_flags_override_user_cfg(self):
+        self.config_dir.mkdir(parents=True)
+        (self.config_dir / "user.cfg").write_text(
+            "[pipeline]\nalign_compute_type = float32\nbatch_size = 24\n", encoding="utf-8")
+        merged = resolve_pipeline_args(
+            self.parser, {"align": "fast", "batch_size": 4}, self.config_dir)
+        self.assertEqual((merged["align_compute_type"], merged["batch_size"]), ("float16", 4))
+
+
+class TestConfigDirDiscovery(unittest.TestCase):
+    """Running outside the repo must read the checkout's config, never scatter new ones."""
+
+    def setUp(self):
+        self.parser = build_parser()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = Path(self.tmp.name)
+
+    def test_cwd_config_wins(self):
+        (self.cwd / "config").mkdir()
+        with mock.patch.object(Path, "cwd", return_value=self.cwd):
+            self.assertEqual(default_config_dir(), self.cwd / "config")
+
+    def test_falls_back_to_the_checkout_and_creates_nothing_here(self):
+        with mock.patch.object(Path, "cwd", return_value=self.cwd):
+            self.assertEqual(default_config_dir(), cli_config._REPO_CONFIG_DIR)
+        self.assertFalse((self.cwd / "config").exists())
+
+    def test_no_config_dir_anywhere_means_built_in_defaults(self):
+        with mock.patch.object(Path, "cwd", return_value=self.cwd), \
+                mock.patch.object(cli_config, "_REPO_CONFIG_DIR", self.cwd / "absent"):
+            self.assertIsNone(default_config_dir())
+            self.assertIsNone(resolve_cfg_path(None, self.parser))
+            merged = resolve_pipeline_args(self.parser, {})
+        self.assertEqual(merged, PipelineConfig.defaults())
+
+    def test_named_cfg_without_a_config_dir_fails_fast(self):
+        with mock.patch.object(Path, "cwd", return_value=self.cwd), \
+                mock.patch.object(cli_config, "_REPO_CONFIG_DIR", self.cwd / "absent"):
+            with _silent_parser_error(), self.assertRaises(SystemExit):
+                resolve_cfg_path("cpu", self.parser)
 
 
 if __name__ == "__main__":
