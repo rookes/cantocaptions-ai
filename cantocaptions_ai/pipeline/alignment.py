@@ -342,7 +342,7 @@ def _run_model_inference(
     model: torch.nn.Module,
     model_type: str,
     audio: torch.Tensor,
-    bert_processor,
+    processor,
     device: str,
     lengths=None,
 ) -> torch.Tensor:
@@ -352,14 +352,34 @@ def _run_model_inference(
         if model_type == "torchaudio":
             emissions, _ = model(audio.to(device, dtype=model_dtype), lengths=lengths)
         elif model_type == "huggingface":
-            if bert_processor is not None:
-                features = bert_processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-                emissions = model(features["input_features"].to(device, dtype=model_dtype)).logits
+            if processor is not None:
+                features = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+                inputs = features[_input_key(processor)]
+                emissions = model(inputs.to(device, dtype=model_dtype)).logits
             else:
                 emissions = model(audio.to(device, dtype=model_dtype)).logits
         else:
             raise NotImplementedError(f"Align model of type {model_type} not supported.")
         return torch.log_softmax(emissions, dim=-1)
+
+
+def _input_key(processor) -> str:
+    """The model input a processor produces: ``input_features`` for wav2vec2-BERT (log-mel
+    fbank frames), ``input_values`` for plain wav2vec2 (normalised raw samples)."""
+    names = getattr(processor, "model_input_names", None)
+    return names[0] if names else "input_features"
+
+
+def _passes_attention_mask(processor) -> bool:
+    """Whether the model should be *given* the padding mask.
+
+    The mask is always requested -- its row sums are each segment's real length -- but the
+    HF convention is that a feature extractor with ``return_attention_mask=False`` belongs to
+    a model that must not see one (wav2vec2-base and other group-norm checkpoints, which are
+    trained on zero-padded batches and degrade when masked).
+    """
+    extractor = getattr(processor, "feature_extractor", processor)
+    return bool(getattr(extractor, "return_attention_mask", True))
 
 
 def _get_blank_id(model_dictionary: dict) -> int:
@@ -462,14 +482,13 @@ def _compute_vad_emissions_sequential(
     vad_segments: List[VadAudioSegment],
     model: torch.nn.Module,
     model_type: str,
-    bert_processor,
+    processor,
     device: str,
 ) -> List[Tuple[torch.Tensor, float]]:
     """Run inference on each VAD segment one at a time.
 
-    Fallback used for model types this pipeline doesn't actually exercise in
-    practice (torchaudio bundles, or a plain HF wav2vec2 model with no BERT
-    feature-extractor) — see _compute_vad_emissions_batched for the real path.
+    Used only for torchaudio bundles, which have no processor to batch through; every
+    Hugging Face model takes _compute_vad_emissions_batched.
     """
     results = []
     for vad_seg in vad_segments:
@@ -479,7 +498,7 @@ def _compute_vad_emissions_sequential(
         if len(seg_audio.shape) == 1:
             seg_audio = seg_audio.unsqueeze(0)
 
-        emissions = _run_model_inference(model, model_type, seg_audio, bert_processor, device)
+        emissions = _run_model_inference(model, model_type, seg_audio, processor, device)
         emission = emissions[0].cpu().detach()
         vad_duration = vad_seg["end"] - vad_seg["start"]
         frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
@@ -522,13 +541,18 @@ def _warn_alignment_vram(input_features: torch.Tensor, model: torch.nn.Module, d
 def _compute_vad_emissions_batched(
     vad_segments: List[VadAudioSegment],
     model: torch.nn.Module,
-    bert_processor,
+    processor,
     device: str,
     batch_size: int,
     vram_checks: bool = True,
     primer: Optional["AudioPrimer"] = None,
 ) -> List[Tuple[torch.Tensor, float]]:
-    """Batch VAD segments through the HF Wav2Vec2-BERT model via BatchExecutor.
+    """Batch VAD segments through a Hugging Face CTC align model via BatchExecutor.
+
+    ``processor`` is the align model's own (``align_metadata["processor"]``). Its first
+    model input is what the model is fed -- fbank ``input_features`` for wav2vec2-BERT, raw
+    ``input_values`` for plain wav2vec2 -- and the padding mask is passed on only where the
+    extractor says the model expects one (see ``_passes_attention_mask``).
 
     ``primer`` (from the align model's profile, ``None`` for a model without one) prepends
     left context to each segment before the encoder sees it, and its frames are discarded
@@ -540,14 +564,15 @@ def _compute_vad_emissions_batched(
     batch (cheap next to the forward) and is worth it — estimating the offset from duration
     instead would be a frame out often enough to reintroduce the artifact it removes.
 
-    bert_processor's feature extractor pads each batch to its own longest segment and returns
-    an attention_mask, whose per-row sum is the segment's real length **in input feature
-    frames**. That is not the same unit as the CTC emission: alvanlii/wav2vec2-BERT-cantonese
+    The processor pads each batch to its own longest segment and returns an attention_mask,
+    whose per-row sum is the segment's real length **in model-input units** (feature frames for
+    wav2vec2-BERT, samples for wav2vec2). That is not the same unit as the CTC emission: alvanlii/wav2vec2-BERT-cantonese
     sets add_adapter=True with adapter_stride=2, so the emission runs at half the feature rate
     (~25 fps vs ~50 fps). The mask length is therefore converted through the model's own
     _get_feat_extract_output_lengths before it is used to trim each row's emission back to its
-    real (unpadded) length — that helper applies the adapter convs and is an identity when a
-    model has no adapter, so this stays correct for a different align model.
+    real (unpadded) length. That helper maps the model's input unit to emission frames for
+    either family: the adapter convs for wav2vec2-BERT (an identity without an adapter), the
+    conv feature encoder for wav2vec2.
 
     Getting this wrong is silent and costly: an over-long real_len makes the slice a no-op, so
     the segment keeps the whole batch-padded emission, _align_segment's
@@ -576,24 +601,29 @@ def _compute_vad_emissions_batched(
     jobs = list(range(len(vad_segments)))
 
     model_dtype = next(model.parameters()).dtype
+    input_key = _input_key(processor)
+    pass_mask = _passes_attention_mask(processor)
 
     def _emission_lens(wavs) -> torch.Tensor:
-        features = bert_processor(
+        features = processor(
             wavs, sampling_rate=SAMPLE_RATE, return_tensors="pt", return_attention_mask=True,
+            padding=True,
         )
-        # Feature frames -> emission frames (see docstring); identity without an adapter.
+        # Model-input units -> emission frames (see docstring).
         return model._get_feat_extract_output_lengths(features["attention_mask"].sum(dim=-1))
 
     def infer_fn(batch: List[int]) -> None:
         wavs = [vad_segments[i]["audio"] for i in batch]
         model_inputs = [primer(w, SAMPLE_RATE) for w in wavs] if primer is not None else wavs
         with torch.inference_mode():
-            features = bert_processor(
+            # padding=True explicitly: the wav2vec2-BERT extractor pads by default, but the
+            # plain wav2vec2 one does not and cannot tensorise a ragged batch without it.
+            features = processor(
                 model_inputs, sampling_rate=SAMPLE_RATE, return_tensors="pt",
-                return_attention_mask=True,
+                return_attention_mask=True, padding=True,
             )
-            input_features = features["input_features"].to(device, dtype=model_dtype)
-            attention_mask = features["attention_mask"].to(device)
+            input_features = features[input_key].to(device, dtype=model_dtype)
+            attention_mask = features["attention_mask"].to(device) if pass_mask else None
             if vram_checks:
                 _warn_alignment_vram(input_features, model, device)
             emissions = torch.log_softmax(
@@ -649,7 +679,7 @@ def _compute_vad_emissions(
     vad_segments: List[VadAudioSegment],
     model: torch.nn.Module,
     model_type: str,
-    bert_processor,
+    processor,
     device: str,
     batch_size: int = 4,
     vram_checks: bool = True,
@@ -661,10 +691,9 @@ def _compute_vad_emissions(
     with many/long VAD segments) is visibly explained rather than looking like a
     hang — this ran with no progress feedback at all before batching was added.
 
-    ``primer`` reaches only the batched path. The sequential fallback exists for model
-    types this pipeline doesn't exercise (torchaudio bundles, plain HF wav2vec2), none of
-    which carry a profile primer today; priming there would need the same exact
-    frame-length bookkeeping for no current caller, so it warns instead of half-doing it.
+    ``primer`` reaches only the batched path. The sequential fallback exists for torchaudio
+    bundles, none of which carry a profile primer today; priming there would need the same
+    exact frame-length bookkeeping for no current caller, so it warns instead of half-doing it.
     """
     if not vad_segments:
         return []
@@ -688,9 +717,13 @@ def _compute_vad_emissions(
 
     if not segments:
         computed = []
-    elif model_type == "huggingface" and bert_processor is not None:
+    elif model_type == "huggingface":
+        if processor is None:
+            raise ValueError(
+                "A Hugging Face align model needs its processor; pass align_metadata['processor']"
+            )
         computed = _compute_vad_emissions_batched(
-            segments, model, bert_processor, device, batch_size,
+            segments, model, processor, device, batch_size,
             vram_checks=vram_checks, primer=primer,
         )
     else:
@@ -700,7 +733,7 @@ def _compute_vad_emissions(
                 "sequential path, which does not apply it. First-character timings may be "
                 "pinned to each segment's start."
             )
-        computed = _compute_vad_emissions_sequential(segments, model, model_type, bert_processor, device)
+        computed = _compute_vad_emissions_sequential(segments, model, model_type, processor, device)
 
     vocab = computed[0][0].shape[-1] if computed else 0
     results: List[Tuple[torch.Tensor, float]] = [(torch.zeros((0, vocab)), 0.0)] * len(vad_segments)
@@ -710,9 +743,9 @@ def _compute_vad_emissions(
     return results
 
 
-def compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size: int = 4, vram_checks: bool = True, primer=None):
+def compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size: int = 4, vram_checks: bool = True, primer=None):
     """Public wrapper around _compute_vad_emissions, for callers outside this module."""
-    return _compute_vad_emissions(vad_segments, model, model_type, bert_processor, device, batch_size, vram_checks=vram_checks, primer=primer)
+    return _compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size, vram_checks=vram_checks, primer=primer)
 
 
 class EmissionTimeline:
@@ -827,7 +860,7 @@ def _get_emission_for_segment(
     vad_seg_emissions: Optional[List[Tuple[torch.Tensor, float]]],
     model: torch.nn.Module,
     model_type: str,
-    bert_processor,
+    processor,
     device: str,
     timeline=None,
 ) -> Optional[Tuple[torch.Tensor, Optional[np.ndarray]]]:
@@ -864,7 +897,7 @@ def _get_emission_for_segment(
         )
     else:
         lengths = None
-    emissions = _run_model_inference(model, model_type, waveform_segment, bert_processor, device, lengths=lengths)
+    emissions = _run_model_inference(model, model_type, waveform_segment, processor, device, lengths=lengths)
     return emissions[0].cpu().detach(), None
 
 
@@ -1182,6 +1215,7 @@ def load_align_model(
     dtype = resolve_torch_compute_dtype(compute_type, device, "align")
 
     import torchaudio
+    processor = None  # torchaudio bundles take raw audio and have none
     if model_name in torchaudio.pipelines.__all__:
         pipeline_type = "torchaudio"
         bundle = torchaudio.pipelines.__dict__[model_name]
@@ -1193,18 +1227,17 @@ def load_align_model(
         labels = bundle.get_labels()
         align_dictionary = {c.lower(): i for i, c in enumerate(labels)}
     else:
-        from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, Wav2Vec2BertForCTC, Wav2Vec2BertProcessor
-        is_bert = 'wav2vec2-BERT' in model_name
-        ProcessorClass = Wav2Vec2BertProcessor if is_bert else Wav2Vec2Processor
-        ModelClass = Wav2Vec2BertForCTC if is_bert else Wav2Vec2ForCTC
-        model_flavor = "wav2vec2-BERT" if is_bert else "wav2vec2.0"
+        # The Auto classes resolve the model family from the checkpoint's own config
+        # (wav2vec2-bert -> Wav2Vec2BertForCTC + its fbank processor, wav2vec2 -> Wav2Vec2ForCTC
+        # + its raw-sample processor, and so on) rather than from the repo name.
+        from transformers import AutoModelForCTC, AutoProcessor
         try:
             ensure_hf_model_downloaded(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
         except Exception as e:
             logger.warning("Could not download %r: %s — using cached version if available.", model_name, e)
         try:
-            processor = ProcessorClass.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
-            align_model = ModelClass.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
+            processor = AutoProcessor.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
+            align_model = AutoModelForCTC.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
         except Exception as e:
             logger.error("Error loading model from huggingface (%s): %s", model_name, e)
             raise ValueError(
@@ -1214,13 +1247,22 @@ def load_align_model(
         pipeline_type = "huggingface"
         check_vram_headroom("Alignment model load", device, _ALIGN_MODEL_VRAM_ESTIMATE_MB, _ALIGN_REMEDIATION, vram_checks=vram_checks)
         align_model = guard_model_load("alignment", _ALIGN_REMEDIATION, lambda: align_model.to(device, dtype=dtype))
-        align_dictionary = {char.lower(): code for char, code in processor.tokenizer.get_vocab().items()}
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            raise ValueError(
+                f'align_model "{model_name}" has no CTC tokenizer (its processor is a bare '
+                f'{type(processor).__name__}); alignment needs the character vocabulary'
+            )
+        align_dictionary = {char.lower(): code for char, code in tokenizer.get_vocab().items()}
 
     profile = get_align_profile(model_name)
     align_metadata = {
         "language": language_code,
         "dictionary": align_dictionary,
         "type": pipeline_type,
+        # The model's own feature extractor (None for a torchaudio bundle). Every stage that
+        # runs the encoder takes it from here, so the model and its inputs cannot mismatch.
+        "processor": processor,
         # Built here, next to the dictionary it edits, so every stage that tokenises text
         # against this model shares one vocabulary. Resolves nothing until a caller hands it
         # some text -- see align_vocab.VocabRepair.
@@ -1242,30 +1284,13 @@ def load_align_model(
     return align_model, align_metadata
 
 
-def load_bert_processor(model_dir=None, model_cache_only: bool = False):
-    """Load the Wav2Vec2-BERT processor used for particle disambiguation during alignment.
-
-    Shared by both the --realign and normal alignment paths in transcribe.py, which
-    otherwise each held their own unlogged, cache_dir/local_files_only-blind
-    from_pretrained call for the same repo.
-    """
-    from transformers import Wav2Vec2BertProcessor
-
-    repo_id = "alvanlii/wav2vec2-BERT-cantonese"
-    try:
-        ensure_hf_model_downloaded(repo_id, cache_dir=model_dir, local_files_only=model_cache_only)
-    except Exception as e:
-        logger.warning("Could not download %r: %s — using cached version if available.", repo_id, e)
-    return Wav2Vec2BertProcessor.from_pretrained(repo_id, cache_dir=model_dir, local_files_only=model_cache_only)
-
-
 def align(
     transcript: Iterable[SingleSegment],
     model: torch.nn.Module,
     align_model_metadata: dict,
     audio: Union[str, np.ndarray, torch.Tensor, List[VadAudioSegment]],
     device: str,
-    bert_processor=None,
+    processor=None,
     align_padding: float = 0.04,
     align_release: float = 0.4,
     interpolate_method: str = "nearest",
@@ -1296,8 +1321,12 @@ def align(
     ``timeline`` (``realign.EmissionTimeline``) replaces the per-chunk emission set: segments
     are then cut out of one continuous timeline, so a segment may span chunk joins and the
     encoder is not run a second time over audio the caller has already encoded.
+
+    ``processor`` defaults to the align model's own, from ``align_model_metadata``.
     """
     spotchecks = spotchecks or {}
+    if processor is None:
+        processor = align_model_metadata.get("processor")
 
     # --- Audio setup ---
     vad_segments: Optional[List[VadAudioSegment]] = None
@@ -1330,7 +1359,7 @@ def align(
         timeline = EmissionTimeline.from_computed(
             vad_segments,
             _compute_vad_emissions(
-                vad_segments, model, model_type, bert_processor, device, batch_size,
+                vad_segments, model, model_type, processor, device, batch_size,
                 vram_checks=vram_checks, primer=profile.primer,
             ),
         )
@@ -1386,7 +1415,7 @@ def align(
 
         found = _get_emission_for_segment(
             t1, t2, audio, vad_segments, vad_seg_emissions,
-            model, model_type, bert_processor, device, timeline=timeline,
+            model, model_type, processor, device, timeline=timeline,
         )
         emission, frame_times = found if found is not None else (None, None)
         if emission is None:

@@ -107,6 +107,8 @@ def _detect_quantization() -> Tuple[bool, str]:
 class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
     """LLM-based transcript corrector: per-segment particle fix + full-doc name normalization."""
 
+    debug_stage = "llm_correction"
+
     def __init__(self, model, tokenizer, device: str, semantic_mode: bool = False) -> None:
         self._model = model
         self._tokenizer = tokenizer

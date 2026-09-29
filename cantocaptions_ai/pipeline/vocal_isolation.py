@@ -14,6 +14,7 @@ from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
 from cantocaptions_ai.utils.model_utils import (
     PipelineStage,
     partition_by_cache,
+    write_checkpoint,
     BatchExecutor,
     check_vram_headroom,
     ensure_hf_file_downloaded,
@@ -68,6 +69,8 @@ def _get_windowing_array(window_size, fade_size, device):
 
 class VocalIsolationProcessor(PipelineStage["List[VadAudioSegment]", "List[VadAudioSegment]"]):
     """Base class for vocal isolation processors."""
+
+    debug_stage = "vocal_isolation"
 
     @staticmethod
     def read_debug(audio_path, debug_dir): return load_isolation_debug(audio_path, debug_dir)
@@ -160,17 +163,17 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         logger.info("Performing vocal isolation...")
         self.model.eval()
 
-        cached, to_compute = partition_by_cache(items, self.read_debug, load_debug_dir)
+        cached, to_compute = partition_by_cache(items, self, load_debug_dir)
 
         C, step, fade, border = self._C, self._step, self._fade, self._border
         base_window = _get_windowing_array(C, fade, torch.device("cpu")).numpy()
 
-        # Per-item finalized audio: idx -> {'n': int, 'segs': {seg_idx: np.ndarray}, 'audio_path': str}
+        # Per-item finalized audio: idx -> {'n': int, 'segs': {seg_idx: np.ndarray}, 'item': dict}
         # Bookkeeping only (no audio buffers) — safe to build for every to-compute item
         # up front regardless of dataset size; segments are filled in incrementally by
         # _finalize_segment as each window below completes.
         item_out: Dict[int, dict] = {
-            idx: {'n': len(item['vad_segments']), 'segs': {}, 'audio_path': item['audio_path']}
+            idx: {'n': len(item['vad_segments']), 'segs': {}, 'item': item}
             for idx, item in to_compute
         }
 
@@ -260,8 +263,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         for idx, meta in item_out.items():
             ordered = [meta['segs'][s] for s in range(meta['n'])]
             computed[idx] = ordered
-            if debug_dir is not None:
-                self.write_debug(meta['audio_path'], ordered, debug_dir)
+            write_checkpoint(self, meta['item'], ordered, debug_dir)
 
         result_items = []
         for idx, item in enumerate(items):

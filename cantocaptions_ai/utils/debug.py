@@ -35,18 +35,25 @@ logger = get_logger(__name__)
 BREAK_CONTEXT_CUES = 5
 
 
-def _stem(audio_path: str) -> str:
-    """Directory name a file's checkpoints live under.
+def _stem(name: str) -> str:
+    """Directory a file's checkpoints live under, relative to the debug dir.
 
-    Writers and readers must agree on this: transcribe.py decides whether to skip a
-    stage from `_debug_stage_exists`, so a stem that only the writer strips would make
-    "cached" and "loadable" disagree.
+    ``name`` is the input's output name (see ``utils.output.output_names``): its stem, or
+    under ``--input_dir`` its path relative to that dir without the extension, so
+    ``s1/ep01.mkv`` and ``s2/ep01.mkv`` get separate trees. Writers and readers must agree
+    on this: transcribe.py decides whether to skip a stage from `_debug_stage_exists`, so
+    a name only one side derived would make "cached" and "loadable" disagree.
     """
-    return Path(audio_path).stem.strip()
+    return name.strip()
 
 
-def _stage_dir(audio_path: str, stage: str, debug_dir: str) -> str:
-    path = os.path.join(debug_dir, _stem(audio_path), stage)
+def _leaf(name: str) -> str:
+    """The last component of a name, for files written *inside* its own debug tree."""
+    return name.rsplit("/", 1)[-1]
+
+
+def _stage_dir(name: str, stage: str, debug_dir: str) -> str:
+    path = os.path.join(debug_dir, _stem(name), stage)
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -84,9 +91,9 @@ def _write_audio_segments(segments: List[VadAudioSegment], stage_dir: str) -> li
     return segment_records
 
 
-def _write_segments_json(audio_path: str, segment_records: list, stage_dir: str) -> None:
+def _write_segments_json(name: str, segment_records: list, stage_dir: str) -> None:
     manifest = {
-        "audio_path": os.path.abspath(audio_path),
+        "name": name,
         "sample_rate": SAMPLE_RATE,
         "segments": segment_records,
     }
@@ -95,27 +102,27 @@ def _write_segments_json(audio_path: str, segment_records: list, stage_dir: str)
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
 
-def write_vad_debug(audio_path: str, segments: List[VadAudioSegment], debug_dir: str) -> None:
+def write_vad_debug(name: str, segments: List[VadAudioSegment], debug_dir: str) -> None:
     """Write VAD segments (audio + manifest) to {debug_dir}/{stem}/vad/."""
-    stage_dir = _stage_dir(audio_path, "vad", debug_dir)
+    stage_dir = _stage_dir(name, "vad", debug_dir)
     segment_records = _write_audio_segments(segments, stage_dir)
-    _write_segments_json(audio_path, segment_records, stage_dir)
+    _write_segments_json(name, segment_records, stage_dir)
     logger.info(f"VAD debug output written to {stage_dir} ({len(segments)} segments)")
 
 
-def write_isolation_debug(audio_path: str, segments: List[VadAudioSegment], debug_dir: str) -> None:
+def write_isolation_debug(name: str, segments: List[VadAudioSegment], debug_dir: str) -> None:
     """Write vocal isolation segments (audio + manifest) to {debug_dir}/{stem}/vocal_isolation/."""
-    stage_dir = _stage_dir(audio_path, "vocal_isolation", debug_dir)
+    stage_dir = _stage_dir(name, "vocal_isolation", debug_dir)
     segment_records = _write_audio_segments(segments, stage_dir)
-    _write_segments_json(audio_path, segment_records, stage_dir)
+    _write_segments_json(name, segment_records, stage_dir)
     logger.info(f"Vocal isolation debug output written to {stage_dir} ({len(segments)} segments)")
 
 
-def write_transcription_debug(audio_path: str, result: TranscriptionResult, debug_dir: str) -> None:
+def write_transcription_debug(name: str, result: TranscriptionResult, debug_dir: str) -> None:
     """Write normalized transcription result to {debug_dir}/{stem}/transcription/result.json."""
-    stage_dir = _stage_dir(audio_path, "transcription", debug_dir)
+    stage_dir = _stage_dir(name, "transcription", debug_dir)
     output = {
-        "audio_path": os.path.abspath(audio_path),
+        "name": name,
         "language": result.get("language"),
         "segments": result["segments"],
     }
@@ -129,9 +136,9 @@ def write_transcription_debug(audio_path: str, result: TranscriptionResult, debu
 # Load functions (inverse of the write functions above)
 # ---------------------------------------------------------------------------
 
-def _debug_stage_exists(audio_path: str, stage: str, debug_dir: str) -> bool:
+def _debug_stage_exists(name: str, stage: str, debug_dir: str) -> bool:
     """Return True if the expected marker file for a stage exists in the debug directory."""
-    stem = _stem(audio_path)
+    stem = _stem(name)
     stage_dir = os.path.join(debug_dir, stem, stage)
     marker = {
         "transcription": "result.json",
@@ -168,9 +175,9 @@ def _load_audio_segments(stage_dir: str) -> Optional[List[VadAudioSegment]]:
     return segments
 
 
-def load_vad_debug(audio_path: str, debug_dir: str) -> Optional[List[VadAudioSegment]]:
+def load_vad_debug(name: str, debug_dir: str) -> Optional[List[VadAudioSegment]]:
     """Load VAD segments from a previous debug run. Returns None if not present."""
-    stem = _stem(audio_path)
+    stem = _stem(name)
     stage_dir = os.path.join(debug_dir, stem, "vad")
     segments = _load_audio_segments(stage_dir)
     if segments is not None:
@@ -178,9 +185,9 @@ def load_vad_debug(audio_path: str, debug_dir: str) -> Optional[List[VadAudioSeg
     return segments
 
 
-def load_isolation_debug(audio_path: str, debug_dir: str) -> Optional[List[VadAudioSegment]]:
+def load_isolation_debug(name: str, debug_dir: str) -> Optional[List[VadAudioSegment]]:
     """Load vocal isolation segments from a previous debug run. Returns None if not present."""
-    stem = _stem(audio_path)
+    stem = _stem(name)
     stage_dir = os.path.join(debug_dir, stem, "vocal_isolation")
     segments = _load_audio_segments(stage_dir)
     if segments is not None:
@@ -188,9 +195,9 @@ def load_isolation_debug(audio_path: str, debug_dir: str) -> Optional[List[VadAu
     return segments
 
 
-def load_transcription_debug(audio_path: str, debug_dir: str) -> Optional[TranscriptionResult]:
+def load_transcription_debug(name: str, debug_dir: str) -> Optional[TranscriptionResult]:
     """Load a normalized transcription result from a previous debug run. Returns None if not present."""
-    stem = _stem(audio_path)
+    stem = _stem(name)
     json_path = os.path.join(debug_dir, stem, "transcription", "result.json")
     if not os.path.isfile(json_path):
         return None
@@ -201,19 +208,19 @@ def load_transcription_debug(audio_path: str, debug_dir: str) -> Optional[Transc
     return result
 
 
-def write_ensemble_debug(audio_path: str, texts: List[str], debug_dir: str) -> None:
+def write_ensemble_debug(name: str, texts: List[str], debug_dir: str) -> None:
     """Write ensemble ASR texts to {debug_dir}/{stem}/ensemble/texts.json."""
-    stage_dir = _stage_dir(audio_path, "ensemble", debug_dir)
+    stage_dir = _stage_dir(name, "ensemble", debug_dir)
     json_path = os.path.join(stage_dir, "texts.json")
-    data = {"audio_path": os.path.abspath(audio_path), "texts": texts}
+    data = {"name": name, "texts": texts}
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     logger.info(f"Ensemble debug output written to {json_path} ({len(texts)} segments)")
 
 
-def load_ensemble_debug(audio_path: str, debug_dir: str) -> Optional[List[str]]:
+def load_ensemble_debug(name: str, debug_dir: str) -> Optional[List[str]]:
     """Load ensemble ASR texts from a previous debug run. Returns None if not present."""
-    stem = _stem(audio_path)
+    stem = _stem(name)
     json_path = os.path.join(debug_dir, stem, "ensemble", "texts.json")
     if not os.path.isfile(json_path):
         return None
@@ -223,11 +230,11 @@ def load_ensemble_debug(audio_path: str, debug_dir: str) -> Optional[List[str]]:
     return texts
 
 
-def write_llm_correction_debug(audio_path: str, result: TranscriptionResult, debug_dir: str) -> None:
+def write_llm_correction_debug(name: str, result: TranscriptionResult, debug_dir: str) -> None:
     """Write LLM-corrected transcription to {debug_dir}/{stem}/llm_correction/result.json."""
-    stage_dir = _stage_dir(audio_path, "llm_correction", debug_dir)
+    stage_dir = _stage_dir(name, "llm_correction", debug_dir)
     output = {
-        "audio_path": os.path.abspath(audio_path),
+        "name": name,
         "language": result.get("language"),
         "segments": result["segments"],
     }
@@ -238,7 +245,7 @@ def write_llm_correction_debug(audio_path: str, result: TranscriptionResult, deb
 
 
 def write_precleaning_debug(
-    audio_path: str,
+    name: str,
     result: Union[TranscriptionResult, AlignedTranscriptionResult],
     debug_dir: str,
 ) -> None:
@@ -250,10 +257,10 @@ def write_precleaning_debug(
     """
     from cantocaptions_ai.utils.output import WriteSRT
 
-    stage_dir = _stage_dir(audio_path, "pre_cleaning", debug_dir)
-    WriteSRT(stage_dir)(result, audio_path, {})
+    stage_dir = _stage_dir(name, "pre_cleaning", debug_dir)
+    WriteSRT(stage_dir)(result, _leaf(name), {})
     output = {
-        "audio_path": os.path.abspath(audio_path),
+        "name": name,
         "language": result.get("language"),
         "segments": result["segments"],
     }
@@ -263,9 +270,9 @@ def write_precleaning_debug(
     logger.info(f"Pre-cleaning debug output written to {stage_dir} ({len(result['segments'])} segments)")
 
 
-def load_llm_correction_debug(audio_path: str, debug_dir: str) -> Optional[TranscriptionResult]:
+def load_llm_correction_debug(name: str, debug_dir: str) -> Optional[TranscriptionResult]:
     """Load LLM-corrected transcription from a previous debug run. Returns None if not present."""
-    stem = _stem(audio_path)
+    stem = _stem(name)
     json_path = os.path.join(debug_dir, stem, "llm_correction", "result.json")
     if not os.path.isfile(json_path):
         return None
@@ -280,14 +287,14 @@ def load_llm_correction_debug(audio_path: str, debug_dir: str) -> Optional[Trans
 # Diarization
 # ---------------------------------------------------------------------------
 
-def write_diarization_debug(audio_path: str, result: DiarizationResult, debug_dir: str) -> None:
+def write_diarization_debug(name: str, result: DiarizationResult, debug_dir: str) -> None:
     """Write raw diarization output to {debug_dir}/{stem}/diarization/result.json.
 
     This is the loadable half of the stage: it holds the model's answer (speaker count and
     turns), not the thresholded per-segment attribution, so a --load_debug_dir replay can
     skip the diarization model while still re-deriving labels at new thresholds.
     """
-    stage_dir = _stage_dir(audio_path, "diarization", debug_dir)
+    stage_dir = _stage_dir(name, "diarization", debug_dir)
     # Under segment scope, "speakers" is the set of per-segment local identities, so its
     # length is a count of voices-per-segment summed, not a count of people in the episode.
     # Name it for what it is rather than implying a global speaker count that wasn't computed.
@@ -295,7 +302,7 @@ def write_diarization_debug(audio_path: str, result: DiarizationResult, debug_di
         "num_speakers" if result.get("scope", "file") == "file" else "num_local_speakers"
     )
     output = {
-        "audio_path": os.path.abspath(audio_path),
+        "name": name,
         count_key: len(result["speakers"]),
         **result,
     }
@@ -308,9 +315,9 @@ def write_diarization_debug(audio_path: str, result: DiarizationResult, debug_di
     )
 
 
-def load_diarization_debug(audio_path: str, debug_dir: str) -> Optional[DiarizationResult]:
+def load_diarization_debug(name: str, debug_dir: str) -> Optional[DiarizationResult]:
     """Load diarization output from a previous debug run. Returns None if not present."""
-    stem = _stem(audio_path)
+    stem = _stem(name)
     json_path = os.path.join(debug_dir, stem, "diarization", "result.json")
     if not os.path.isfile(json_path):
         return None
@@ -334,7 +341,7 @@ def load_diarization_debug(audio_path: str, debug_dir: str) -> Optional[Diarizat
 
 
 def write_realign_debug(
-    audio_path: str, transcript_path: str, timings: list, lines: list, debug_dir: str,
+    name: str, transcript_path: str, timings: list, lines: list, debug_dir: str,
 ) -> None:
     """Write the coarse --realign placements to {debug_dir}/{stem}/realign/result.json.
 
@@ -347,10 +354,10 @@ def write_realign_debug(
     transcript matched the recording, and reading it back is much easier than re-running the
     search to find out which lines the aligner was unsure about.
     """
-    stage_dir = _stage_dir(audio_path, "realign", debug_dir)
+    stage_dir = _stage_dir(name, "realign", debug_dir)
     by_index = {line.index: line.text for line in lines}
     output = {
-        "audio_path": os.path.abspath(audio_path),
+        "name": name,
         "transcript_path": os.path.abspath(transcript_path),
         "num_lines": len(timings),
         "num_unplaced": sum(1 for t in timings if not t.placed),
@@ -377,7 +384,7 @@ def write_realign_debug(
 
 
 def write_realign_transform(
-    audio_path: str, transcript_path: str, mode: str, lines: list, timings: list,
+    name: str, transcript_path: str, mode: str, lines: list, timings: list,
     transform, report, dropped, debug_dir: str,
 ) -> None:
     """Write what the fitted transform did, as JSON and as a watchable SRT.
@@ -393,7 +400,7 @@ def write_realign_transform(
     the SRT reports the *residual* move. That is what turns "956 cues moved by a minute" into
     the handful of places where something other than the offset happened.
     """
-    stage_dir = _stage_dir(audio_path, "realign", debug_dir)
+    stage_dir = _stage_dir(name, "realign", debug_dir)
     by_index = {line.index: line for line in lines}
 
     # Which cues sit either side of an edit. Found by source time rather than by cue index,
@@ -450,7 +457,7 @@ def write_realign_transform(
             rows.append((timing.start, timing.end, labels, line.text))
 
     output = {
-        "audio_path": os.path.abspath(audio_path),
+        "name": name,
         "transcript_path": os.path.abspath(transcript_path),
         "mode": mode,
         "scale": round(report.scale, 8),
@@ -533,7 +540,7 @@ def write_labelled_srt(path: str, rows: Iterable[tuple]) -> int:
 
 
 def write_realign_suspects(
-    audio_path: str, segments: List[SingleAlignedSegment], debug_dir: str,
+    name: str, segments: List[SingleAlignedSegment], debug_dir: str,
 ) -> int:
     """Write the doubtful cues to {debug_dir}/{stem}/realign/suspect.srt. Returns the count.
 
@@ -551,7 +558,7 @@ def write_realign_suspects(
         detail = seg.get("realign_detail")
         return f"{reason}: {detail}" if detail else reason
 
-    path = os.path.join(_stage_dir(audio_path, "realign", debug_dir), "suspect.srt")
+    path = os.path.join(_stage_dir(name, "realign", debug_dir), "suspect.srt")
     write_labelled_srt(
         path,
         ((s["start"], s["end"], [labelled(s)], s.get("text", "")) for s in suspects),
@@ -566,7 +573,7 @@ def write_realign_suspects(
 
 
 def write_segment_notes(
-    audio_path: str, segments: List[SingleAlignedSegment], debug_dir: str,
+    name: str, segments: List[SingleAlignedSegment], debug_dir: str,
 ) -> int:
     """Write every annotated cue to {debug_dir}/{stem}/notes/notes.srt. Returns the count.
 
@@ -578,7 +585,7 @@ def write_segment_notes(
     annotated = [s for s in segments if s.get("notes")]
     if not annotated:
         return 0
-    path = os.path.join(_stage_dir(audio_path, "notes", debug_dir), "notes.srt")
+    path = os.path.join(_stage_dir(name, "notes", debug_dir), "notes.srt")
     write_labelled_srt(
         path,
         ((s["start"], s["end"], s["notes"], s.get("text", "")) for s in annotated),
@@ -591,14 +598,14 @@ def write_segment_notes(
     return len(annotated)
 
 
-def load_realign_debug(audio_path: str, transcript_path: str, debug_dir: str) -> Optional[list]:
+def load_realign_debug(name: str, transcript_path: str, debug_dir: str) -> Optional[list]:
     """Load coarse realign placements from a previous debug run, or None if unusable.
 
     A checkpoint written for a *different* transcript is refused rather than reused: the
     placements are indexed by line number, so replaying them against edited text would
     silently attach every cue to the wrong span.
     """
-    stem = _stem(audio_path)
+    stem = _stem(name)
     json_path = os.path.join(debug_dir, stem, "realign", "result.json")
     if not os.path.isfile(json_path):
         return None
@@ -641,7 +648,7 @@ def _assignment_label(segment: SingleAlignedSegment) -> str:
 
 
 def write_speaker_assignment_debug(
-    audio_path: str,
+    name: str,
     segments: List[SingleAlignedSegment],
     debug_dir: str,
 ) -> None:
@@ -657,7 +664,7 @@ def write_speaker_assignment_debug(
     """
     from cantocaptions_ai.utils.output import WriteSRT
 
-    stage_dir = _stage_dir(audio_path, "diarization", debug_dir)
+    stage_dir = _stage_dir(name, "diarization", debug_dir)
 
     assignments = [
         {
@@ -673,7 +680,7 @@ def write_speaker_assignment_debug(
     json_path = os.path.join(stage_dir, "assignments.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
-            {"audio_path": os.path.abspath(audio_path), "assignments": assignments},
+            {"name": name, "assignments": assignments},
             f, ensure_ascii=False, indent=2,
         )
 
@@ -691,7 +698,7 @@ def write_speaker_assignment_debug(
             for segment in segments
         ],
     }
-    WriteSRT(stage_dir)(shadow, audio_path, {})
+    WriteSRT(stage_dir)(shadow, _leaf(name), {})
 
     flagged = sum(1 for a in assignments if a["conflict"])
     logger.info(

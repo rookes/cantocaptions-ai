@@ -248,7 +248,8 @@ class TestBuildSegmentContexts(unittest.TestCase):
         segs = _iv((0.1, 0.2))
         self.assertEqual(build_segment_contexts(segs, self.cues, template="bare"), ["one"])
         self.assertEqual(
-            build_segment_contexts(segs, self.cues, template="labelled"), ["參考翻譯：one"]
+            build_segment_contexts(segs, self.cues, template="labelled"),
+            [CONTEXT_TEMPLATES["labelled"].format(text="one")],
         )
         self.assertTrue(
             build_segment_contexts(segs, self.cues, template="instruct")[0].endswith("one")
@@ -499,5 +500,5 @@ class TestRestrictToSpans(unittest.TestCase):
                 _iv((0.0, 3.0)), self.cues, template="labelled",
                 restrict_to_spans=[[1.2, 1.8]],
             ),
-            ["參考翻譯：two"],
+            [CONTEXT_TEMPLATES["labelled"].format(text="two")],
         )

@@ -51,14 +51,6 @@ class PipelineResult:
     empty: bool = False
 
 
-def _writer_args(cfg: PipelineConfig) -> dict:
-    return {
-        "highlight_words": cfg.highlight_words,
-        "max_line_count": cfg.max_line_count,
-        "max_line_width": cfg.max_line_width,
-    }
-
-
 def run_pipeline(
     audio_path: str,
     cfg: PipelineConfig,
@@ -86,7 +78,7 @@ def run_pipeline(
         validate_config,
     )
     from cantocaptions_ai.utils.audio import validate_input_file
-    from cantocaptions_ai.utils.output import render_result
+    from cantocaptions_ai.utils.output import render_result, writer_args
 
     if cfg.output_format == "all":
         raise ConfigError(
@@ -112,7 +104,7 @@ def run_pipeline(
     finally:
         _cleanup_temp_files(temp_files)
 
-    language = cfg.language or "yue"
+    language = cfg.language
     if not results:
         return PipelineResult(
             subtitle_text="", output_format=cfg.output_format, language=language,
@@ -121,7 +113,7 @@ def run_pipeline(
 
     result = results[0]["result"]
     segments = result.get("segments", [])
-    subtitle_text = render_result(result, cfg.output_format, _writer_args(cfg))
+    subtitle_text = render_result(result, cfg.output_format, writer_args(cfg))
     return PipelineResult(
         subtitle_text=subtitle_text,
         output_format=cfg.output_format,

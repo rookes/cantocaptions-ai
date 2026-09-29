@@ -53,7 +53,7 @@ def _paths(name):
 def cache(args):
     """Run split-only VAD and the align encoder once, and store the result plus the answer key."""
     from cantocaptions_ai.pipeline.alignment import (
-        _compute_vad_emissions_batched, load_align_model, load_bert_processor,
+        _compute_vad_emissions_batched, load_align_model,
     )
     from cantocaptions_ai.pipeline.vad import load_vad
 
@@ -63,8 +63,8 @@ def cache(args):
     segments = vad.process(audio)
     print(f"{len(segments)} contiguous chunks covering {segments[-1]['end']:.1f}s")
 
-    processor = load_bert_processor()
     model, meta = load_align_model(args.language, args.device, compute_type="float32")
+    processor = meta["processor"]
     results = _compute_vad_emissions_batched(
         segments, model, processor, args.device, args.batch_size,
         vram_checks=False, primer=meta["profile"].primer,

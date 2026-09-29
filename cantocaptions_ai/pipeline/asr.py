@@ -26,6 +26,8 @@ def _has_native_qwen3asr() -> bool:
 
 def _normalize_language(language: str) -> str:
     """Convert an ISO code or bare name to the canonical Qwen3-ASR form (e.g. 'yue' → 'Cantonese')."""
+    if not language:
+        raise ValueError("an ASR language is required (e.g. 'yue'); there is no auto-detection")
     longname = LANGUAGES.get(language, language)
     return longname[:1].upper() + longname[1:].lower()
 
@@ -45,6 +47,8 @@ class QwenPipeline(PipelineStage["List[VadAudioSegment]", "TranscriptionResult"]
       QwenPipelineNative (_asr_native.py) — official transformers qwen3_asr support, -hf model (`transformers_qwen` extra)
     """
 
+    debug_stage = "transcription"
+
     @staticmethod
     def read_debug(audio_path, debug_dir): return load_transcription_debug(audio_path, debug_dir)
 
@@ -56,7 +60,7 @@ class QwenPipeline(PipelineStage["List[VadAudioSegment]", "TranscriptionResult"]
 
     @staticmethod
     def _pack(item, result):
-        return {'audio_path': item['audio_path'], 'result': result, 'vad_segments': item['vad_segments']}
+        return {**item, 'result': result}
 
     @abstractmethod
     def process(
@@ -78,11 +82,8 @@ def load_model(
     device_index: int = 0,
     compute_type: str = "default",
     attn_implementation: str = "sdpa",
-    asr_options: Optional[dict] = None,
     language: Optional[str] = "yue",
-    vocal_isolation_method: Optional[str] = None,
     model=None,
-    task: str = "transcribe",
     download_root: Optional[str] = None,
     local_files_only: bool = False,
     threads: int = 4,

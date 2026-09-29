@@ -44,6 +44,17 @@ from cantocaptions_ai.utils.log_utils import get_logger
 logger = get_logger(__name__)
 
 
+def linebreak_step(line_max_length: int, max_line_count: Optional[int]) -> Optional[Callable[[str], str]]:
+    """The line-layout step for these line limits, or None where no break is allowed.
+
+    Shared by the cleaner's ``linebreak`` builtin and by the pipeline's layout pass when
+    cleaning is off, so ``max_line_width``/``max_line_count`` mean the same either way.
+    """
+    if max_line_count is not None and max_line_count < 2:
+        return None  # a single-line output can't take a break
+    return lambda text: linebreak(text, line_max_length)
+
+
 class SubtitleCleaner:
     """Applies the configured cleaning steps to a single subtitle line at a time."""
 
@@ -112,9 +123,9 @@ class SubtitleCleaner:
             elif step_type == "builtin":
                 name = entry.get("name")
                 if name == "linebreak":
-                    if self.max_line_count is not None and self.max_line_count < 2:
-                        continue  # a single-line output can't take a break
-                    steps.append((name, lambda text: linebreak(text, self.line_max_length)))
+                    step = linebreak_step(self.line_max_length, self.max_line_count)
+                    if step is not None:
+                        steps.append((name, step))
                 elif name in self.BUILTIN_STEPS:
                     steps.append((name, self.BUILTIN_STEPS[name]))
                 else:

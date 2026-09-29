@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     formatter_class = functools.partial(ConfigAwareHelpFormatter, defaults=PipelineConfig.defaults())
     parser = argparse.ArgumentParser(formatter_class=formatter_class)
     parser.add_argument("audio", nargs="*", type=str, help="audio file(s) to transcribe")
-    parser.add_argument("--language", type=str, default=argparse.SUPPRESS, choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio, specify None to perform language detection")
+    parser.add_argument("--language", type=str, default=argparse.SUPPRESS, choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio (required; only yue/Cantonese is fully supported)")
     parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {importlib.metadata.version('cantocaptions-ai')}", help="Show cantocaptions-ai version information and exit")
     parser.add_argument("--python-version", "-P", action="version", version=f"Python {platform.python_version()} ({platform.python_implementation()})", help="Show python version information and exit")
 
@@ -124,14 +124,6 @@ def build_parser() -> argparse.ArgumentParser:
     isol_grp.add_argument("--vocal_isolation_segment_mode", default=argparse.SUPPRESS, type=str, choices=["whole", "chunked"], help="how the isolation model consumes a segment: 'whole' runs one pass at the segment's natural length (~2.5x faster, no chunk seams), 'chunked' slides a fixed 8s window with overlap-add. Must match what the downstream ASR model was trained on. Defaults to the bundled model config.")
     isol_grp.add_argument("--vocal_isolation", "-vi", choices=["fast", "quality"], default=argparse.SUPPRESS, help="shorthand for --vocal_isolation_compute_type (fast=float16, quality=float32). Does NOT affect --vocal_isolation_batch_size (see its own help text: larger batches give little/no speedup on this model and can regress sharply). The granular --vocal_isolation_compute_type flag always wins if both are given.")
 
-    asr_grp = parser.add_argument_group("asr options")
-    asr_grp.add_argument("--suppress_tokens", type=str, default=argparse.SUPPRESS, help="comma-separated list of token ids to suppress during sampling; '-1' will suppress most special characters except common punctuations")
-    asr_grp.add_argument("--suppress_numerals", action="store_true", default=argparse.SUPPRESS, help="whether to suppress numeric symbols and currency symbols during sampling, since wav2vec2 cannot align them correctly")
-    asr_grp.add_argument("--initial_prompt", type=str, default=argparse.SUPPRESS, help="optional text to provide as a prompt for the first window.")
-    asr_grp.add_argument("--hotwords", type=str, default=argparse.SUPPRESS, help="hotwords/hint phrases to the model (e.g. \"WhisperX, PyAnnote, GPU\"); improves recognition of rare/technical terms")
-    asr_grp.add_argument("--condition_on_previous_text", type=str2bool, default=argparse.SUPPRESS, help="if True, provide the previous output of the model as a prompt for the next window; disabling may make the text inconsistent across windows, but the model becomes less prone to getting stuck in a failure loop")
-    asr_grp.add_argument("--fp16", type=str2bool, default=argparse.SUPPRESS, help="whether to perform inference in fp16; True by default")
-
     ensemble_grp = parser.add_argument_group("ensemble & LLM correction")
     ensemble_grp.add_argument("--ensemble_model", type=str, default=argparse.SUPPRESS, choices=["none", "whisper"], help="second ASR model for ensemble correction; 'whisper' runs alvanlii/whisper-small-cantonese via faster-whisper alongside the primary model (requires pip install 'cantocaptions_ai[ensemble]')")
     ensemble_grp.add_argument("--llm_correction", action="store_true", default=argparse.SUPPRESS, help="run LLM-based per-segment particle correction and full-document name normalization after transcription")
@@ -155,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     align_grp.add_argument("--interpolate_method", default=argparse.SUPPRESS, choices=["nearest", "linear", "ignore"], help="For word .srt, method to assign timestamps to non-aligned words, or merge them into neighbouring.")
     align_grp.add_argument("--no_align", action='store_true', default=argparse.SUPPRESS, help="Do not perform phoneme alignment")
     align_grp.add_argument("--return_char_alignments", action='store_true', default=argparse.SUPPRESS, help="Return character-level alignments in the output json file")
-    align_grp.add_argument("--align_padding", type=float, default=argparse.SUPPRESS, help="The minimum allowed timebetween subttitles.")
+    align_grp.add_argument("--align_padding", type=float, default=argparse.SUPPRESS, help="seconds of gap left between consecutive subtitles where alignment would otherwise make them touch or overlap")
     align_grp.add_argument("--align_release", type=float, default=argparse.SUPPRESS, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
     align_grp.add_argument("--align_merge_distance", type=float, default=argparse.SUPPRESS, help="The maximum distance between utterances that allows them to be merged.")
     align_grp.add_argument("--min_cue_duration", type=float, default=argparse.SUPPRESS, help="subtitles shorter than this (seconds) are merged into a neighbouring cue, dropped if they are pure interjection noise, or held longer; 0 disables all three")
@@ -170,8 +162,6 @@ def build_parser() -> argparse.ArgumentParser:
     subtitle_grp = parser.add_argument_group("subtitle formatting")
     subtitle_grp.add_argument("--max_line_width", type=optional_int, default=argparse.SUPPRESS, help="(not possible with --no_align) the maximum number of characters in a line before text cleaning breaks the line")
     subtitle_grp.add_argument("--max_line_count", type=optional_int, default=argparse.SUPPRESS, help="(not possible with --no_align) the maximum number of lines in a segment; text cleaning only breaks lines when this is 2 or more")
-    subtitle_grp.add_argument("--highlight_words", type=str2bool, default=argparse.SUPPRESS, help="(not possible with --no_align) underline each word as it is spoken in srt and vtt")
-    subtitle_grp.add_argument("--segment_resolution", type=str, default=argparse.SUPPRESS, choices=["sentence", "chunk"], help="(not possible with --no_align) the maximum number of characters in a line before breaking the line")
 
     clean_grp = parser.add_argument_group("text cleaning")
     clean_grp.add_argument("--no_clean_text", action="store_true", default=argparse.SUPPRESS, help="disable Cantonese subtitle text cleaning (punctuation, HK conventions, particle fixes, interjection removal, line breaking)")
@@ -236,7 +226,7 @@ def cli():
 
     from cantocaptions_ai.pipeline.transcribe import transcribe_task
 
-    transcribe_task(merged, parser)
+    transcribe_task(merged, parser, input_dir=input_dir)
 
 if __name__ == "__main__":
     cli()

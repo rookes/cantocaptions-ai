@@ -90,14 +90,6 @@ class PipelineConfig:
     # that pass segment_mode=None instead defer to the bundled model yaml.)
     vocal_isolation_segment_mode: str = "chunked"
 
-    # ASR options
-    suppress_tokens: str = "-1"
-    suppress_numerals: bool = False
-    initial_prompt: Optional[str] = None
-    hotwords: Optional[str] = None
-    condition_on_previous_text: bool = False
-    fp16: bool = True
-
     # Ensemble & LLM correction
     ensemble_model: str = "none"
     llm_correction: bool = False
@@ -134,8 +126,6 @@ class PipelineConfig:
     # Subtitle formatting
     max_line_width: Optional[int] = 18
     max_line_count: Optional[int] = 2
-    highlight_words: bool = False
-    segment_resolution: str = "sentence"
 
     # Text cleaning
     no_clean_text: bool = False

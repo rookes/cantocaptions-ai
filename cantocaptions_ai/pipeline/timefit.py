@@ -89,7 +89,7 @@ MIN_BREAK_JUMP = 0.4
 
 # Floor on the outlier-trim threshold, which is otherwise four scaled MADs. A very tight fit
 # would otherwise start trimming anchors that sit at the edge of ordinary jitter.
-OUTLIER_TOLERANCE = 0.5 # Changed from 1.0 for testing
+OUTLIER_TOLERANCE = 0.5
 MAX_TRIM_ROUNDS = 3
 
 # Below either of these the fit is refused and the caller falls back (the identity for sync,
@@ -126,7 +126,7 @@ REASON_NO_AUDIO = "no_audio"
 # directly (see prune_to_density), and everywhere else falls back to interpolation between
 # whichever of those survive nearby -- the discipline the file-wide transform was fitted for
 # in the first place, rather than 800-950 individually-trusted acoustic opinions.
-TARGET_ANCHORS_PER_MINUTE = 3.0 # Changed from 3 for testing
+TARGET_ANCHORS_PER_MINUTE = 3.0
 MIN_ANCHORS_PER_PIECE = 3
 
 # Common frame-rate conversions, for naming a fitted scale in the log. NAMING ONLY -- the fit
@@ -140,7 +140,7 @@ _RATIOS = (
     ("30 -> 29.97 fps", 30.0 / (30000.0 / 1001.0)),
 )
 # Relative, and tight enough to keep 25/23.976 and 25/24 (0.1% apart) from both matching.
-_RATIO_TOLERANCE = 0.0008 # Changed from 0.0008 for testing
+_RATIO_TOLERANCE = 0.0008
 
 
 class TransformError(ValueError):
@@ -1087,23 +1087,6 @@ def _trim_overlaps(
         prev = i
 
 
-def _pad_starts(
-    out: List[Optional[Tuple[float, float, Optional[str]]]], pad: float, file_start: float,
-) -> None:
-    """Shift every start earlier by *pad*, as the last thing done to any cue's timing.
-
-    A viewer forgives a subtitle appearing a frame before the words start far more readily
-    than one appearing a frame after -- see the CLAUDE.md note on why even one frame late is
-    treated as a real defect here, not a rounding nuance. So every start is nudged the same
-    direction on principle, not only the ones a fit happened to place late.
-    """
-    for i, row in enumerate(out):
-        if row is None:
-            continue
-        start = max(file_start, row[0] - pad)
-        out[i] = (round(start, 3), row[1], row[2])
-
-
 def map_cues(
     transform: Transform,
     spans: Sequence[Tuple[float, float]],
@@ -1137,13 +1120,9 @@ def map_cues(
     single piece-wide average -- the direct extension of "anchors only, starts only" to a
     cue's other endpoint, which was never itself an anchor.
 
-    Two passes run after every cue has a first-draft timing, in this order and not the
-    reverse: ``_trim_overlaps`` resolves any cue whose neighbour's own (independently derived)
-    timing now runs into it, then ``_pad_starts`` shifts every start earlier by
-    ``align_padding`` as the very last thing that happens. Doing the trim first means a pair
-    the trim actually touched comes out of padding exactly flush (the same amount is
-    subtracted from both sides of the join), not padding first and hoping the trim has
-    nothing left to fix.
+    After every cue has a first-draft timing, ``_trim_overlaps`` resolves any cue whose
+    neighbour's own (independently derived) timing now runs into it, leaving a gap of
+    ``align_padding`` at the join. Starts are never moved here.
     """
     if cut_policy not in ("drop", "keep"):
         raise ValueError(f"unknown cut policy: {cut_policy!r}")
@@ -1182,13 +1161,6 @@ def map_cues(
         out.append((round(start, 3), round(end, 3), reason))
 
     _trim_overlaps(out, align_padding, min_visible)
-
-    # Removing universal shift for now. Still keeping align_padding to use as padding
-    # distance between subtitles.
-    #
-    # if align_padding:
-    #    _pad_starts(out, align_padding, file_start)
-
     return out
 
 
@@ -1254,7 +1226,7 @@ def _clock(seconds: float) -> str:
 
 
 def report_transform(report: TransformReport, total_cues: int) -> None:
-    """Say what happened, loudly where it was drastic. See CLAUDE.md on --realign_mode."""
+    """Say what happened, loudly where it was drastic (see --realign_mode in the README)."""
     if report.refused:
         logger.warning(
             "realign: no usable transform was fitted; timings are unchanged. Check that the "

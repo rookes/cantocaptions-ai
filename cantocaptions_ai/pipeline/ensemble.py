@@ -12,6 +12,8 @@ logger = get_logger(__name__)
 class FasterWhisperEnsemble(PipelineStage["List[VadAudioSegment]", "List[str]"]):
     """Second ASR model (faster-whisper) for ensemble transcription."""
 
+    debug_stage = "ensemble"
+
     def __init__(self, model, device: str) -> None:
         self._model = model
         self._device = device

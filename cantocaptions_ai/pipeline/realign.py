@@ -235,7 +235,7 @@ ACQUIRE_MIN_SCORE = 0.45
 # ...and what a single line must reach, and hold in characters, to become an anchor. Anchors
 # are the load-bearing part: a wrong one misplaces everything filled around it, while a
 # missing one costs nothing because the fill covers it. So this is deliberately strict.
-ANCHOR_MIN_SCORE = 0.75 # Changed from 0.55 for testing
+ANCHOR_MIN_SCORE = 0.75
 ANCHOR_MIN_CHARS = 4
 
 # Consecutive windows overlap by this much, so a line near a window's far edge gets a second,
@@ -275,8 +275,8 @@ UNCONSTRAINED_ROOM = 1.5
 # The two sources of evidence fail in opposite ways, which is why neither is trusted alone. The
 # transform is global and cannot be locally wrong by much -- it is fitted to hundreds of
 # anchors -- but it is also blind to anything smaller than a piece. Forced alignment is exact
-# where it can read the audio and confidently wrong where it cannot, and CLAUDE.md records that
-# the confidence score does not distinguish the two. So the transform bounds the aligner, and
+# where it can read the audio and confidently wrong where it cannot, and its confidence score
+# does not distinguish the two (see the ``May呀`` example above). So the transform bounds the aligner, and
 # within the bound the aligner wins.
 ADJUST_TOLERANCE = 2.0
 
@@ -352,7 +352,7 @@ class LineTiming:
         return self.reason is None
 
 
-# What to do with the timings a --realign input already carries. See CLAUDE.md.
+# What to do with the timings a --realign input already carries; see PipelineConfig.realign_mode.
 REALIGN_MODES = ("transcript", "sync", "adjust")
 
 

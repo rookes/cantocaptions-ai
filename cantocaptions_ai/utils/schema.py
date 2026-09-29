@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, TypedDict, Optional, List, Tuple, Union
 
 import numpy as np
@@ -185,6 +186,7 @@ class DiarizationResult(TypedDict):
 class VadItem(TypedDict):
     """Intermediate carrier for the VAD and vocal-isolation stages (before transcription)."""
     audio_path: str
+    name: NotRequired[str]  # output/debug name; see utils.output.output_names
     vad_segments: List[VadAudioSegment]
     audio_track: NotRequired[int]
     audio_downmix: NotRequired[str]
@@ -193,6 +195,7 @@ class VadItem(TypedDict):
 class ProcessingItem(TypedDict):
     """Carries one audio file's data from transcription onwards."""
     audio_path: str
+    name: NotRequired[str]  # output/debug name; see utils.output.output_names
     result: Union[TranscriptionResult, AlignedTranscriptionResult]
     vad_segments: NotRequired[List[VadAudioSegment]]
     audio_downmix: NotRequired[str]
@@ -204,6 +207,18 @@ class ProcessingItem(TypedDict):
     # reused by alignment so the encoder runs once rather than twice. Not serialisable and
     # never checkpointed; see realign.EmissionTimeline.
     emission_timeline: NotRequired[object]
+
+
+def item_name(item: dict) -> str:
+    """The name an item's outputs and debug checkpoints are keyed by.
+
+    ``_execute_pipeline`` sets ``item['name']`` from ``utils.output.output_names``; an item
+    built without one (a direct stage call) falls back to the file's stem.
+    """
+    name = item.get("name")
+    if name:
+        return name
+    return Path(item["audio_path"]).stem.strip()
 
 
 def add_note(segment: SingleAlignedSegment, note: str) -> None:

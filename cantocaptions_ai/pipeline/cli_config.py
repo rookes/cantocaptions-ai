@@ -2,7 +2,12 @@
 
 Precedence (lowest -> highest):
     PipelineConfig.defaults()  ->  one cfg file (default.cfg or --cfg NAME)
+    ->  config/user.cfg (personal overrides, gitignored; optional)
     ->  stage-preset flags (--vocal_isolation/--asr/--align)  ->  explicit CLI flags
+
+The config directory is ./config if the working directory has one, else the
+config/ beside the package in a source checkout. With neither (an installed
+package run from elsewhere) no file is read and the built-in defaults apply.
 
 Config files are INI (stdlib configparser), one ``[pipeline]`` section, read
 as raw strings and coerced using each argparse action's own ``type=``/
@@ -18,10 +23,12 @@ that a value cannot itself contain a literal ``#``; nothing the pipeline takes
 
 Only PipelineConfig field names are legal cfg-file keys; CLI-only args
 (log_level, log_file, input_dir, recursive, cfg, and the 3 preset dests
-themselves) are rejected as "unknown key" if present in a cfg file.
+themselves) are rejected as "unknown key" if present in a cfg file. Keys in
+REMOVED_KEYS (fields since deleted) are skipped with a warning instead.
 """
 import argparse
 import configparser
+import warnings
 from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -31,9 +38,22 @@ from cantocaptions_ai.utils.output import str2bool
 
 CONFIG_DIR_NAME = "config"
 DEFAULT_CFG_FILENAME = "default.cfg"
+USER_CFG_FILENAME = "user.cfg"
+
+# config/ in a source checkout: cantocaptions_ai/pipeline/cli_config.py -> repo root.
+_REPO_CONFIG_DIR = Path(__file__).resolve().parents[2] / CONFIG_DIR_NAME
 _SECTION = "pipeline"
 
 _PIPELINE_FIELD_NAMES = {f.name for f in fields(PipelineConfig)}
+
+# Keys that were once PipelineConfig fields and have since been removed because nothing
+# read them (Whisper-era ASR options the Qwen backends never supported, and formatting
+# switches no writer implemented). A cfg file written before the removal still loads: the
+# key is skipped with a warning rather than failing as an unknown key.
+REMOVED_KEYS = frozenset({
+    "fp16", "segment_resolution", "highlight_words", "initial_prompt", "hotwords",
+    "suppress_tokens", "suppress_numerals", "condition_on_previous_text",
+})
 
 # One entry per stage-preset flag: dest -> tier name -> the field(s) it sets.
 _STAGE_PRESETS: Dict[str, Dict[str, Dict[str, str]]] = {
@@ -52,11 +72,20 @@ _STAGE_PRESETS: Dict[str, Dict[str, Dict[str, str]]] = {
 }
 
 
-def default_config_dir() -> Path:
-    """config/ relative to the CWD at invocation (not package-relative) --
-    matches this project's `uv run cantocaptions` dev-from-repo-root workflow.
+def default_config_dir() -> Optional[Path]:
+    """The config directory to read, or None if there is none.
+
+    ./config wins when the working directory has one (the `uv run cantocaptions`
+    from-the-repo-root workflow). Otherwise the checkout's own config/ is used, so
+    running from another directory still reads your settings instead of silently
+    creating a fresh config/default.cfg wherever you happen to be.
     """
-    return Path.cwd() / CONFIG_DIR_NAME
+    cwd_dir = Path.cwd() / CONFIG_DIR_NAME
+    if cwd_dir.is_dir():
+        return cwd_dir
+    if _REPO_CONFIG_DIR.is_dir():
+        return _REPO_CONFIG_DIR
+    return None
 
 
 def _is_bool_flag(action: argparse.Action) -> bool:
@@ -85,12 +114,21 @@ def resolve_cfg_path(
     cfg_name: Optional[str],
     parser: argparse.ArgumentParser,
     config_dir: Optional[Path] = None,
-) -> Path:
+) -> Optional[Path]:
     """cfg_name is None -> auto-create/reuse config/default.cfg. Otherwise
     resolve config/{cfg_name}.cfg, erroring out (parser.error) if it doesn't
     exist -- same style as __main__.py's existing --input_dir validation.
+
+    Returns None (built-in defaults only) when no config directory was found.
     """
     config_dir = config_dir if config_dir is not None else default_config_dir()
+    if config_dir is None:
+        if cfg_name is not None:
+            parser.error(
+                f"--cfg '{cfg_name}': no config directory found "
+                f"(looked for ./{CONFIG_DIR_NAME} and {_REPO_CONFIG_DIR})"
+            )
+        return None
     if cfg_name is None:
         return ensure_default_cfg_exists(config_dir)
 
@@ -127,6 +165,12 @@ def load_cfg_file(path: Path, parser: argparse.ArgumentParser) -> Dict[str, Any]
     }
     resolved: Dict[str, Any] = {}
     for key, raw in cp[_SECTION].items():
+        if key in REMOVED_KEYS:
+            warnings.warn(
+                f"{path}: '{key}' has been removed and is ignored (it never had any "
+                f"effect); delete it from the file to silence this warning"
+            )
+            continue
         action = dest_to_action.get(key)
         if action is None:
             parser.error(f"{path}: unknown config key '{key}'")
@@ -161,8 +205,11 @@ def resolve_pipeline_args(
     explicit: Dict[str, Any],
     config_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """The 4-layer merge: dataclass defaults -> cfg file -> stage presets ->
-    explicit CLI flags.
+    """The 5-layer merge: dataclass defaults -> cfg file -> user.cfg -> stage
+    presets -> explicit CLI flags.
+
+    user.cfg sits above whichever cfg was selected, so personal settings (batch
+    sizes for your card, a gated model you have access to) hold under --cfg too.
 
     `explicit` is vars(parser.parse_args()); thanks to default=argparse.SUPPRESS
     on every add_argument() in __main__.py, it contains ONLY keys the user
@@ -174,8 +221,13 @@ def resolve_pipeline_args(
     -- so a plain dict-merge makes the granular flag win with no special-case
     code, regardless of argument order on the command line.
     """
+    config_dir = config_dir if config_dir is not None else default_config_dir()
     cfg_path = resolve_cfg_path(explicit.get("cfg"), parser, config_dir)
-    cfg_layer = load_cfg_file(cfg_path, parser)
+    cfg_layer = load_cfg_file(cfg_path, parser) if cfg_path is not None else {}
+    user_path = config_dir / USER_CFG_FILENAME if config_dir is not None else None
+    user_layer = (
+        load_cfg_file(user_path, parser) if user_path is not None and user_path.is_file() else {}
+    )
 
     preset_layer: Dict[str, Any] = {}
     for preset_dest, tiers in _STAGE_PRESETS.items():
@@ -183,7 +235,7 @@ def resolve_pipeline_args(
         if tier is not None:
             preset_layer.update(tiers[tier])
 
-    return {**PipelineConfig.defaults(), **cfg_layer, **preset_layer, **explicit}
+    return {**PipelineConfig.defaults(), **cfg_layer, **user_layer, **preset_layer, **explicit}
 
 
 class ConfigAwareHelpFormatter(argparse.HelpFormatter):

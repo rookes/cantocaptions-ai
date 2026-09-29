@@ -280,7 +280,7 @@ class TestNotesSrt(unittest.TestCase):
              "notes": ["homophone:駒→區"]},
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(write_segment_notes("film.wav", segments, tmp), 1)
+            self.assertEqual(write_segment_notes("film", segments, tmp), 1)
             path = os.path.join(tmp, "film", "notes", "notes.srt")
             with open(path, encoding="utf-8") as fh:
                 body = fh.read()
@@ -292,7 +292,7 @@ class TestNotesSrt(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(
-                write_segment_notes("film.wav", [{"start": 0.0, "end": 1.0, "text": "a"}], tmp),
+                write_segment_notes("film", [{"start": 0.0, "end": 1.0, "text": "a"}], tmp),
                 0)
             self.assertFalse(os.path.exists(os.path.join(tmp, "film", "notes")))
 
