@@ -64,11 +64,13 @@ holding only the keys you want to change). Settings are layered, each overriding
 4. the `--vocal_isolation` / `--asr` / `--align` presets
 5. flags you type
 
-`language` defaults to `yue`, the one language supported end to end. Another language runs as a raw
-pipeline -- transcribed, aligned, split into cues and laid out with that language's conventions (spaces
-between words, Latin punctuation, word-wrapped lines), but not cleaned -- and needs you to supply what is
-Cantonese-specific: a `--model` that transcribes it, an `--align_model` if there is no built-in default for
-it (most languages have one), and `--no_clean_text`. The error message names whatever is missing.
+`language` defaults to `yue`, the one language with a full language pack: it alone picks the ASR model,
+alignment model, cleaning rules and subtitle conventions, so nothing else needs setting. Another language
+runs as a raw pipeline -- transcribed, aligned, split into cues and laid out with that language's
+conventions (spaces between words, Latin punctuation, word-wrapped lines), but not cleaned -- and needs you
+to supply what its pack lacks: a `--model` that transcribes it, an `--align_model` if there is no built-in
+default for it (most languages have one), and `--no_clean_text`. The error message names whatever is
+missing. To add a language properly, see [docs/adding-a-language.md](docs/adding-a-language.md).
 
 For video files, the audio track is chosen from the stream tags by language (for `yue`: a Cantonese
 track, then any Chinese one). Pass `--audio_track N` when a release's tags are missing or wrong.
@@ -84,7 +86,8 @@ Run `uv run cantocaptions_ai --help` to display the complete flag list.
 
 ### ASR Model selection
 
-`model` picks the transcription model. The default, `cantocaptions-cantonese-ASR`, is
+`model` picks the transcription model; left unset, the language's own is used. For Cantonese that is
+`cantocaptions-cantonese-ASR`,
 [a fine-tune of Qwen3-ASR](https://huggingface.co/rookes/cantocaptions-cantonese-asr) trained on the
 CantoCaptions dataset. It already writes HK-style written Cantonese and even distinguishes sentence-final 
 particles by tone (e.g. 啦 laa1 / 喇 laa3), so less post-processing is necessary to clean things up. This is
@@ -138,7 +141,7 @@ After alignment, subtitles are split and re-merged to maintain output standards.
 * `max_line_width` / `max_line_count` (default: 18 / 2) — control forced line breaks and how text is wrapped
 
 More extensive text processing, such as OpenCC simplified -> traditional options and regex substitutions, are configurable via .toml
-files in `cantocaptions-ai/cantonese`.
+files in `cantocaptions_ai/languages/yue/rules/` (point `--clean_rules_dir` at a copy to use your own).
 
 ### Speaker separation (diarization)
 
@@ -267,23 +270,24 @@ stages over every input file: VAD → vocal isolation (optional) → ASR → ens
 (optional) → forced alignment → diarization (optional) → cue assembly and text cleaning → writers.
 Each model-backed stage is a `PipelineStage` (`utils/model_utils.py`) with its own debug checkpoint.
 
-Behaviour that depends on a particular model is looked up rather than hard-coded:
+Everything that depends on the language is gathered into one **language pack** per language
+(`cantocaptions_ai/languages/`): how it is written (`ScriptConfig`, `PunctuationConfig` from
+`text_profiles.py`), its default ASR and alignment models, how each ASR model writes it (normalization,
+particle spot-checks, cue markers, cleaning manifest), its cleaning rules and builtin steps, its audio-track
+preference, and its LLM correction prompts and ensemble model. `get_language_pack(code).resolve(model)` gives
+the stages what they need; a language with no pack gets a generic one, enough to run raw. The Cantonese pack
+is `languages/yue/`; the old `cantocaptions_ai.cantonese` import paths still work.
 
-* `pipeline/model_profiles.py` — per ASR model: text normalization, punctuation, particle spot-checks,
-  cue-assembly markers and which cleaning manifest to use.
+Behaviour that depends on a particular model rather than a language is looked up per model:
+
+* `pipeline/model_profiles.py` — per ASR model: where its weights are, and which languages it is trained for.
 * `pipeline/align_profiles.py` — per alignment model: audio primer, hand-picked character substitutions
   and the default substitution level (Jyutping homophones only for the Cantonese model), internal-gap
   splitting, minimum input length. The model's own processor and emission frame rate come with it from
   `load_align_model`.
 
-How a language is *written* is described by the value types in `cantocaptions_ai/text_profiles.py`:
-`PunctuationConfig`, and `ScriptConfig` (what joins two pieces of text, the default line width, which line
-breaker). A model profile may pin them; `ModelProfile.for_language` fills in whatever it leaves unset from
-the run's language, and cue assembly, alignment, realign and line layout all take them as arguments.
-
-Cantonese-specific text handling lives in `cantocaptions_ai/cantonese/` (cleaning rules and builtin
-steps, numerals, the CJK line breaker, particles). What remains tied to one language is registered per
-language and checked by `validate_config`: `model_profiles.FULLY_SUPPORTED_LANGUAGES`, the LLM correction
-prompts (`llm_correction.CORRECTION_PROMPTS`) and the ensemble model (`ensemble.ENSEMBLE_MODELS`).
+Text cleaning is a language-independent engine (`cantocaptions_ai/cleaning/`: a manifest of TOML regex rule
+files and coded builtin steps) that each pack supplies with rules; cue assembly, alignment, realign and line
+layout take the pack's script and punctuation as arguments.
 
 Thank you to everyone from the CantoCaptions community and Discord for their support and testing on this project.
