@@ -343,9 +343,9 @@ class TestSpotcheckGuard(unittest.TestCase):
         # substituted and the guard is inert in practice. This asserts the half a unit test
         # can: given a vocabulary holding them, augment leaves them alone and the table
         # comes back untouched.
-        from cantocaptions_ai.pipeline.model_profiles import get_model_profile
+        from cantocaptions_ai.languages import get_language_pack
 
-        checks = get_model_profile("Qwen3-ASR").spotchecks
+        checks = get_language_pack("yue").resolve("Qwen3-ASR").spotchecks
         chars = set(checks) | {c for check in checks.values() for c in check.candidates}
         repair = VocabRepair(dictionary(*chars), LEVEL_NEAR)
         repair.augment(["".join(sorted(chars))])

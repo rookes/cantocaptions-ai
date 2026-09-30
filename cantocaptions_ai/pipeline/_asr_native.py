@@ -336,6 +336,7 @@ def load_model_native(
     vram_checks: bool = True,
     vram_headroom_mb: int = 512,
     processor=None,
+    normalization=None,
 ) -> QwenPipelineNative:
     """Build the native ASR pipeline, loading whatever the caller did not supply.
 
@@ -348,8 +349,10 @@ def load_model_native(
     """
     from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-    profile = get_model_profile(model_name)
-    model_id = profile.hf_id
+    from cantocaptions_ai.pipeline.asr import _resolve_normalization
+
+    model_id = get_model_profile(model_name, language).hf_id
+    normalization = _resolve_normalization(model_name, language, normalization)
 
     if model is None or processor is None:
         try:
@@ -415,5 +418,5 @@ def load_model_native(
         print_progress=print_progress,
         verbose=verbose,
         vram_checks=vram_checks,
-        normalization=profile.normalization,
+        normalization=normalization,
     )

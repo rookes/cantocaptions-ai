@@ -9,11 +9,20 @@ from cantocaptions_ai.utils.log_utils import get_logger
 logger = get_logger(__name__)
 
 
-# The second-opinion model per language: (hub repo, CTranslate2 subfolder in it).
-# validate_config refuses ensemble_model for a language with no entry.
-ENSEMBLE_MODELS: Dict[str, Tuple[str, str]] = {
-    "yue": ("alvanlii/whisper-small-cantonese", "cts"),
-}
+def ensemble_model_for(language: str) -> Optional[Tuple[str, str]]:
+    """The language pack's second-opinion model: (hub repo, CTranslate2 subfolder in it).
+    validate_config refuses ensemble_model for a language whose pack has none."""
+    from cantocaptions_ai.languages import get_language_pack
+    return get_language_pack(language).ensemble_model
+
+
+def _ensemble_models() -> Dict[str, Tuple[str, str]]:
+    from cantocaptions_ai.languages import LANGUAGE_PACKS
+    return {code: p.ensemble_model for code, p in LANGUAGE_PACKS.items() if p.ensemble_model}
+
+
+# Snapshot of the registered packs' ensemble models, for callers that read a table.
+ENSEMBLE_MODELS: Dict[str, Tuple[str, str]] = _ensemble_models()
 
 
 class FasterWhisperEnsemble(PipelineStage["List[VadAudioSegment]", "List[str]"]):
@@ -86,7 +95,8 @@ def load_faster_whisper(
 
     Raises ImportError if faster-whisper is not installed.
     """
-    default_id, default_subfolder = ENSEMBLE_MODELS.get(language, ENSEMBLE_MODELS["yue"])
+    default_id, default_subfolder = (
+        ensemble_model_for(language) or ensemble_model_for("yue"))
     model_id = model_id or default_id
     model_subfolder = model_subfolder or default_subfolder
     try:

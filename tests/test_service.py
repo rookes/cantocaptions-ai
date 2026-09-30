@@ -281,7 +281,7 @@ class TestLanguageSupport(unittest.TestCase):
                                        max_line_width=None, max_line_count=None))
 
     def test_the_cantonese_model_is_refused_for_mandarin(self):
-        with self.assertRaisesRegex(ConfigError, "Cantonese model"):
+        with self.assertRaisesRegex(ConfigError, "trained for yue only"):
             validate_config(PipelineConfig(language="zh", no_clean_text=True))
 
     def test_llm_and_ensemble_are_cantonese_only(self):

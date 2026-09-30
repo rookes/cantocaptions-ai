@@ -144,11 +144,14 @@ def load_model_legacy(
     attn_implementation: Optional[str] = "sdpa",
     print_progress: bool = False,
     verbose: bool = False,
+    normalization=None,
 ) -> QwenPipelineLegacy:
     from qwen_asr import Qwen3ASRModel
 
-    profile = get_model_profile(model_name)
-    model_id = _MODEL_IDS.get(model_name, model_name)
+    from cantocaptions_ai.pipeline.asr import _resolve_normalization
+
+    model_id = _MODEL_IDS.get(model_name, get_model_profile(model_name, language).hf_id)
+    normalization = _resolve_normalization(model_name, language, normalization)
 
     try:
         ensure_hf_model_downloaded(model_id, cache_dir=download_root, local_files_only=local_files_only)
@@ -172,4 +175,4 @@ def load_model_legacy(
         attn_implementation=attn_implementation
     )
 
-    return QwenPipelineLegacy(model=hf_model, language=language, normalization=profile.normalization)
+    return QwenPipelineLegacy(model=hf_model, language=language, normalization=normalization)
