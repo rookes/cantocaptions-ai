@@ -70,7 +70,7 @@ class TestShippedDefaultCfg(unittest.TestCase):
             loaded = load_cfg_file(self._path(), parser)
         self.assertEqual(loaded["attn_implementation"], "sdpa")
         self.assertEqual(loaded["batch_size"], 8)
-        self.assertEqual(loaded["model"], "cantocaptions-cantonese-ASR")
+        self.assertIsNone(loaded["model"])  # the language's own model
         self.assertIsNone(loaded["realign"])
 
     def test_every_value_matches_the_dataclass_default(self):

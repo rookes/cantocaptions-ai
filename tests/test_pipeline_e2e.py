@@ -312,6 +312,6 @@ def test_a_registered_pack_adds_a_fully_supported_language(tmp_path, monkeypatch
     install(monkeypatch, english)
     media = english.write_wav(tmp_path / "english.wav")
     # No --model, no --no_clean_text: the pack supplies both.
-    cfg = _cfg(tmp_path, language="en", model=None)
+    cfg = _cfg(tmp_path, language="en")
     texts = [s["text"] for s in _run([media], cfg)[0]["result"]["segments"]]
     assert texts == ["VERY WELL THANKS."]

@@ -51,7 +51,8 @@ class PipelineConfig:
     compile: bool = False
 
     # Model loading
-    model: str = "cantocaptions-cantonese-ASR"
+    # The ASR model; None uses the language pack's own (cantocaptions-cantonese-ASR for yue).
+    model: Optional[str] = None
     model_dir: Optional[str] = None
     model_cache_only: bool = False
 
