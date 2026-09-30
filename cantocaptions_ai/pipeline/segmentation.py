@@ -19,17 +19,18 @@ Four passes run in order over one file's segments:
      gets its end extended into the following silence.
 
 Everything is a pure function over segment dicts: no models, no I/O, no config objects beyond
-the plain value types from ``cantonese/text.py``. Set ``min_cue_duration=0`` to disable
+the plain value types from ``text_profiles.py``. Set ``min_cue_duration=0`` to disable
 passes B-D entirely.
 """
 
 from typing import Callable, List, Optional, Sequence
 
-from cantocaptions_ai.cantonese.text import (
+from cantocaptions_ai.text_profiles import (
     DEFAULT_PUNCTUATION,
+    DEFAULT_SCRIPT,
     DEFAULT_SEGMENTATION,
-    MAX_CHARS,
     PunctuationConfig,
+    ScriptConfig,
     SegmentationConfig,
     boundary_is_mergeable,
     is_mergeable,
@@ -139,6 +140,7 @@ def _adjacency_merge(
     leading_markers: frozenset,
     min_cue_duration: float,
     vetoes: "_MergeVetoLog",
+    script: ScriptConfig = DEFAULT_SCRIPT,
 ) -> List[SingleAlignedSegment]:
     """Pass A: greedily join touching neighbours with a clean join boundary.
 
@@ -167,10 +169,11 @@ def _adjacency_merge(
         mergeable = (
             not defer
             and gap <= threshold + GAP_EPS
-            and is_mergeable(_text(prev), _text(segment), punctuation, max_chars=max_chars)
+            and is_mergeable(_text(prev), _text(segment), punctuation, max_chars=max_chars,
+                             script=script)
         )
         if mergeable and _same_speaker(prev, segment):
-            merged[-1] = merge_segments(prev, segment)
+            merged[-1] = merge_segments(prev, segment, join=script.join)
         else:
             if mergeable:
                 vetoes.record(prev, segment)
@@ -204,6 +207,7 @@ def _rescue_short_cues(
     merge_gap: float,
     rescue_max_chars: int,
     vetoes: "_MergeVetoLog",
+    script: ScriptConfig = DEFAULT_SCRIPT,
 ) -> List[SingleAlignedSegment]:
     """Pass C: merge each too-short cue into whichever neighbour reads best.
 
@@ -244,7 +248,7 @@ def _rescue_short_cues(
                 if left_idx < 0 or left_idx + 1 >= len(cues):
                     continue
                 left, right = cues[left_idx], cues[left_idx + 1]
-                if len(_text(left)) + len(_text(right)) > rescue_max_chars:
+                if len(script.join(_text(left), _text(right))) > rescue_max_chars:
                     continue
                 gap = right["start"] - left["end"]
                 if gap > gap_limit + GAP_EPS:
@@ -268,7 +272,8 @@ def _rescue_short_cues(
 
             candidates.sort()
             left_idx = candidates[0][-1]
-            cues[left_idx:left_idx + 2] = [merge_segments(cues[left_idx], cues[left_idx + 1])]
+            cues[left_idx:left_idx + 2] = [
+                merge_segments(cues[left_idx], cues[left_idx + 1], join=script.join)]
             merged_any = True
             break
 
@@ -309,15 +314,18 @@ def assemble_cues(
     align_padding: float = 0.04,
     min_cue_duration: float = 0.5,
     merge_gap: float = 0.25,
-    max_chars: int = MAX_CHARS,
+    max_chars: Optional[int] = None,
     rescue_max_chars: Optional[int] = None,
     is_noise: Optional[Callable[[str], bool]] = None,
     merge: bool = True,
+    script: ScriptConfig = DEFAULT_SCRIPT,
 ) -> List[SingleAlignedSegment]:
     """Turn aligned subsegments into displayable cues (passes A-D; see module docstring).
 
-    ``punctuation`` and ``segmentation`` come from the ASR model's profile. ``max_chars`` caps
-    an ordinary adjacency merge (one subtitle line); ``rescue_max_chars`` caps a short-cue
+    ``punctuation``, ``segmentation`` and ``script`` come from the ASR model's profile,
+    resolved for the language. ``script`` decides how two cues' text is joined (nothing for
+    CJK, a space otherwise). ``max_chars`` caps an ordinary adjacency merge (one subtitle line;
+    the script's ``line_width`` by default); ``rescue_max_chars`` caps a short-cue
     rescue and defaults to ``max_chars`` -- callers pass the full multi-line budget
     (``max_line_width * max_line_count``) so a stranded marker can attach to a sentence that
     will simply be broken over two lines. ``is_noise`` decides pass B and is skipped when None.
@@ -345,6 +353,8 @@ def assemble_cues(
     if not segments:
         return []
 
+    if max_chars is None:
+        max_chars = script.line_width
     if rescue_max_chars is None:
         rescue_max_chars = max_chars
 
@@ -356,7 +366,7 @@ def assemble_cues(
     if merge:
         cues = _adjacency_merge(
             segments, punctuation, align_merge_distance, align_padding, max_chars,
-            leading_markers, min_cue_duration, vetoes,
+            leading_markers, min_cue_duration, vetoes, script,
         )
     else:
         cues = [dict(seg) for seg in segments]
@@ -367,7 +377,7 @@ def assemble_cues(
         if merge:
             cues = _rescue_short_cues(
                 cues, punctuation, segmentation, min_cue_duration, merge_gap, rescue_max_chars,
-                vetoes,
+                vetoes, script,
             )
         cues = _apply_duration_floor(cues, min_cue_duration, align_padding)
 

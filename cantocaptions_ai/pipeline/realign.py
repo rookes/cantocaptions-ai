@@ -65,7 +65,12 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION, PunctuationConfig
+from cantocaptions_ai.text_profiles import (
+    DEFAULT_PUNCTUATION,
+    DEFAULT_SCRIPT,
+    PunctuationConfig,
+    ScriptConfig,
+)
 from cantocaptions_ai.pipeline.alignment import (
     EmissionTimeline,
     _get_blank_id,
@@ -101,10 +106,22 @@ REALIGN_SENTINEL = ""
 # in split_chars to the blank id -- so the break survives into the cue text and the aligner
 # spends silence on it. It cannot split a cue: _get_sentence_spans is never consulted under
 # --realign, which declares its cue boundaries through cue_spans instead.
-REALIGN_PUNCTUATION = PunctuationConfig(
-    split_chars=tuple(DEFAULT_PUNCTUATION.split_chars) + (" ", "\n", REALIGN_SENTINEL),
-    mergeable_chars=DEFAULT_PUNCTUATION.mergeable_chars,
-)
+#
+# The space is a pause only in a script that does not separate words with it. In a
+# space-separated language it is the word boundary alignment already handles, and making it
+# a pause token would put a blank between every pair of words.
+def realign_punctuation(
+    punctuation: PunctuationConfig = DEFAULT_PUNCTUATION, script: ScriptConfig = DEFAULT_SCRIPT,
+) -> PunctuationConfig:
+    """The language's punctuation plus the pause tokens --realign needs (see above)."""
+    extra = ("\n", REALIGN_SENTINEL) if script.spaced else (" ", "\n", REALIGN_SENTINEL)
+    return PunctuationConfig(
+        split_chars=tuple(punctuation.split_chars) + extra,
+        mergeable_chars=punctuation.mergeable_chars,
+    )
+
+
+REALIGN_PUNCTUATION = realign_punctuation()
 
 # Halfwidth marks are neither in the align vocabulary nor in split_chars, so left alone they
 # are dropped outright and the pause they represent goes unmodelled. Only a mark that follows
@@ -692,7 +709,7 @@ class _Aligner:
     def cost(self, lo: int, hi: int, t0: float, t1: float) -> Tuple[int, int]:
         """(frames, tokens) for this request, without building anything."""
         a, b = self.timeline.chunk_range(t0, t1)
-        frames = int(round((min(t1, self.timeline.file_end) - t0) * 25.0))
+        frames = int(round((min(t1, self.timeline.file_end) - t0) * self.timeline.frame_rate))
         tokens = sum(len(self.tokens_per_line[i]) + 1 for i in range(lo, hi))
         return max(frames, 0), tokens
 
@@ -785,7 +802,7 @@ def acquire(
     p, t = 0, timeline.file_start
     while p < len(lines) and t < timeline.file_end - 0.5:
         t1 = min(t + window_seconds, timeline.file_end)
-        frames = max(int(round((t1 - t) * 25.0)), 1) # TODO: Are we assuming frame rate here with a hard-coded value? Needs clarification
+        frames = max(int(round((t1 - t) * timeline.frame_rate)), 1)
         best = None
         for offset in ANCHOR_OFFSETS:
             q = p + offset

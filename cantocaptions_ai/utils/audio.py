@@ -104,6 +104,54 @@ def select_cantonese_track(streams: List[dict]) -> int:
     return 0
 
 
+# ISO 639-2 codes (bibliographic and terminology forms) containers use for a language,
+# keyed by the ISO 639-1 code the pipeline speaks. Only languages whose two forms differ
+# from "the 639-1 code" need an entry to be matched by code; any language is still matched
+# by its English name in the track title.
+_ISO639_2 = {
+    "en": ("eng",), "ja": ("jpn",), "ko": ("kor",), "fr": ("fre", "fra"),
+    "de": ("ger", "deu"), "es": ("spa",), "it": ("ita",), "pt": ("por",), "ru": ("rus",),
+    "nl": ("dut", "nld"), "th": ("tha",), "vi": ("vie",), "id": ("ind",), "ms": ("may", "msa"),
+    "hi": ("hin",), "ar": ("ara",), "tr": ("tur",), "pl": ("pol",), "sv": ("swe",),
+    "tl": ("tgl", "fil"),
+}
+
+
+def select_track(streams: List[dict], language: Optional[str]) -> int:
+    """Return the 0-based audio stream index most likely to carry *language*.
+
+    Cantonese keeps its own order (:func:`select_cantonese_track`: an explicit Cantonese
+    track, then any Chinese one). Mandarin (``zh``) prefers an explicit Mandarin or generic
+    Chinese track, then any Chinese one. Any other language takes the first stream whose
+    language tag is its ISO 639-1 or 639-2 code, or whose title names it. With no match,
+    0 -- ffmpeg's default. Tags are often missing or wrong on real releases; --audio_track
+    overrides all of this.
+    """
+    if language in (None, "yue"):
+        return select_cantonese_track(streams)
+    if language == "zh":
+        for i, stream in enumerate(streams):
+            lang = (stream.get("tags", {}).get("language") or "").lower()
+            if lang in {"zh", "zho", "chi", "cmn", "zh-hans", "zh-cn", "zh-tw", "zh-hant"}:
+                return i
+        for i, stream in enumerate(streams):
+            if _is_chinese_track(stream):
+                return i
+        return 0
+
+    from cantocaptions_ai.utils.output import LANGUAGES
+
+    codes = {language.lower(), *_ISO639_2.get(language, ())}
+    name = LANGUAGES.get(language, "").lower()
+    for i, stream in enumerate(streams):
+        tags = stream.get("tags", {})
+        if (tags.get("language") or "").lower() in codes:
+            return i
+        if name and name in (tags.get("title") or "").lower():
+            return i
+    return 0
+
+
 # Channel ORDER for every ffmpeg layout this module knows how to reduce to mono.
 #
 # Order, not just membership: the downmix below weights channels by role, and a

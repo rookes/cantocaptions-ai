@@ -1,5 +1,6 @@
 import re
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -53,6 +54,28 @@ _PASS_REF_SEMANTIC_SYSTEM = (
     "4. 如果普通話參考同ASR意思差異過大（例如係唔同版本），保留原文。\n"
     "5. 最多只能補充少量缺漏字，唔好大幅改寫句子。"
 )
+
+
+@dataclass(frozen=True)
+class CorrectionPrompts:
+    """The system prompts for one language's correction passes (see LLMCorrector)."""
+    particles: str              # pass A: per-segment particle / typo fix against the ensemble
+    names: str                  # pass B: whole-document proper-noun consistency
+    reference: str              # reference subtitle: homophone fixes only
+    reference_semantic: str     # reference subtitle: also restore missing key words
+
+
+# Correction is written for one language at a time: the prompts, and the particle-aware
+# sanitising of the model's answers, are Cantonese. validate_config refuses llm_correction
+# for a language with no entry here rather than feed Cantonese instructions another language.
+CORRECTION_PROMPTS: Dict[str, CorrectionPrompts] = {
+    "yue": CorrectionPrompts(
+        particles=_PASS_A_SYSTEM,
+        names=_PASS_B_SYSTEM,
+        reference=_PASS_REF_SYSTEM,
+        reference_semantic=_PASS_REF_SEMANTIC_SYSTEM,
+    ),
+}
 
 
 def _edit_distance(a: str, b: str) -> int:
@@ -109,11 +132,13 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
 
     debug_stage = "llm_correction"
 
-    def __init__(self, model, tokenizer, device: str, semantic_mode: bool = False) -> None:
+    def __init__(self, model, tokenizer, device: str, semantic_mode: bool = False,
+                 language: str = "yue") -> None:
         self._model = model
         self._tokenizer = tokenizer
         self._device = device
         self._semantic_mode = semantic_mode
+        self._prompts = CORRECTION_PROMPTS[language]
 
     @staticmethod
     def read_debug(audio_path, debug_dir): return load_llm_correction_debug(audio_path, debug_dir)
@@ -173,7 +198,7 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
             user_lines.append("\n請輸出修正後嘅文字：")
 
             response = self._generate(
-                system=_PASS_A_SYSTEM,
+                system=self._prompts.particles,
                 user="\n".join(user_lines),
                 max_new_tokens=max(128, len(primary) * 3),
             )
@@ -187,7 +212,7 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
         reference_texts: List[str],
     ) -> List[str]:
         """Pass REF: per-segment correction using a standard Chinese subtitle as reference."""
-        system = _PASS_REF_SEMANTIC_SYSTEM if self._semantic_mode else _PASS_REF_SYSTEM
+        system = self._prompts.reference_semantic if self._semantic_mode else self._prompts.reference
         corrected = []
         for i, seg in enumerate(segments):
             primary = seg.get('text', '')
@@ -216,7 +241,7 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
 
         numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
         response = self._generate(
-            system=_PASS_B_SYSTEM,
+            system=self._prompts.names,
             user=f"以下係完整字幕文字（每行一段）：\n{numbered}\n\n請列出需要統一嘅專有名詞替換：",
             max_new_tokens=512,
         )
@@ -329,6 +354,7 @@ def load_llm(
     semantic_mode: bool = False,
     attn_implementation: str = "sdpa",
     vram_checks: bool = True,
+    language: str = "yue",
 ) -> LLMCorrector:
     """Load a causal LM for transcript correction.
 
@@ -378,4 +404,5 @@ def load_llm(
                 f"({stats['free_mb']:.0f} MB free / {stats['total_mb']:.0f} MB total)"
             )
 
-    return LLMCorrector(model=model, tokenizer=tokenizer, device=device, semantic_mode=semantic_mode)
+    return LLMCorrector(model=model, tokenizer=tokenizer, device=device, semantic_mode=semantic_mode,
+                        language=language)

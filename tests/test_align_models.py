@@ -133,3 +133,36 @@ def test_load_align_model_returns_the_models_own_processor(tmp_path):
         vram_checks=False,
     )
     assert results[0][0].shape[-1] == len(VOCAB)
+
+
+def test_load_align_model_records_the_nominal_frame_rate_and_substitution_level(tmp_path):
+    """A non-Cantonese model gets its own frame rate and no Jyutping substitution."""
+    model, extractor = _tiny_wav2vec2(return_attention_mask=False)
+    vocab_file = tmp_path / "vocab.json"
+    vocab_file.write_text(json.dumps({tok: i for i, tok in enumerate(VOCAB)}))
+    tokenizer = Wav2Vec2CTCTokenizer(str(vocab_file), pad_token="<pad>", unk_token="<unk>",
+                                     word_delimiter_token="|")
+    checkpoint = tmp_path / "ckpt"
+    Wav2Vec2Processor(feature_extractor=extractor, tokenizer=tokenizer).save_pretrained(checkpoint)
+    model.save_pretrained(checkpoint)
+
+    _, metadata = load_align_model("en", "cpu", model_name=str(checkpoint),
+                                   model_cache_only=True, vram_checks=False)
+    assert metadata["frame_rate"] == pytest.approx(WAV2VEC2_FPS, rel=0.01)
+    assert metadata["vocab_repair"].level == "off"
+
+
+def test_only_the_cantonese_align_model_defaults_to_homophone_substitution():
+    from cantocaptions_ai.pipeline.align_profiles import get_align_profile
+
+    assert get_align_profile("alvanlii/wav2vec2-BERT-cantonese").char_substitution == "homophone"
+    assert get_align_profile("jonatasgrosman/wav2vec2-large-xlsr-53-japanese").char_substitution == "off"
+
+
+def test_timeline_budgets_with_the_nominal_rate_and_measures_without_one():
+    from cantocaptions_ai.pipeline.alignment import EmissionTimeline
+
+    segments = [{"start": 0.0, "end": 2.0, "audio": np.zeros(32000, np.float32)}]
+    emission = (torch.zeros(100, 3), 50.0)  # 100 frames over 2 s
+    assert EmissionTimeline.from_computed(segments, [emission], frame_rate=25.0).frame_rate == 25.0
+    assert EmissionTimeline.from_computed(segments, [emission]).frame_rate == pytest.approx(50.0)

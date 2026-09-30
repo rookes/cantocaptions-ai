@@ -5,6 +5,7 @@ C. Max Bain
 import bisect
 from dataclasses import dataclass
 import math
+from functools import lru_cache
 import time
 from typing import Callable, Dict, Iterable, Mapping, NamedTuple, Optional, Sequence, Union, List, Tuple
 
@@ -25,7 +26,13 @@ from cantocaptions_ai.utils.schema import (
     add_note,
     interpolate_nans,
 )
-from cantocaptions_ai.cantonese.text import DEFAULT_PUNCTUATION, PunctuationConfig, SpotCheck
+from cantocaptions_ai.text_profiles import (
+    DEFAULT_PUNCTUATION,
+    PunctuationConfig,
+    ScriptConfig,
+    SpotCheck,
+    script_for_language,
+)
 from cantocaptions_ai.pipeline.align_checks import (
     split_gapped_cues,
     warn_on_gapped_cues,
@@ -38,7 +45,6 @@ from cantocaptions_ai.pipeline.align_profiles import (
     get_align_profile,
 )
 from cantocaptions_ai.pipeline.align_vocab import (
-    LEVEL_HOMOPHONE,
     VocabRepair,
     bundled_substitutions,
     filter_spotchecks,
@@ -47,7 +53,6 @@ from cantocaptions_ai.pipeline.align_vocab import (
 )
 
 from cantocaptions_ai.utils.log_utils import get_logger
-from cantocaptions_ai.utils.output import LANGUAGES_WITHOUT_SPACES
 from cantocaptions_ai.utils.model_utils import (
     BatchExecutor,
     check_vram_headroom,
@@ -64,7 +69,8 @@ _ALIGN_MODEL_VRAM_ESTIMATE_MB = 1200
 _ALIGN_REMEDIATION = "pass --no_align to skip alignment, or free VRAM used by other processes/stages"
 
 # One 25 ms fbank frame at 16 kHz: the shortest audio the aligner's feature extractor turns
-# into anything. Below 400 samples it yields no frames, and below 240 it raises.
+# into anything. Below 400 samples it yields no frames, and below 240 it raises. The default
+# for AlignProfile.min_samples; wav2vec2's conv front end happens to need the same 400.
 MIN_ALIGN_SAMPLES = 400
 
 DEFAULT_ALIGN_MODELS_TORCH = {
@@ -386,26 +392,56 @@ def _get_blank_id(model_dictionary: dict) -> int:
     return next((code for char, code in model_dictionary.items() if char in ('[pad]', '<pad>')), 0)
 
 
-def _get_sentence_spans(text: str, model_lang: str, punctuation: PunctuationConfig) -> List[Tuple[int, int]]:
-    """Split text into sentence span tuples using language-appropriate tokenization."""
-    if model_lang in ['yue', 'zh']:
-        return punctuation.sentence_spans(text)
+def _spaced(model_lang: str, script: Optional[ScriptConfig]) -> bool:
+    """Whether words are space-separated: the script's say, else the language's default."""
+    return (script or script_for_language(model_lang)).spaced
 
+
+def _get_sentence_spans(
+    text: str, model_lang: str, punctuation: PunctuationConfig,
+    script: Optional[ScriptConfig] = None,
+) -> List[Tuple[int, int]]:
+    """Split text into sentence span tuples using language-appropriate tokenization.
+
+    A script without spaces splits at its own punctuation; a space-separated one uses the
+    NLTK Punkt model for the language, which knows abbreviations are not sentence ends.
+    """
+    if not _spaced(model_lang, script):
+        return punctuation.sentence_spans(text)
+    splitter = _punkt_splitter(PUNKT_LANGUAGES.get(model_lang, 'english'))
+    if splitter is None:
+        return punctuation.sentence_spans(text)
+    return list(splitter.span_tokenize(text))
+
+
+@lru_cache(maxsize=None)
+def _punkt_splitter(punkt_lang: str):
+    """NLTK's Punkt sentence splitter for a language, downloading it on first use.
+
+    None when it is neither installed nor downloadable (an offline machine): sentences are
+    then split at the language's own punctuation instead, which only loses Punkt's
+    knowledge that "Dr." does not end a sentence.
+    """
     import nltk
-    from nltk.data import load as nltk_load
-    punkt_lang = PUNKT_LANGUAGES.get(model_lang, 'english')
-    try:
-        sentence_splitter = nltk_load(f'tokenizers/punkt_tab/{punkt_lang}.pickle')
-    except LookupError:
-        nltk.download('punkt_tab', quiet=True)
-        sentence_splitter = nltk_load(f'tokenizers/punkt_tab/{punkt_lang}.pickle')
-    return list(sentence_splitter.span_tokenize(text))
+
+    for attempt in range(2):
+        try:
+            return nltk.tokenize.PunktTokenizer(punkt_lang)
+        except LookupError:
+            if attempt == 0 and not nltk.download("punkt_tab", quiet=True):
+                break
+    logger.warning(
+        "NLTK Punkt data for %r is unavailable (offline?); splitting sentences at punctuation",
+        punkt_lang,
+    )
+    return None
 
 
 def _preprocess_segment(
     text: str, model_lang: str, model_dictionary: dict,
     punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
     spans: Optional[List[Tuple[int, int]]] = None,
+    script: Optional[ScriptConfig] = None,
 ) -> SegmentData:
     """Clean text and produce per-segment alignment metadata.
 
@@ -417,12 +453,13 @@ def _preprocess_segment(
     num_leading = len(text) - len(text.lstrip())
     num_trailing = len(text) - len(text.rstrip())
 
-    per_word = text.split(" ") if model_lang not in LANGUAGES_WITHOUT_SPACES else text
+    spaced = _spaced(model_lang, script)
+    per_word = text.split(" ") if spaced else text
 
     clean_char, clean_cdx = [], []
     for cdx, char in enumerate(text):
         char_ = char.lower()
-        if model_lang not in LANGUAGES_WITHOUT_SPACES:
+        if spaced:
             char_ = char_.replace(" ", "|")
         if cdx < num_leading or cdx > len(text) - num_trailing - 1:
             continue
@@ -441,7 +478,7 @@ def _preprocess_segment(
         "clean_wdx": clean_wdx,
         "sentence_spans": (
             list(spans) if spans is not None
-            else _get_sentence_spans(text, model_lang, punctuation)
+            else _get_sentence_spans(text, model_lang, punctuation, script)
         ),
     }
 
@@ -451,6 +488,7 @@ def _preprocess_transcript(
     model_dictionary: dict,
     punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
     print_progress: bool = False,
+    script: Optional[ScriptConfig] = None,
 ) -> dict:
     """First pass: build SegmentData for every transcript segment."""
     total = len(transcript)
@@ -458,7 +496,7 @@ def _preprocess_transcript(
     for sdx, segment in enumerate(transcript):
         segment_data[sdx] = _preprocess_segment(
             segment["text"], model_lang, model_dictionary, punctuation,
-            spans=segment.get("cue_spans"),
+            spans=segment.get("cue_spans"), script=script,
         )
     return segment_data
 
@@ -684,6 +722,7 @@ def _compute_vad_emissions(
     batch_size: int = 4,
     vram_checks: bool = True,
     primer: Optional["AudioPrimer"] = None,
+    min_samples: int = MIN_ALIGN_SAMPLES,
 ) -> List[Tuple[torch.Tensor, float]]:
     """Run inference on each full VAD segment. Returns (log_softmax_emission, frame_rate) per segment.
 
@@ -705,12 +744,12 @@ def _compute_vad_emissions(
     # longer produce one (Binarize._split_long), but a crash here costs a whole batch of
     # files, and there is no speech in 25 ms to align anyway. Downstream already copes with
     # an empty emission: EmissionTimeline skips it, so a line there is treated as unmatched.
-    usable = [i for i, seg in enumerate(vad_segments) if len(seg["audio"]) >= MIN_ALIGN_SAMPLES]
+    usable = [i for i, seg in enumerate(vad_segments) if len(seg["audio"]) >= min_samples]
     if len(usable) < len(vad_segments):
-        short = [seg for seg in vad_segments if len(seg["audio"]) < MIN_ALIGN_SAMPLES]
+        short = [seg for seg in vad_segments if len(seg["audio"]) < min_samples]
         logger.warning(
             "Skipping %d VAD segment(s) shorter than one alignment frame (%d samples): %s",
-            len(short), MIN_ALIGN_SAMPLES,
+            len(short), min_samples,
             ", ".join(f"{s['start']:.3f}-{s['end']:.3f}s" for s in short[:5]),
         )
     segments = [vad_segments[i] for i in usable]
@@ -743,9 +782,9 @@ def _compute_vad_emissions(
     return results
 
 
-def compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size: int = 4, vram_checks: bool = True, primer=None):
+def compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size: int = 4, vram_checks: bool = True, primer=None, min_samples: int = MIN_ALIGN_SAMPLES):
     """Public wrapper around _compute_vad_emissions, for callers outside this module."""
-    return _compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size, vram_checks=vram_checks, primer=primer)
+    return _compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size, vram_checks=vram_checks, primer=primer, min_samples=min_samples)
 
 
 class EmissionTimeline:
@@ -778,7 +817,9 @@ class EmissionTimeline:
         self,
         vad_segments: Sequence[VadAudioSegment],
         compute_fn: Callable[[List[VadAudioSegment]], List[Tuple[torch.Tensor, float]]],
+        frame_rate: Optional[float] = None,
     ):
+        self._nominal_rate = frame_rate
         self._segments = list(vad_segments)
         self._compute = compute_fn
         self._emissions: List[Optional[np.ndarray]] = [None] * len(self._segments)
@@ -786,6 +827,23 @@ class EmissionTimeline:
         self._starts = [float(s["start"]) for s in self._segments]
         self._ends = [float(s["end"]) for s in self._segments]
         self.computed = 0
+
+    @property
+    def frame_rate(self) -> float:
+        """Emission frames per second: the align model's nominal rate (``align_metadata
+        ["frame_rate"]``), or failing that the rate measured on the first computed chunk.
+
+        Used to *budget* a search before its emissions exist -- frame times themselves always
+        come from each chunk's own frame count (see the class docstring).
+        """
+        if self._nominal_rate:
+            return self._nominal_rate
+        if not any(e is not None for e in self._emissions):
+            self.ensure(0, 1)
+        for times in self._times:
+            if times is not None and len(times) > 1:
+                return 1.0 / float(times[1] - times[0])
+        return 25.0
 
     @property
     def file_start(self) -> float:
@@ -844,10 +902,11 @@ class EmissionTimeline:
         return torch.from_numpy(np.asarray(emission, dtype=np.float32)), frame_times
 
     @classmethod
-    def from_computed(cls, vad_segments, results):
+    def from_computed(cls, vad_segments, results, frame_rate: Optional[float] = None):
         """Wrap emissions that have already been computed, so nothing is encoded twice."""
         by_start = {float(s["start"]): r for s, r in zip(vad_segments, results)}
-        timeline = cls(vad_segments, lambda segs: [by_start[float(s["start"])] for s in segs])
+        timeline = cls(vad_segments, lambda segs: [by_start[float(s["start"])] for s in segs],
+                       frame_rate=frame_rate)
         timeline.ensure(0, len(vad_segments))
         return timeline
 
@@ -973,6 +1032,7 @@ def _align_segment(
     spotchecks: Mapping[str, SpotCheck],
     punctuation: PunctuationConfig,
     frame_times: Optional[np.ndarray] = None,
+    script: Optional[ScriptConfig] = None,
 ) -> List[dict]:
     """Align one transcript segment against its emission, returning subsegment dicts.
 
@@ -1084,7 +1144,7 @@ def _align_segment(
             end = round(_at(char_seg.end), 3)
             score = round(char_seg.score, 3)
         char_segments_arr.append({"char": char, "start": start, "end": end, "score": score, "word-idx": word_idx})
-        if model_lang in LANGUAGES_WITHOUT_SPACES:
+        if not _spaced(model_lang, script):
             word_idx += 1
         elif cdx == len(text) - 1 or text[cdx + 1] == " ":
             word_idx += 1
@@ -1164,7 +1224,7 @@ def _align_segment(
         aligned_subsegments["realign_reason"] = None
     agg_dict = {"text": " ".join, "words": "sum", "release_from": "first",
                 "realign_reason": "first"}
-    if model_lang in LANGUAGES_WITHOUT_SPACES:
+    if not _spaced(model_lang, script):
         agg_dict["text"] = "".join
     if return_char_alignments:
         agg_dict["chars"] = "sum"
@@ -1183,14 +1243,43 @@ def _align_segment(
 
 # --- Public functions ---
 
+def _nominal_frame_rate(model, processor, model_type: str, device) -> Optional[float]:
+    """Emission frames per second of audio, from the model's own length arithmetic.
+
+    Hugging Face models: the processor's feature length for 100 s of audio, run through
+    ``_get_feat_extract_output_lengths`` -- exact, and no forward pass. torchaudio bundles
+    have no such helper, so ten seconds of silence go through the model once and the rate is
+    rounded to the whole number every wav2vec2-family model runs at (edge frames lose one).
+    """
+    seconds = 100 if model_type == "huggingface" else 10
+    silence = np.zeros(SAMPLE_RATE * seconds, dtype=np.float32)
+    try:
+        with torch.inference_mode():
+            if model_type == "huggingface":
+                features = processor(silence, sampling_rate=SAMPLE_RATE, return_tensors="pt",
+                                     return_attention_mask=True)
+                frames = int(model._get_feat_extract_output_lengths(
+                    features["attention_mask"].sum(dim=-1))[0])
+                return frames / seconds
+            dtype = next(model.parameters()).dtype
+            emissions, _ = model(torch.from_numpy(silence)[None].to(device, dtype=dtype))
+            return float(round(emissions.shape[1] / seconds))
+    except Exception as exc:  # the timeline falls back to measuring it
+        logger.warning("Could not determine the align model's frame rate: %s", exc)
+        return None
+
+
 def load_align_model(
     language_code: str, device: str, device_index: int = 0, model_name: Optional[str] = None,
     model_dir=None, model_cache_only: bool = False, compute_type: str = "float32",
     vram_checks: bool = True,
-    char_substitution: str = LEVEL_HOMOPHONE,
+    char_substitution: Optional[str] = None,
     substitution_overrides: Optional[Mapping[str, str]] = None,
 ):
     """Load the phoneme-alignment model.
+
+    ``char_substitution`` None takes the model profile's level (homophone for the Cantonese
+    model, off for anything else): the homophone tiers read Cantonese pronunciations.
 
     compute_type="float16" halves weight VRAM but the model is otherwise loaded and
     invoked exactly like float32 (no autocast) — inputs are cast to match in
@@ -1256,6 +1345,8 @@ def load_align_model(
         align_dictionary = {char.lower(): code for char, code in tokenizer.get_vocab().items()}
 
     profile = get_align_profile(model_name)
+    if char_substitution is None:
+        char_substitution = profile.char_substitution
     align_metadata = {
         "language": language_code,
         "dictionary": align_dictionary,
@@ -1263,6 +1354,9 @@ def load_align_model(
         # The model's own feature extractor (None for a torchaudio bundle). Every stage that
         # runs the encoder takes it from here, so the model and its inputs cannot mismatch.
         "processor": processor,
+        # Frames per second the model emits, read off its own length arithmetic; realign
+        # budgets its searches with it before any emission exists.
+        "frame_rate": _nominal_frame_rate(align_model, processor, pipeline_type, device),
         # Built here, next to the dictionary it edits, so every stage that tokenises text
         # against this model shares one vocabulary. Resolves nothing until a caller hands it
         # some text -- see align_vocab.VocabRepair.
@@ -1303,6 +1397,7 @@ def align(
     punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
     timeline=None,
     split_gap: Optional[float] = None,
+    script: Optional[ScriptConfig] = None,
 ) -> AlignedTranscriptionResult:
     """Align phoneme recognition predictions to known transcription.
 
@@ -1323,6 +1418,10 @@ def align(
     encoder is not run a second time over audio the caller has already encoded.
 
     ``processor`` defaults to the align model's own, from ``align_model_metadata``.
+
+    ``script`` (from the ASR model's profile) decides whether spaces separate words, which
+    changes how words are counted, how sentences are split and how subsegments rejoin. None
+    derives it from the align model's language.
     """
     spotchecks = spotchecks or {}
     if processor is None:
@@ -1360,8 +1459,9 @@ def align(
             vad_segments,
             _compute_vad_emissions(
                 vad_segments, model, model_type, processor, device, batch_size,
-                vram_checks=vram_checks, primer=profile.primer,
+                vram_checks=vram_checks, primer=profile.primer, min_samples=profile.min_samples,
             ),
+            frame_rate=align_model_metadata.get("frame_rate"),
         )
     vad_seg_emissions = None
 
@@ -1377,7 +1477,9 @@ def align(
         # A substituted character's token is some homophone's, so it cannot be asked which
         # of two particles the audio supports. Never fires for the shipped profiles.
         spotchecks = filter_spotchecks(spotchecks, repair.substitutions)
-    segment_data = _preprocess_transcript(transcript, model_lang, model_dictionary, punctuation, print_progress)
+    segment_data = _preprocess_transcript(
+        transcript, model_lang, model_dictionary, punctuation, print_progress, script=script,
+    )
 
     # --- Align each segment ---
     aligned_segments: List[SingleAlignedSegment] = []
@@ -1427,7 +1529,7 @@ def align(
             segment, segment_data[sdx], emission,
             model_dictionary, model_lang, blank_id, spacing_char_id,
             t1, t2, interpolate_method, return_char_alignments,
-            spotchecks, punctuation, frame_times=frame_times,
+            spotchecks, punctuation, frame_times=frame_times, script=script,
         )
         aligned_segments += subsegments
 

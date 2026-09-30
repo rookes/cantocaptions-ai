@@ -254,3 +254,32 @@ def test_service_reports_audio_without_speech_as_empty(tmp_path, fakes):
     silent = ScriptedAudio(script=(), duration=3.0).write_wav(tmp_path / "silence.wav")
     result = run_pipeline(silent, _cfg(tmp_path, output_format="srt"))
     assert (result.empty, result.num_segments, result.subtitle_text) == (True, 0, "")
+
+
+# --- a space-separated language ------------------------------------------------------
+
+def test_english_takes_the_space_separated_path(tmp_path, monkeypatch):
+    """The Cantonese assumptions are seams now: an English run joins words with spaces,
+    splits sentences at Latin punctuation and breaks lines between words."""
+    from cantocaptions_ai.pipeline import alignment
+
+    # "hi." is too short to stand alone, so cue assembly rescues it into the next
+    # sentence -- which is where a CJK join would have written "hi.how are you".
+    english = ScriptedAudio(script=((1.0, "hi. how are you doing today?"),
+                                    (5.0, "fine thanks.")), duration=8.0)
+    install(monkeypatch, english)
+    # No network in tests: sentence splitting falls back to Latin punctuation.
+    monkeypatch.setattr(alignment, "_punkt_splitter", lambda lang: None)
+    media = english.write_wav(tmp_path / "english.wav")
+    cfg = _cfg(tmp_path, language="en", model="some/english-asr", no_clean_text=True,
+               max_line_width=16, max_line_count=2)
+    texts = [s["text"] for s in _run([media], cfg)[0]["result"]["segments"]]
+    assert texts == ["hi. how are you\ndoing today?", "fine thanks."]
+
+
+def test_english_needs_its_own_model_and_no_cantonese_cleaning(tmp_path):
+    from cantocaptions_ai.errors import ConfigError
+
+    with pytest.raises(ConfigError) as err:
+        validate_config(PipelineConfig(device="cpu", language="en"))
+    assert "--model" in str(err.value) and "--no_clean_text" in str(err.value)

@@ -3,10 +3,9 @@ A utility library for Cantonese parsing of raw text
 """
 
 import re
-from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Mapping, Optional, Tuple, TYPE_CHECKING
+from typing import List, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from cantocaptions_ai.utils.schema import SingleSegment
@@ -20,89 +19,28 @@ PARTICLE_CHARS = [
     '吖', '啊', '呀', '噃', '㗎', '嘅', '吓', '可', '嗬', '啩', '囖', '囉', '咯', '啦', '喇', '嘞', '呢', '咧', '哩', '嗎', '嘛', '咩', '𠻹', '喎', '啫', '唧'
 ]
 
-SPLIT_CHARS = ["，", "。", "？", "！", "；", "…"]
-MERGEABLE_CHARS = ["，"]
 REMOVE_STANDALONE_CHARS = ["噢", "嗯", "哦", "嘩", "嗌", "唉", "誒", "哎", "啊", "嘿", "吓"]
 
+# The generic value types moved to cantocaptions_ai/text_profiles.py; they are re-exported
+# here so existing imports keep working.
+from cantocaptions_ai.text_profiles import (  # noqa: E402,F401
+    CJK_MERGEABLE_CHARS,
+    CJK_SPLIT_CHARS,
+    DEFAULT_CLEANING,
+    DEFAULT_NORMALIZATION,
+    DEFAULT_PUNCTUATION,
+    DEFAULT_SEGMENTATION,
+    CleaningConfig,
+    PunctuationConfig,
+    SegmentationConfig,
+    SpotCheck,
+    TextNormalization,
+    boundary_is_mergeable,
+    is_mergeable,
+)
 
-# --- Per-model downstream config value objects ---
-# These are plain data holders describing how a given ASR model's output should be
-# treated downstream. They live here (not in pipeline/) so this module stays free of
-# pipeline imports; pipeline/model_profiles.py bundles them per model.
-
-@dataclass(frozen=True)
-class TextNormalization:
-    """Post-ASR text normalization to apply. Both steps default off (no-op)."""
-    opencc_config: Optional[str] = None   # filename under cantonese/opencc/; None => skip OpenCC
-    chars_hk: bool = False                # run the rules/chars_hk.toml HK-variant ruleset
-
-
-@dataclass(frozen=True)
-class PunctuationConfig:
-    """Punctuation that drives sentence splitting, alignment token spacing and line merging."""
-    split_chars: Tuple[str, ...] = tuple(SPLIT_CHARS)
-    mergeable_chars: Tuple[str, ...] = tuple(MERGEABLE_CHARS)
-
-    def sentence_spans(self, text: str) -> List[Tuple[int, int]]:
-        """Return (start, end) index spans of text between split_chars (never mutates text)."""
-        split_indexes = [i for i, ch in enumerate(text) if ch in self.split_chars]
-        spans: List[Tuple[int, int]] = []
-        cur_start = 0
-        for val in split_indexes:
-            spans.append((cur_start, val))
-            cur_start = val + 1
-        if cur_start <= len(text):
-            spans.append((cur_start, len(text)))
-        return spans
-
-
-@dataclass(frozen=True)
-class SpotCheck:
-    """A set of interchangeable candidate characters for one source char, with optional
-    additive log-prob biases applied on top of the acoustic score during alignment."""
-    candidates: Tuple[str, ...]                              # incl. the source char
-    weights: Mapping[str, float] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class SegmentationConfig:
-    """Model-specific discourse markers that introduce the clause following them.
-
-    Markers like 嗱/哎吔/喂 are punctuated off by the ASR as their own clause, but acoustically
-    they sit inside a continuous speech run, so forced alignment collapses them to a few
-    frames and they surface as sub-100 ms cues. Cue assembly (``pipeline/segmentation.py``)
-    uses this list to rejoin them *forwards*, onto the sentence they introduce, rather than
-    stranding them on the end of the previous one.
-
-    Only list tokens that reliably *lead*. Final particles (呀, 啦, 吓 -- see
-    ``PARTICLE_CHARS``) are ambiguous: they attach backwards just as often, so they are left
-    to the generic duration-based rescue instead. Empty by default (a no-op), like every
-    other model-profile field.
-    """
-    leading_markers: Tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class CleaningConfig:
-    """Which cleaning step manifest this model's output should be folded through.
-
-    ``manifest`` names a file in the rules directory (the packaged ``cantonese/rules/``,
-    or a ``--clean_rules_dir`` override). The default manifest is conservative --
-    character variants, punctuation, noise and line layout -- because a model fine-tuned to emit
-    the target convention already writes what the heavier rules exist to impose.
-
-    A model that writes generic Mandarin-flavoured output needs the full legacy chain
-    instead (``pipeline_qwen.toml``): question particles, ASR error repair, numeral
-    conversion and particle conventions on top. Like every other model-profile field,
-    the default is the no-op-ish one and a model opts *in* to more work.
-    """
-    manifest: str = "pipeline.toml"
-
-
-DEFAULT_NORMALIZATION = TextNormalization()
-DEFAULT_PUNCTUATION = PunctuationConfig()
-DEFAULT_SEGMENTATION = SegmentationConfig()
-DEFAULT_CLEANING = CleaningConfig()
+SPLIT_CHARS = list(CJK_SPLIT_CHARS)
+MERGEABLE_CHARS = list(CJK_MERGEABLE_CHARS)
 
 
 @lru_cache(maxsize=None)
@@ -145,45 +83,9 @@ def is_punctuation(char):
     "Returns true if char contains only Chinese punctuation chars."
     return re.match(r'[，？！…：；\s\-]', char)
 
-def boundary_is_mergeable(text1: str, punctuation: PunctuationConfig = DEFAULT_PUNCTUATION) -> bool:
-    """Returns true if a line ending in ``text1`` reads acceptably joined to what follows.
-
-    This is the punctuation half of :func:`is_mergeable`, split out so the cue-assembly
-    passes can reuse one definition of the rule: the adjacency merge applies it as a hard
-    gate, while the short-cue rescue applies it only to *rank* the two possible join
-    directions (see ``pipeline/segmentation.py``).
-    """
-    if len(text1) == 0:
-        return True
-
-    return text1[-1] not in punctuation.split_chars or text1[-1] in punctuation.mergeable_chars
-
-
-def is_mergeable(
-    text1: str,
-    text2: str,
-    punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
-    max_chars: int = MAX_CHARS,
-) -> bool:
-    "Returns true if text1 and text2 can be acceptably merged into a single line."
-    if len(text1) == 0 or len(text2) == 0:
-        return True
-
-    if boundary_is_mergeable(text1, punctuation):
-        if len(text1 + text2) <= max_chars:
-            return True
-
-    return False
-
-def is_removable(text: str) -> bool:
+def is_removable(text: str, noise_tokens=REMOVE_STANDALONE_CHARS) -> bool:
     "Returns true if the subtitle line text can be removed completely (used for interjections and meaningless text)."
-    if len(text) == 0:
-        return True
-
-    if text in REMOVE_STANDALONE_CHARS:
-        return True
-
-    return False
+    return len(text) == 0 or text in noise_tokens
 
 def _locate_particles(sentence: str) -> Tuple[Tuple[int, int], str]:
     particle_start_i = next((i+1 for i in range(len(sentence)-1, -1, -1) if sentence[i] not in PARTICLE_CHARS), 0)

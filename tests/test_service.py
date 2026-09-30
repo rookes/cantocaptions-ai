@@ -9,6 +9,7 @@
 import os
 import tempfile
 import unittest
+import warnings
 
 from cantocaptions_ai.errors import ConfigError, InputError
 from cantocaptions_ai.pipeline.config import PipelineConfig
@@ -258,3 +259,34 @@ class TestValidateInputFile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLanguageSupport(unittest.TestCase):
+    """Only yue runs end to end; others run raw, with each missing piece named."""
+
+    def test_raw_english_pipeline_is_accepted(self):
+        cfg = PipelineConfig(language="en", model="Qwen3-ASR", no_clean_text=True)
+        # catch_warnings, not assertWarns, which trips over transformers' lazy modules.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            validate_config(cfg)
+        self.assertTrue(any("raw pipeline" in str(w.message) for w in caught))
+
+    def test_a_language_without_a_default_align_model_needs_one(self):
+        cfg = PipelineConfig(language="sw", model="some/swahili-asr", no_clean_text=True)
+        with self.assertRaisesRegex(ConfigError, "--align_model"):
+            validate_config(cfg)
+        validate_config(PipelineConfig(language="sw", model="some/swahili-asr",
+                                       no_clean_text=True, no_align=True,
+                                       max_line_width=None, max_line_count=None))
+
+    def test_the_cantonese_model_is_refused_for_mandarin(self):
+        with self.assertRaisesRegex(ConfigError, "Cantonese model"):
+            validate_config(PipelineConfig(language="zh", no_clean_text=True))
+
+    def test_llm_and_ensemble_are_cantonese_only(self):
+        base = dict(language="en", model="Qwen3-ASR", no_clean_text=True)
+        with self.assertRaisesRegex(ConfigError, "llm_correction"):
+            validate_config(PipelineConfig(**base, llm_correction=True))
+        with self.assertRaisesRegex(ConfigError, "ensemble_model"):
+            validate_config(PipelineConfig(**base, ensemble_model="whisper", llm_correction=True))

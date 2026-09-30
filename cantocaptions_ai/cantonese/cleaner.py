@@ -21,7 +21,7 @@ landing mid-cue or on a cue's end after the cues are already cut.
 """
 
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Mapping, Optional, Sequence, Tuple
 
 try:
     import tomllib
@@ -38,33 +38,49 @@ from cantocaptions_ai.cantonese.rules import (
     get_builtin_ruleset,
     load_ruleset,
 )
-from cantocaptions_ai.cantonese.text import DEFAULT_CLEANING
+from cantocaptions_ai.cantonese.text import REMOVE_STANDALONE_CHARS, is_removable
+from cantocaptions_ai.text_profiles import DEFAULT_CLEANING, word_wrap
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
 
+# Line breakers by ``ScriptConfig.layout``: "cjk" breaks at punctuation or between words
+# found by pycantonese segmentation; "word" breaks at the space nearest the middle.
+LAYOUTS: Mapping[str, Callable[[str, int], str]] = {
+    "cjk": linebreak,
+    "word": word_wrap,
+}
 
-def linebreak_step(line_max_length: int, max_line_count: Optional[int]) -> Optional[Callable[[str], str]]:
+# The coded steps a Cantonese manifest may name. A cleaner for another language passes its
+# own registry; ``linebreak`` is not in it because it is built per instance from the line
+# settings and layout.
+CANTONESE_BUILTIN_STEPS: Mapping[str, Callable[[str], str]] = {
+    "acronyms": format_acronyms,
+    "question_particles": clean_question_particles,
+    "chinese_numbers": convert_chinese_numbers,
+    "trim": trim,
+}
+
+
+def linebreak_step(
+    line_max_length: int, max_line_count: Optional[int], layout: str = "cjk",
+) -> Optional[Callable[[str], str]]:
     """The line-layout step for these line limits, or None where no break is allowed.
 
     Shared by the cleaner's ``linebreak`` builtin and by the pipeline's layout pass when
     cleaning is off, so ``max_line_width``/``max_line_count`` mean the same either way.
+    ``layout`` picks the line breaker from ``LAYOUTS`` (the script's ``layout``).
     """
     if max_line_count is not None and max_line_count < 2:
         return None  # a single-line output can't take a break
-    return lambda text: linebreak(text, line_max_length)
+    breaker = LAYOUTS[layout]
+    return lambda text: breaker(text, line_max_length)
 
 
 class SubtitleCleaner:
     """Applies the configured cleaning steps to a single subtitle line at a time."""
 
-    BUILTIN_STEPS = {
-        "acronyms": format_acronyms,
-        "question_particles": clean_question_particles,
-        "chinese_numbers": convert_chinese_numbers,
-        "trim": trim,
-        # "linebreak" is constructed per instance (depends on line settings)
-    }
+    BUILTIN_STEPS = CANTONESE_BUILTIN_STEPS
 
     def __init__(
         self,
@@ -72,11 +88,20 @@ class SubtitleCleaner:
         line_max_length: int = 18,
         max_line_count: Optional[int] = 1,
         manifest: str = DEFAULT_CLEANING.manifest,
+        builtin_steps: Optional[Mapping[str, Callable[[str], str]]] = None,
+        noise_tokens: Sequence[str] = REMOVE_STANDALONE_CHARS,
+        layout: str = "cjk",
     ) -> None:
+        """``builtin_steps`` are the coded steps a manifest may name (the Cantonese ones by
+        default); ``noise_tokens`` are the lines :meth:`is_noise` treats as droppable;
+        ``layout`` picks the line breaker for the ``linebreak`` step (see ``LAYOUTS``)."""
         self.rules_dir = Path(rules_dir) if rules_dir is not None else BUILTIN_RULES_DIR
         self.manifest = manifest
         self.line_max_length = line_max_length
         self.max_line_count = max_line_count
+        self.builtin_steps = dict(CANTONESE_BUILTIN_STEPS if builtin_steps is None else builtin_steps)
+        self.noise_tokens = tuple(noise_tokens)
+        self.layout = layout
         # Fails fast on a missing/invalid manifest, rule file, or regex so problems
         # surface at pipeline start rather than after hours of ASR.
         manifest_path, manifest = self._load_manifest()
@@ -123,11 +148,11 @@ class SubtitleCleaner:
             elif step_type == "builtin":
                 name = entry.get("name")
                 if name == "linebreak":
-                    step = linebreak_step(self.line_max_length, self.max_line_count)
+                    step = linebreak_step(self.line_max_length, self.max_line_count, self.layout)
                     if step is not None:
                         steps.append((name, step))
-                elif name in self.BUILTIN_STEPS:
-                    steps.append((name, self.BUILTIN_STEPS[name]))
+                elif name in self.builtin_steps:
+                    steps.append((name, self.builtin_steps[name]))
                 else:
                     raise ValueError(f"{manifest_path}: {key} #{i + 1} has unknown builtin '{name}'")
             else:
@@ -140,6 +165,10 @@ class SubtitleCleaner:
         for _name, step in self._steps:
             text = step(text)
         return text
+
+    def is_noise(self, text: str) -> bool:
+        """True if a cleaned line holds nothing worth showing (empty, or a lone interjection)."""
+        return is_removable(text, self.noise_tokens)
 
     def pre_align(self, text: str) -> str:
         """Apply the manifest's ``pre_align`` steps to raw ASR text (a no-op if it has none)."""
