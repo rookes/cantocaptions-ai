@@ -19,7 +19,7 @@ from cantocaptions_ai.utils.model_utils import (
     ensure_hf_model_downloaded,
     guard_model_load,
 )
-from cantocaptions_ai.cantonese.text import normalize_segment_text
+from cantocaptions_ai.languages.yue.text import normalize_segment_text
 from cantocaptions_ai.text_profiles import DEFAULT_NORMALIZATION, TextNormalization
 from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 from cantocaptions_ai.utils.log_utils import get_logger

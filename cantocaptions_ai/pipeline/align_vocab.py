@@ -261,7 +261,7 @@ class VocabRepair:
         return None
 
     def _variant(self, char: str) -> Optional[str]:
-        from cantocaptions_ai.cantonese.text import simplified_to_traditional
+        from cantocaptions_ai.languages.yue.text import simplified_to_traditional
         try:
             converted = simplified_to_traditional(char)
         except Exception as exc:  # pragma: no cover - opencc is a base dependency

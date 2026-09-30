@@ -317,7 +317,7 @@ class TestSpotcheckGuard(unittest.TestCase):
     """
 
     def setUp(self):
-        from cantocaptions_ai.cantonese.text import SpotCheck
+        from cantocaptions_ai.languages.yue.text import SpotCheck
         self.checks = {
             "咁": SpotCheck(("咁", "噉"), weights={"噉": 0.8}),
             "喇": SpotCheck(("喇", "啦", "囉")),

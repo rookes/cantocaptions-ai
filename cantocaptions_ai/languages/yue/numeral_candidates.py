@@ -1,6 +1,6 @@
 """Arabic-digit -> Chinese-numeral reading candidates.
 
-The reverse direction of :mod:`cantocaptions_ai.cantonese.numbers` (which reads
+The reverse direction of :mod:`cantocaptions_ai.languages.yue.numbers` (which reads
 Chinese numerals BACK into digits for post-ASR display). This module exists for a
 different problem: a forced-aligner's CTC vocabulary is built from real subtitle
 text, which is overwhelmingly written with Chinese numerals, so it typically holds

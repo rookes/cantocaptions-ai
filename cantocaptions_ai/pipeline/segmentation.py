@@ -94,7 +94,7 @@ class _MergeVetoLog:
         """Log one line per held boundary, plus a count. Silent when nothing was blocked."""
         if not self._by_boundary:
             return
-        # Imported lazily to keep this module's import graph to cantonese/ + utils.schema.
+        # Imported lazily to keep this module's import graph to text_profiles + utils.schema.
         from cantocaptions_ai.utils.output import format_timestamp
 
         for boundary in sorted(self._by_boundary):

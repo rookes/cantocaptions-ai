@@ -13,7 +13,7 @@ All pure functions -- no models, no I/O.
 import logging
 import unittest
 
-from cantocaptions_ai.cantonese.text import SegmentationConfig
+from cantocaptions_ai.languages.yue.text import SegmentationConfig
 from cantocaptions_ai.pipeline.segmentation import assemble_cues
 from cantocaptions_ai.utils.schema import merge_segments
 

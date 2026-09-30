@@ -1,112 +1,70 @@
-"""Manifest-driven Cantonese subtitle text cleaner.
+"""Manifest-driven subtitle text cleaner.
 
 ``SubtitleCleaner`` folds each subtitle line through the step sequence declared in a
-manifest: TOML regex rule files interleaved with coded builtin steps (question-aware
-particle fixes, Chinese numeral conversion, line breaking, trimming).
+manifest: TOML regex rule files (``cleaning/rules.py``) interleaved with coded builtin
+steps. Nothing here knows a language. A language pack supplies the rules directory, the
+builtin steps its manifests may name, the lines it treats as noise and its line breaker
+(see ``languages/base.py`` ``CleaningSpec``); the Cantonese ones live in
+``languages/yue``.
 
 Which manifest is a per-model decision, since it depends on how much the model's raw
-output already follows the target convention -- the ASR model's profile supplies it
-(``pipeline/model_profiles.py``, ``ModelProfile.cleaning``). ``pipeline.toml`` is the
-conservative default; ``pipeline_qwen.toml`` is the full legacy chain vanilla
-Qwen3-ASR needs. Point ``rules_dir`` at a directory with its own manifest to swap
-rule sets entirely.
+output already follows the target convention -- the language pack's conventions for the
+model supply it. Point ``rules_dir`` at a directory with its own manifest to swap rule
+sets entirely.
 
 Cleaning may return an empty string (noise-only lines); callers should drop those
-subtitles (see ``text.is_removable``).
+subtitles (see :meth:`SubtitleCleaner.is_noise`).
 
 A manifest may also declare ``[[pre_align]]`` steps, in the same format. Those run on
 the raw ASR text *before* alignment (``SubtitleCleaner.pre_align``), so punctuation
 they insert becomes a clause boundary alignment can split a cue on, rather than
 landing mid-cue or on a cue's end after the cues are already cut.
 """
-
 from pathlib import Path
-from typing import Callable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, List, Mapping, Optional, Sequence, Tuple, Union
 
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
-from cantocaptions_ai.cantonese.acronyms import format_acronyms
-from cantocaptions_ai.cantonese.linebreak import linebreak, trim
-from cantocaptions_ai.cantonese.numbers import convert_chinese_numbers
-from cantocaptions_ai.cantonese.questions import clean_question_particles
-from cantocaptions_ai.cantonese.rules import (
-    BUILTIN_RULES_DIR,
-    apply_ruleset,
-    get_builtin_ruleset,
-    load_ruleset,
-)
-from cantocaptions_ai.cantonese.text import REMOVE_STANDALONE_CHARS, is_removable
-from cantocaptions_ai.text_profiles import DEFAULT_CLEANING, word_wrap
+from cantocaptions_ai.cleaning.layout import linebreak_step
+from cantocaptions_ai.cleaning.rules import apply_ruleset, load_ruleset_cached
+from cantocaptions_ai.text_profiles import DEFAULT_CLEANING
 from cantocaptions_ai.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
-
-# Line breakers by ``ScriptConfig.layout``: "cjk" breaks at punctuation or between words
-# found by pycantonese segmentation; "word" breaks at the space nearest the middle.
-LAYOUTS: Mapping[str, Callable[[str, int], str]] = {
-    "cjk": linebreak,
-    "word": word_wrap,
-}
-
-# The coded steps a Cantonese manifest may name. A cleaner for another language passes its
-# own registry; ``linebreak`` is not in it because it is built per instance from the line
-# settings and layout.
-CANTONESE_BUILTIN_STEPS: Mapping[str, Callable[[str], str]] = {
-    "acronyms": format_acronyms,
-    "question_particles": clean_question_particles,
-    "chinese_numbers": convert_chinese_numbers,
-    "trim": trim,
-}
-
-
-def linebreak_step(
-    line_max_length: int, max_line_count: Optional[int], layout: str = "cjk",
-) -> Optional[Callable[[str], str]]:
-    """The line-layout step for these line limits, or None where no break is allowed.
-
-    Shared by the cleaner's ``linebreak`` builtin and by the pipeline's layout pass when
-    cleaning is off, so ``max_line_width``/``max_line_count`` mean the same either way.
-    ``layout`` picks the line breaker from ``LAYOUTS`` (the script's ``layout``).
-    """
-    if max_line_count is not None and max_line_count < 2:
-        return None  # a single-line output can't take a break
-    breaker = LAYOUTS[layout]
-    return lambda text: breaker(text, line_max_length)
 
 
 class SubtitleCleaner:
     """Applies the configured cleaning steps to a single subtitle line at a time."""
 
-    BUILTIN_STEPS = CANTONESE_BUILTIN_STEPS
-
     def __init__(
         self,
-        rules_dir: Optional[str] = None,
+        rules_dir: Union[str, Path],
         line_max_length: int = 18,
         max_line_count: Optional[int] = 1,
         manifest: str = DEFAULT_CLEANING.manifest,
         builtin_steps: Optional[Mapping[str, Callable[[str], str]]] = None,
-        noise_tokens: Sequence[str] = REMOVE_STANDALONE_CHARS,
+        noise_tokens: Sequence[str] = (),
         layout: str = "cjk",
     ) -> None:
-        """``builtin_steps`` are the coded steps a manifest may name (the Cantonese ones by
-        default); ``noise_tokens`` are the lines :meth:`is_noise` treats as droppable;
-        ``layout`` picks the line breaker for the ``linebreak`` step (see ``LAYOUTS``)."""
-        self.rules_dir = Path(rules_dir) if rules_dir is not None else BUILTIN_RULES_DIR
+        """``rules_dir`` holds the manifest and its rule files. ``builtin_steps`` are the
+        coded steps a manifest may name (``linebreak`` is always available, built from the
+        line settings and ``layout``); ``noise_tokens`` are the lines :meth:`is_noise`
+        treats as droppable."""
+        self.rules_dir = Path(rules_dir)
         self.manifest = manifest
         self.line_max_length = line_max_length
         self.max_line_count = max_line_count
-        self.builtin_steps = dict(CANTONESE_BUILTIN_STEPS if builtin_steps is None else builtin_steps)
+        self.builtin_steps = dict(builtin_steps or {})
         self.noise_tokens = tuple(noise_tokens)
         self.layout = layout
         # Fails fast on a missing/invalid manifest, rule file, or regex so problems
         # surface at pipeline start rather than after hours of ASR.
-        manifest_path, manifest = self._load_manifest()
-        self._steps = self._load_steps(manifest_path, manifest, "steps")
-        self._pre_align_steps = self._load_steps(manifest_path, manifest, "pre_align")
+        manifest_path, manifest_data = self._load_manifest()
+        self._steps = self._load_steps(manifest_path, manifest_data, "steps")
+        self._pre_align_steps = self._load_steps(manifest_path, manifest_data, "pre_align")
 
     def _load_manifest(self) -> Tuple[Path, dict]:
         manifest_path = self.rules_dir / self.manifest
@@ -137,13 +95,10 @@ class SubtitleCleaner:
                 file = entry.get("file")
                 if not file:
                     raise ValueError(f"{manifest_path}: {key} #{i + 1} is missing 'file'")
-                if self.rules_dir == BUILTIN_RULES_DIR:
-                    rules = get_builtin_ruleset(Path(file).stem)
-                else:
-                    rule_path = self.rules_dir / file
-                    if not rule_path.is_file():
-                        raise ValueError(f"{manifest_path}: {key} #{i + 1} rule file not found: {rule_path}")
-                    rules = load_ruleset(rule_path)
+                rule_path = self.rules_dir / file
+                if not rule_path.is_file():
+                    raise ValueError(f"{manifest_path}: {key} #{i + 1} rule file not found: {rule_path}")
+                rules = load_ruleset_cached(rule_path)
                 steps.append((file, lambda text, _rules=rules: apply_ruleset(text, _rules)))
             elif step_type == "builtin":
                 name = entry.get("name")
@@ -167,8 +122,8 @@ class SubtitleCleaner:
         return text
 
     def is_noise(self, text: str) -> bool:
-        """True if a cleaned line holds nothing worth showing (empty, or a lone interjection)."""
-        return is_removable(text, self.noise_tokens)
+        """True if a cleaned line holds nothing worth showing (empty, or a noise token)."""
+        return len(text) == 0 or text in self.noise_tokens
 
     def pre_align(self, text: str) -> str:
         """Apply the manifest's ``pre_align`` steps to raw ASR text (a no-op if it has none)."""

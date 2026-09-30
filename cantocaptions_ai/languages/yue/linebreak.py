@@ -48,7 +48,7 @@ def linebreak(text: str, line_max_length: int = 21, line_break_threshold: int = 
     # Otherwise, split at the first non-punctuation character that's not mid-word
     import pycantonese  # deferred: loads corpus data on first segment() call
 
-    from cantocaptions_ai.cantonese.text import is_punctuation
+    from cantocaptions_ai.languages.yue.text import is_punctuation
 
     for i in range(firstline_max_length, firstline_min_length - 1, -1):
         if is_punctuation(text[i]):

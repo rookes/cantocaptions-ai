@@ -992,7 +992,7 @@ def _execute_pipeline(
                 "(it is already a finished subtitle, not a raw transcript)", realign_mode,
             )
     elif not cfg.no_clean_text:
-        from cantocaptions_ai.cantonese.cleaner import SubtitleCleaner
+        from cantocaptions_ai.languages.yue.builtins import CantoneseCleaner as SubtitleCleaner
         cleaner = SubtitleCleaner(
             rules_dir=cfg.clean_rules_dir,
             line_max_length=cfg.max_line_width or 21,
@@ -1005,7 +1005,7 @@ def _execute_pipeline(
     elif cfg.max_line_width:
         # --no_clean_text turns off the rewriting, not the line limits the user also set:
         # line breaking lives in the cleaner's manifest, so it is applied on its own here.
-        from cantocaptions_ai.cantonese.cleaner import linebreak_step
+        from cantocaptions_ai.cleaning.layout import linebreak_step
         layout = linebreak_step(cfg.max_line_width, cfg.max_line_count, profile.script.layout)
 
     if cfg.load_debug_dir:

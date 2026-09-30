@@ -13,7 +13,7 @@ from cantocaptions_ai.pipeline.asr import QwenPipeline, _normalize_language
 from cantocaptions_ai.utils.audio import resolve_device
 from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
 from cantocaptions_ai.utils.model_utils import partition_by_cache, ensure_hf_model_downloaded, write_checkpoint
-from cantocaptions_ai.cantonese.text import normalize_segment_text
+from cantocaptions_ai.languages.yue.text import normalize_segment_text
 from cantocaptions_ai.text_profiles import DEFAULT_NORMALIZATION, TextNormalization
 from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 from cantocaptions_ai.utils.log_utils import get_logger

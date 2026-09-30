@@ -10,7 +10,7 @@ Covers:
 
 import unittest
 
-from cantocaptions_ai.cantonese.text import (
+from cantocaptions_ai.languages.yue.text import (
     DEFAULT_NORMALIZATION,
     PunctuationConfig,
     SegmentationConfig,

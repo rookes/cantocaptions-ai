@@ -8,7 +8,7 @@ clause subsegments, particle spot-checks, and what happens to text it cannot ali
 import pytest
 
 from _pipeline_fakes import FRAME_S, ScriptedAudio, StubVad, fake_align_model
-from cantocaptions_ai.cantonese.text import SpotCheck
+from cantocaptions_ai.languages.yue.text import SpotCheck
 from cantocaptions_ai.pipeline.alignment import align
 
 
