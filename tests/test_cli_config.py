@@ -270,9 +270,16 @@ class TestConfigDirDiscovery(unittest.TestCase):
             self.assertEqual(default_config_dir(), self.cwd / "config")
 
     def test_falls_back_to_the_checkout_and_creates_nothing_here(self):
-        with mock.patch.object(Path, "cwd", return_value=self.cwd):
-            self.assertEqual(default_config_dir(), cli_config._REPO_CONFIG_DIR)
+        checkout = self.cwd / "checkout-config"
+        checkout.mkdir()
+        with mock.patch.object(Path, "cwd", return_value=self.cwd), \
+                mock.patch.object(cli_config, "_REPO_CONFIG_DIR", checkout):
+            self.assertEqual(default_config_dir(), checkout)
         self.assertFalse((self.cwd / "config").exists())
+
+    def test_a_fresh_clone_has_a_config_dir_to_find(self):
+        """config/ holds only gitignored files and its README, which keeps it in a clone."""
+        self.assertTrue((cli_config._REPO_CONFIG_DIR / "README.md").is_file())
 
     def test_the_environment_variable_wins(self):
         (self.cwd / "config").mkdir()
