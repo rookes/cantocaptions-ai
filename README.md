@@ -29,13 +29,9 @@ This installs all dependencies plus the recommended ASR backend into an isolated
 environment and pins exact versions. Torch is pulled from the PyTorch CUDA 12.8 index on Linux and
 Windows; the CPU build is used on macOS.
 
-Note that bare `uv sync` does **not** install a working ASR backend. You need to pick one
-explicitly:
-
-```bash
-uv sync --extra transformers_qwen   # ASR via official transformers Qwen3-ASR support (recommended)
-uv sync --extra legacy              # ASR via the older qwen_asr package; mutually exclusive with transformers_qwen
-```
+Note that bare `uv sync` does **not** install support for Qwen3-ASR, the default (Cantonese)
+model family; the `transformers_qwen` extra adds it. Whisper and CTC (wav2vec2) models run on the base
+install.
 
 ## Basic Usage
 

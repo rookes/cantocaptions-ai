@@ -708,6 +708,17 @@ def validate_config(cfg) -> None:
         warnings.warn("reference_correction_semantic has no effect without reference_subtitle")
     if cfg.asr_context and not cfg.reference_subtitle:
         raise ConfigError("asr_context requires reference_subtitle")
+    if cfg.asr_context:
+        # Context biasing is a prompt feature of the model family; only some backends have
+        # one. Checked only when asked for, so a plain run never reads a model config here.
+        from cantocaptions_ai.pipeline.asr import backend_for
+        backend = backend_for(cfg.model, cfg.language, cache_dir=cfg.model_dir,
+                              local_files_only=cfg.model_cache_only)
+        if not backend.supports_context:
+            raise ConfigError(
+                f"asr_context is not supported by the {backend.name} ASR backend "
+                "(only qwen3-asr models take a context prompt)"
+            )
     if cfg.asr_context and cfg.asr_context_template not in CONTEXT_TEMPLATES:
         raise ConfigError(
             f"asr_context_template must be one of {sorted(CONTEXT_TEMPLATES)}, "
@@ -1356,8 +1367,8 @@ def _execute_pipeline(
                     # GPU through alignment and diarization.
                     del model
         else:
-            from cantocaptions_ai.pipeline.asr import QwenPipeline
-            items = QwenPipeline.load_cache(items, cfg.load_debug_dir)
+            from cantocaptions_ai.pipeline.asr import AsrStage
+            items = AsrStage.load_cache(items, cfg.load_debug_dir)
 
         # Stage 3b: Ensemble ASR (optional)
         if cfg.ensemble_model != "none":
