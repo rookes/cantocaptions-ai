@@ -2,7 +2,7 @@
 
 For many smaller languages a fine-tuned wav2vec2 / wav2vec2-BERT / HuBERT CTC model is the
 only ASR there is. The forward pass is the alignment code's own
-(``alignment._compute_vad_emissions_batched``), which already handles both input families
+(the ``huggingface`` align backend's, ``align_backends``), which already handles both input families
 (fbank features and raw samples), batch padding and trimming each row back to its real
 length; this backend takes the per-frame argmax and lets the processor collapse repeats,
 drop blanks and turn the word delimiter into a space.
@@ -80,16 +80,14 @@ class CtcAsr(BatchedAsrStage):
             self._silent_ids.add(delimiter)
 
     def _infer_batch(self, wavs: List, language: str, contexts=None) -> List[str]:
-        from cantocaptions_ai.pipeline.alignment import (
-            MIN_ALIGN_SAMPLES,
-            _compute_vad_emissions_batched,
-        )
+        from cantocaptions_ai.pipeline.align_backends import ALIGN_BACKENDS
+        from cantocaptions_ai.pipeline.alignment import MIN_ALIGN_SAMPLES
 
         # Below one feature frame the extractor fails outright, and there is nothing to hear.
         usable = [i for i, w in enumerate(wavs) if len(w) >= MIN_ALIGN_SAMPLES]
         segments = [{"start": 0.0, "end": len(wavs[i]) / SAMPLE_RATE, "audio": wavs[i]}
                     for i in usable]
-        emissions = _compute_vad_emissions_batched(
+        emissions = ALIGN_BACKENDS["huggingface"].emissions(
             segments, self.model, self.processor, self.model.device,
             batch_size=max(len(segments), 1), vram_checks=self.vram_checks,
         ) if segments else []

@@ -37,6 +37,7 @@ from cantocaptions_ai.utils.model_utils import (
 from cantocaptions_ai.utils.debug import load_transcription_debug, write_transcription_debug
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.output import LANGUAGES
+from cantocaptions_ai.pipeline.align_backends import CTC_MODEL_TYPES
 from cantocaptions_ai.text_profiles import (
     DEFAULT_NORMALIZATION,
     LATIN_SPLIT_CHARS,
@@ -322,10 +323,7 @@ ASR_BACKENDS: Dict[str, AsrBackend] = {
 _MODEL_TYPE_BACKENDS = {
     "qwen3_asr": "qwen3-asr",
     "whisper": "whisper",
-    **{model_type: "ctc" for model_type in (
-        "wav2vec2", "wav2vec2-bert", "wav2vec2-conformer", "hubert", "wavlm",
-        "data2vec-audio", "sew", "sew-d", "unispeech", "unispeech-sat",
-    )},
+    **{model_type: "ctc" for model_type in CTC_MODEL_TYPES},
 }
 
 
