@@ -277,10 +277,18 @@ cantocaptions-dataset test-split clips into episodes with an exact reference SRT
 
 ### Architecture
 
-The pipeline (`cantocaptions_ai/pipeline/transcribe.py`, `_execute_pipeline`) runs a fixed sequence of
-stages over every input file: VAD → vocal isolation (optional) → ASR → ensemble / LLM correction
-(optional) → forced alignment → diarization (optional) → cue assembly and text cleaning → writers.
-Each model-backed stage is a `PipelineStage` (`utils/model_utils.py`) with its own debug checkpoint.
+The pipeline runs a list of stages over every input file: VAD → vocal isolation (optional) → ASR →
+ensemble / LLM correction (optional) → forced alignment → diarization (optional), then cue assembly, text
+cleaning and the writers. The stages are objects in `cantocaptions_ai/pipeline/stages.py`; `build_stages`
+picks the ones a config needs, and `_execute_pipeline` (`pipeline/transcribe.py`) runs them in order after
+logging the plan, e.g. `Pipeline: VAD [cached] → Transcription [compute] → Alignment`. A model stage with a
+debug checkpoint (`CachedStage`) computes, or reads every file back from `--load_debug_dir` when all of them
+have a current checkpoint. Each model itself is a `PipelineStage` (`utils/model_utils.py`).
+
+To add a stage, subclass `Stage` (`run(ctx, items) -> items`, plus `active(ctx)` if it is optional) or
+`CachedStage` (`compute` and `from_cache`, plus a `checkpoint` key in `utils/checkpoints.py`), and add it
+to `DEFAULT_STAGES` where it belongs. A caller can also pass `_execute_pipeline(..., stages=fn)`, where
+`fn(ctx, default_stages)` returns the list to run, to insert or replace one without editing the package.
 
 Everything that depends on the language is gathered into one **language pack** per language
 (`cantocaptions_ai/languages/`): how it is written (`ScriptConfig`, `PunctuationConfig` from
