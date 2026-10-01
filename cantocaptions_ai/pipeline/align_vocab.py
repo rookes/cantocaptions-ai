@@ -14,6 +14,11 @@ Two substitutions recover almost all of it, tried in this order:
 2. **A homophone.** 駒 (keoi1) is absent while 區 (keoi1) is present, and to an acoustic
    model those are the same syllable.
 
+Both need to know the language -- its variant forms, how its characters sound -- which its
+language pack supplies (``LanguagePack.char_readings``; Cantonese's is Jyutping, in
+``languages/yue/readings.py``). A language without one gets only the overrides and the align
+model's own substitution table.
+
 **This is not a text edit.** The original character stays in ``clean_char`` and therefore in
 the subtitle -- exactly the way punctuation keeps its own character while being tokenised as
 blank. Only the token id changes.
@@ -45,7 +50,10 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Tuple
+
+if TYPE_CHECKING:
+    from cantocaptions_ai.languages.base import CharReadings
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +76,7 @@ KIND_NEAR = "near-homophone"
 KIND_HELP = {
     KIND_OVERRIDE: "substituted by hand from --align_substitutions",
     KIND_VARIANT: "a Simplified or variant form of a character the model knows",
-    KIND_HOMOPHONE: "substituted by a character with the same Jyutping reading",
+    KIND_HOMOPHONE: "substituted by a character with the same reading",
     KIND_NEAR: "substituted by a character with the same syllable, different tone",
 }
 
@@ -107,33 +115,6 @@ class RepairReport:
         return Counter(s.kind for s in self.substitutions.values())
 
 
-# --- Readings -------------------------------------------------------------------------
-
-@lru_cache(maxsize=None)
-def reading_of(char: str) -> Optional[str]:
-    """The Jyutping for a single character, or None if nothing knows it.
-
-    Goes through pycantonese's public converter rather than its bundled dictionary, which is
-    an internal module. Only one reading per character is available there, so a polyphone is
-    matched on its commonest reading -- acceptable, given the alternative for these
-    characters is no token at all.
-    """
-    try:
-        import pycantonese
-    except ImportError:  # pragma: no cover - pycantonese is a base dependency
-        logger.warning("pycantonese is not installed; homophone substitution is unavailable.")
-        return None
-    got = pycantonese.characters_to_jyutping(char)
-    reading = got[0][1] if got else None
-    # A multi-syllable result means the converter re-segmented, which is not a character
-    # reading.
-    return reading if reading and " " not in reading else None
-
-
-def _toneless(reading: str) -> str:
-    return reading.rstrip("123456")
-
-
 def _repairable(char: str) -> bool:
     """Only letters. See the module docstring on digits and punctuation."""
     return (
@@ -158,12 +139,16 @@ class VocabRepair:
         dictionary: Dict[str, int],
         level: str = LEVEL_HOMOPHONE,
         overrides: Optional[Mapping[str, str]] = None,
+        readings: Optional["CharReadings"] = None,
     ) -> None:
         if level not in LEVELS:
             raise ValueError(f"unknown substitution level {level!r}; expected one of {LEVELS}")
         self.dictionary = dictionary
         self.level = level
         self.overrides = dict(overrides or {})
+        # The language's (languages.base.CharReadings). Without it the variant and homophone
+        # tiers have nothing to go on, and only the overrides apply.
+        self.readings = readings
         self.substitutions: Dict[str, Substitution] = {}
         self.unresolved: Dict[str, None] = {}
         self._exact: Optional[Dict[str, List[str]]] = None
@@ -178,24 +163,18 @@ class VocabRepair:
         the commoner character more often and so holds a better-trained token for it, then by
         code point so that a run is reproducible.
         """
-        freq: "Counter[str]" = Counter()
-        try:
-            import pycantonese
-            for word in pycantonese.hkcancor().words():
-                freq.update(word)
-        except Exception as exc:  # pragma: no cover - corpus ships with pycantonese
-            logger.debug("No HKCanCor frequencies for substitution ranking (%s)", exc)
+        freq = self.readings.frequencies()
 
         exact: Dict[str, List[str]] = {}
         near: Dict[str, List[str]] = {}
         for char in self.dictionary:
             if not _repairable(char):
                 continue
-            reading = reading_of(char)
+            reading = self._reading(char)
             if not reading:
                 continue
             exact.setdefault(reading, []).append(char)
-            near.setdefault(_toneless(reading), []).append(char)
+            near.setdefault(self.readings.toneless(reading), []).append(char)
         for index in (exact, near):
             for reading in index:
                 index[reading].sort(key=lambda c: (-freq.get(c, 0), ord(c)))
@@ -221,7 +200,7 @@ class VocabRepair:
             # An empty override means "leave this one alone", so one bad automatic choice
             # can be switched off without switching off the feature.
             if forced and forced in self.dictionary:
-                return Substitution(char, forced, KIND_OVERRIDE, reading_of(char) or "")
+                return Substitution(char, forced, KIND_OVERRIDE, self._reading(char) or "")
             if forced:
                 logger.warning(
                     "Substitution override %r -> %r ignored: the align model has no token "
@@ -229,20 +208,20 @@ class VocabRepair:
                 )
             return None
 
-        if not _repairable(char):
+        if not _repairable(char) or self.readings is None:
             return None
 
         # 1. A variant fold, which is not an acoustic substitution at all -- the transcript
         #    simply spelled a character the model knows in the wrong character set.
         variant = self._variant(char)
         if variant is not None and variant in self.dictionary:
-            return Substitution(char, variant, KIND_VARIANT, reading_of(char) or "")
+            return Substitution(char, variant, KIND_VARIANT, self._reading(char) or "")
         if LEVELS.index(self.level) < LEVELS.index(LEVEL_HOMOPHONE):
             return None
 
         # 2. A homophone. Fall back to the *variant's* reading when the original has none:
         #    撺 is unknown to the reading data, but 攛 (cyun1) is not.
-        reading = reading_of(char) or (reading_of(variant) if variant else None)
+        reading = self._reading(char) or (self._reading(variant) if variant else None)
         if not reading:
             return None
         if self._exact is None:
@@ -255,19 +234,16 @@ class VocabRepair:
 
         # 3. The same syllable on a different tone. Weaker evidence, but the alternative is a
         #    character the trellis cannot see at all.
-        candidate = self._first_candidate(self._near, _toneless(reading), char)
+        candidate = self._first_candidate(self._near, self.readings.toneless(reading), char)
         if candidate is not None:
             return Substitution(char, candidate, KIND_NEAR, reading)
         return None
 
+    def _reading(self, char: str) -> Optional[str]:
+        return self.readings.reading(char) if self.readings is not None else None
+
     def _variant(self, char: str) -> Optional[str]:
-        from cantocaptions_ai.languages.yue.text import simplified_to_traditional
-        try:
-            converted = simplified_to_traditional(char)
-        except Exception as exc:  # pragma: no cover - opencc is a base dependency
-            logger.debug("OpenCC unavailable for variant folding (%s)", exc)
-            return None
-        return converted if len(converted) == 1 and converted != char else None
+        return self.readings.variant(char) if self.readings is not None else None
 
     # -- application --
 

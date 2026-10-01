@@ -17,7 +17,7 @@ to the functions that need them, so reading the registry stays cheap.
 """
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Mapping, Optional, Tuple
+from typing import Callable, List, Mapping, Optional, Protocol, Tuple
 
 from cantocaptions_ai.languages.align_defaults import default_align_model
 from cantocaptions_ai.text_profiles import (
@@ -33,6 +33,32 @@ from cantocaptions_ai.text_profiles import (
     punctuation_for_script,
     script_for_language,
 )
+
+
+class CharReadings(Protocol):
+    """How a language's characters sound, for alignment's vocab repair.
+
+    An align model can only place a character it holds a token for. ``pipeline/align_vocab``
+    gives an unknown character the token of one the model does know: its variant form
+    (a Simplified character's Traditional one), or failing that a homophone. Both need
+    knowledge of the language, which a pack supplies through this. Without it only the
+    align model's own hand-picked substitution table applies.
+    """
+
+    # The romanisation, as named in log lines and notes (e.g. "Jyutping").
+    label: str
+
+    def reading(self, char: str) -> Optional[str]:
+        """The character's pronunciation, toned, or None if unknown."""
+
+    def toneless(self, reading: str) -> str:
+        """*reading* without its tone: the "near" tier's same-syllable match."""
+
+    def variant(self, char: str) -> Optional[str]:
+        """The standard form of a variant character, or None if it has none."""
+
+    def frequencies(self) -> Mapping[str, int]:
+        """Character counts from a corpus, to prefer the commoner of several homophones."""
 
 
 @dataclass(frozen=True)
@@ -119,6 +145,9 @@ class LanguagePack:
     # streams -> index of the audio track to use; None matches the language code
     # (utils.audio.select_track).
     track_selector: Optional[Callable[[List[dict]], int]] = None
+    # () -> CharReadings, for alignment's vocab repair. A factory so that importing a pack
+    # never imports its pronunciation data; None: only per-model substitution tables apply.
+    char_readings: Optional[Callable[[], CharReadings]] = None
 
     @property
     def fully_supported(self) -> bool:

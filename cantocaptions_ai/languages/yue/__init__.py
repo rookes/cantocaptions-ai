@@ -75,6 +75,11 @@ def _builtin_steps():
     return builtin_steps()
 
 
+def _char_readings():
+    from cantocaptions_ai.languages.yue.readings import JYUTPING
+    return JYUTPING
+
+
 def _select_track(streams: List[dict]) -> int:
     from cantocaptions_ai.utils.audio import select_cantonese_track
     return select_cantonese_track(streams)
@@ -104,4 +109,5 @@ YUE = LanguagePack(
     correction_prompts=CORRECTION_PROMPTS,
     ensemble_model=("alvanlii/whisper-small-cantonese", "cts"),
     track_selector=_select_track,
+    char_readings=_char_readings,
 )

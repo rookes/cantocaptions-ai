@@ -1025,11 +1025,12 @@ def load_align_model(
     opt-in with float32 as the default since it can measurably affect forced-alignment
     accuracy.
     """
+    from cantocaptions_ai.languages import get_language_pack
+    pack = get_language_pack(language_code)
     if model_name is None:
         # The language pack's choice; an unregistered language's generic pack takes the
         # built-in tables (languages/align_defaults.py).
-        from cantocaptions_ai.languages import get_language_pack
-        model_name = get_language_pack(language_code).default_align_model
+        model_name = pack.default_align_model
         if model_name is None:
             logger.error(
                 f"No default alignment model for language: {language_code}. "
@@ -1051,6 +1052,13 @@ def load_align_model(
     profile = get_align_profile(model_name)
     if char_substitution is None:
         char_substitution = profile.char_substitution
+    readings = pack.char_readings() if pack.char_readings is not None else None
+    if readings is None and char_substitution != "off":
+        logger.warning(
+            "Align char substitution %r needs character readings, which language %r does not "
+            "provide; only the align model's substitution table and --align_substitutions apply.",
+            char_substitution, language_code,
+        )
     align_metadata = {
         "language": language_code,
         "dictionary": align_dictionary,
@@ -1074,6 +1082,7 @@ def load_align_model(
                 bundled_substitutions(profile.substitutions) if profile.substitutions else None,
                 substitution_overrides,
             ),
+            readings=readings,
         ),
         # Resolved once here rather than in align(), which then has no idea which model it
         # is holding. Unknown models get the all-no-op default.
