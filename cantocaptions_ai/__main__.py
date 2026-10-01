@@ -164,8 +164,8 @@ def build_parser() -> argparse.ArgumentParser:
     cues_grp.add_argument("--merge_gap", type=float, default=argparse.SUPPRESS, help="the maximum silence (seconds) a too-short subtitle may be merged across; doubled for the discourse markers listed in the ASR model's profile")
 
     subtitle_grp = parser.add_argument_group("subtitle formatting")
-    subtitle_grp.add_argument("--max_line_width", type=optional_int, default=argparse.SUPPRESS, help="(not possible with --no_align) the maximum number of characters in a line before text cleaning breaks the line")
-    subtitle_grp.add_argument("--max_line_count", type=optional_int, default=argparse.SUPPRESS, help="(not possible with --no_align) the maximum number of lines in a segment; text cleaning only breaks lines when this is 2 or more")
+    subtitle_grp.add_argument("--max_line_width", type=optional_int, default=argparse.SUPPRESS, help="the maximum number of characters in a line before it is broken. Unset, the language's own width (18 for Chinese, 42 for space-separated scripts); 0 never breaks a line")
+    subtitle_grp.add_argument("--max_line_count", type=optional_int, default=argparse.SUPPRESS, help="the maximum number of lines in a subtitle; lines are only broken when this is 2 or more")
 
     clean_grp = parser.add_argument_group("text cleaning")
     clean_grp.add_argument("--no_clean_text", action="store_true", default=argparse.SUPPRESS, help="disable Cantonese subtitle text cleaning (punctuation, HK conventions, particle fixes, interjection removal, line breaking)")

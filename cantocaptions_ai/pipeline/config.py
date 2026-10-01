@@ -132,7 +132,10 @@ class PipelineConfig:
     align_split_gap: Optional[float] = None
 
     # Subtitle formatting
-    max_line_width: Optional[int] = 18
+    # Characters per line before text is broken onto the next. None: the language's own width
+    # (its script's line_width: 18 for Chinese, 42 for space-separated scripts), filled in by
+    # validate_config (see LANGUAGE_DEFAULTED). 0: never break a line.
+    max_line_width: Optional[int] = None
     max_line_count: Optional[int] = 2
 
     # Text cleaning
@@ -403,6 +406,13 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
         "realign_adjust_tolerance", "realign_normalize", "realign_sync_anchor_density",
         "realign_anchor", "realign_window", "realign_commit_margin", "realign_min_score",
     ),
+})
+
+# Settings whose unset (None) value means "whatever the language does": validate_config fills
+# each in from the run profile (the language pack resolved for the ASR model), so a
+# Cantonese value never becomes another language's default by accident.
+LANGUAGE_DEFAULTED: Mapping[str, Any] = MappingProxyType({
+    "max_line_width": lambda profile: profile.script.line_width,
 })
 
 _SECTION_OF: Dict[str, str] = {

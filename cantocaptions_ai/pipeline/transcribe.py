@@ -399,12 +399,15 @@ def validate_config(cfg) -> None:
             raise ConfigError(f"Unsupported language: {cfg.language}")
     _validate_language_support(cfg)
 
-    if cfg.no_align:
-        for option in ("max_line_count", "max_line_width"):
-            if getattr(cfg, option):
-                raise ConfigError(f"{option} not possible with no_align")
-    if cfg.max_line_count and not cfg.max_line_width:
-        warnings.warn("max_line_count has no effect without max_line_width")
+    # Settings left unset that the language decides (config.LANGUAGE_DEFAULTED). Line
+    # breaking is a text step (cleaning/layout.py), so it applies under --no_align too; the
+    # old rule refusing line limits there dated from writers that split on word timings.
+    from cantocaptions_ai.languages import get_language_pack
+    from cantocaptions_ai.pipeline.config import LANGUAGE_DEFAULTED
+    profile = get_language_pack(cfg.language).resolve(cfg.model)
+    for option, from_profile in LANGUAGE_DEFAULTED.items():
+        if getattr(cfg, option) is None:
+            setattr(cfg, option, from_profile(profile))
 
 
 def _prepare_clips(audio_paths: List[str], cfg):
@@ -584,7 +587,7 @@ def _execute_pipeline(
         spec = pack.cleaning  # validate_config guarantees one when cleaning is on
         cleaner = SubtitleCleaner(
             rules_dir=cfg.clean_rules_dir or spec.rules_dir,
-            line_max_length=cfg.max_line_width or 21,
+            line_max_length=cfg.max_line_width,
             max_line_count=cfg.max_line_count,
             # How much cleaning the text needs depends on how the model writes it, so the
             # step manifest comes from the model's conventions like every other output one.
