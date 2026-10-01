@@ -178,3 +178,117 @@ def test_whisper_loader_takes_the_common_load_arguments():
                  "download_root", "local_files_only", "batch_size", "vram_checks",
                  "vram_headroom_mb", "normalization"):
         assert name in params, name
+
+
+# --- ctc -----------------------------------------------------------------------------
+
+_CTC_VOCAB = ["<pad>", "<s>", "</s>", "<unk>", "|", "a", "b", "c"]
+
+
+def _tiny_ctc_checkpoint(tmp_path):
+    """A random 1-layer wav2vec2 CTC model with its processor, saved like a hub checkpoint."""
+    import json
+
+    import torch
+    from transformers import (
+        Wav2Vec2Config,
+        Wav2Vec2CTCTokenizer,
+        Wav2Vec2FeatureExtractor,
+        Wav2Vec2ForCTC,
+        Wav2Vec2Processor,
+    )
+
+    config = Wav2Vec2Config(
+        hidden_size=16, num_hidden_layers=1, num_attention_heads=2, intermediate_size=32,
+        conv_dim=(16,) * 7, vocab_size=len(_CTC_VOCAB), pad_token_id=0,
+        num_conv_pos_embeddings=16, num_conv_pos_embedding_groups=2,
+    )
+    torch.manual_seed(0)
+    model = Wav2Vec2ForCTC(config).eval()
+    vocab_file = tmp_path / "vocab.json"
+    vocab_file.write_text(json.dumps({tok: i for i, tok in enumerate(_CTC_VOCAB)}))
+    tokenizer = Wav2Vec2CTCTokenizer(str(vocab_file), pad_token="<pad>", unk_token="<unk>",
+                                     word_delimiter_token="|")
+    extractor = Wav2Vec2FeatureExtractor(feature_size=1, sampling_rate=16000, padding_value=0.0,
+                                         do_normalize=True, return_attention_mask=True)
+    checkpoint = tmp_path / "ctc"
+    Wav2Vec2Processor(feature_extractor=extractor, tokenizer=tokenizer).save_pretrained(checkpoint)
+    model.save_pretrained(checkpoint)
+    return str(checkpoint)
+
+
+def _noise(*seconds):
+    rng = np.random.default_rng(0)
+    return [{"start": float(i), "end": float(i) + s,
+             "audio": rng.standard_normal(int(s * 16000)).astype(np.float32)}
+            for i, s in enumerate(seconds)]
+
+
+def test_a_wav2vec2_checkpoint_is_detected_and_loads_as_ctc(tmp_path):
+    from cantocaptions_ai.pipeline._asr_ctc import CtcAsr
+
+    checkpoint = _tiny_ctc_checkpoint(tmp_path)
+    assert backend_for(checkpoint).name == "ctc"
+    stage = asr.load_model(checkpoint, device="cpu", language="en", local_files_only=True,
+                           batch_size=2, vram_checks=False)
+    assert isinstance(stage, CtcAsr)
+    result = stage.process(_noise(1.0, 0.5, 1.5))
+    assert len(result["segments"]) == 3
+    assert all(isinstance(s["text"], str) for s in result["segments"])
+    assert result["language"] == "en"
+
+
+def test_ctc_decodes_greedily_and_collapses_repeats_per_segment(tmp_path):
+    """Scripted logits: every segment spells "a a <pad> a b | c", then blanks to its end."""
+    import torch
+    from transformers import AutoProcessor
+
+    from cantocaptions_ai.pipeline._asr_ctc import CtcAsr
+
+    checkpoint = _tiny_ctc_checkpoint(tmp_path)
+    processor = AutoProcessor.from_pretrained(checkpoint)
+    script = [_CTC_VOCAB.index(t) for t in ("a", "a", "<pad>", "a", "b", "|", "c")]
+
+    from transformers import Wav2Vec2ForCTC
+
+    class _Scripted(Wav2Vec2ForCTC):
+        def forward(self, input_values, attention_mask=None, **_):
+            batch, samples = input_values.shape
+            frames = int(self._get_feat_extract_output_lengths(torch.tensor(samples)))
+            logits = torch.zeros(batch, frames, len(_CTC_VOCAB))
+            logits[:, :, 0] = 1.0
+            for t, token in enumerate(script):
+                logits[:, t, token] = 5.0
+            return type("Out", (), {"logits": logits})()
+
+    model = _Scripted.from_pretrained(checkpoint).eval()
+    stage = CtcAsr(model, processor, device="cpu", language="en", batch_size=4,
+                   vram_checks=False)
+    result = stage.process(_noise(1.0, 2.0))
+    assert [s["text"] for s in result["segments"]] == ["aab c", "aab c"]
+
+
+def test_ctc_gives_a_segment_too_short_for_one_frame_no_text(tmp_path):
+    from transformers import AutoModelForCTC, AutoProcessor
+
+    from cantocaptions_ai.pipeline._asr_ctc import CtcAsr
+
+    checkpoint = _tiny_ctc_checkpoint(tmp_path)
+    stage = CtcAsr(AutoModelForCTC.from_pretrained(checkpoint).eval(),
+                   AutoProcessor.from_pretrained(checkpoint), device="cpu", language="en",
+                   vram_checks=False)
+    assert stage._infer_batch([np.zeros(100, np.float32)], "en") == [""]
+
+
+@pytest.mark.parametrize("model", ["whisper-large-v3", "ctc"])
+def test_asr_context_is_refused_for_a_backend_without_it(tmp_path, model):
+    from cantocaptions_ai.pipeline.config import PipelineConfig
+    from cantocaptions_ai.errors import ConfigError
+    from cantocaptions_ai.pipeline.transcribe import validate_config
+
+    if model == "ctc":
+        model = _tiny_ctc_checkpoint(tmp_path)
+    cfg = PipelineConfig(model=model, reference_subtitle="ref.srt", asr_context=True,
+                         model_cache_only=True)
+    with pytest.raises(ConfigError, match="asr_context is not supported"):
+        validate_config(cfg)

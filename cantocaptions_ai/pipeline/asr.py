@@ -271,6 +271,7 @@ ASR_BACKENDS: Dict[str, AsrBackend] = {
         AsrBackend("qwen3-asr", "cantocaptions_ai.pipeline._asr_native:load_model_native",
                    supports_context=True),
         AsrBackend("whisper", "cantocaptions_ai.pipeline._asr_whisper:load_model_whisper"),
+        AsrBackend("ctc", "cantocaptions_ai.pipeline._asr_ctc:load_model_ctc"),
     )
 }
 
@@ -278,6 +279,10 @@ ASR_BACKENDS: Dict[str, AsrBackend] = {
 _MODEL_TYPE_BACKENDS = {
     "qwen3_asr": "qwen3-asr",
     "whisper": "whisper",
+    **{model_type: "ctc" for model_type in (
+        "wav2vec2", "wav2vec2-bert", "wav2vec2-conformer", "hubert", "wavlm",
+        "data2vec-audio", "sew", "sew-d", "unispeech", "unispeech-sat",
+    )},
 }
 
 
