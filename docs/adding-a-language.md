@@ -36,8 +36,8 @@ EN = LanguagePack(
 )
 ```
 
-Register it next to yue in `languages/__init__.py` (`_register_builtin_packs`), or from your own code
-with `register_language_pack(EN)`. With only this, `--language en` needs no `--model`, but still needs
+Register it next to yue in `languages/__init__.py` (`_register_builtin_packs`), from your own code
+with `register_language_pack(EN)`, or from a package of its own (see "Shipping a pack as its own package"). With only this, `--language en` needs no `--model`, but still needs
 `--no_clean_text`: `fully_supported` means a default model **and** cleaning rules.
 
 The model can be any Qwen3-ASR, Whisper or wav2vec2-family CTC checkpoint: the backend is read from
@@ -98,6 +98,28 @@ comment = "optional"
 may name (yue's are numerals, question particles, acronyms and trimming). It is called only when a
 cleaner is built, so heavy NLP imports stay out of the registry. `noise_tokens` are whole cues dropped as
 pure interjection. `--clean_rules_dir` lets a user swap in their own directory.
+
+## Shipping a pack as its own package
+
+A pack does not have to live in this repository. Any installed distribution can register one through
+the `cantocaptions_ai.languages` entry-point group; the registry picks it up the first time it is read,
+with no import or registration call needed:
+
+```toml
+# pyproject.toml of your package
+[project]
+name = "cantocaptions-lang-en"
+dependencies = ["cantocaptions-ai"]
+
+[project.entry-points."cantocaptions_ai.languages"]
+en = "cantocaptions_lang_en:EN"     # a LanguagePack, or a zero-argument function returning one
+```
+
+After `pip install cantocaptions-lang-en`, `--language en` uses it. Keep the module that defines the pack
+light, since importing it is part of reading the registry: no torch, and heavy data (pronunciation tables,
+OpenCC) behind factories, as `char_readings` and `builtin_steps` already are. A pack that fails to load is
+skipped with a warning naming its distribution. One with the same code as a built-in pack replaces it, and
+a pack registered in code with `register_language_pack` wins over both.
 
 ## Testing a pack
 
