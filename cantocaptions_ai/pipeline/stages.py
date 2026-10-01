@@ -549,9 +549,17 @@ class RunContext:
 
 
 class Stage:
-    """One step of the pipeline. ``run`` takes and returns the item list."""
+    """One step of the pipeline. ``run`` takes and returns the item list.
+
+    ``key`` is the stage's stable, language-neutral id (what a UI translates by and a
+    progress record stores); ``name`` is its English label, the one its StageTimer and so
+    ``ProgressSink.stage_start`` use. ``timed`` says the stage runs under a StageTimer, and
+    so reports progress, rather than finishing in an instant.
+    """
 
     name: str = ""
+    key: str = ""
+    timed: bool = False
 
     def active(self, ctx: RunContext) -> bool:
         """Whether this stage is part of the run at all."""
@@ -560,18 +568,34 @@ class Stage:
     def run(self, ctx: RunContext, items: List[dict]) -> List[dict]:
         raise NotImplementedError
 
+    def status(self, ctx: RunContext) -> Optional[str]:
+        """``"compute"`` or ``"cached"`` for a stage with a checkpoint; None otherwise."""
+        return None
+
+    def timed_in(self, ctx: RunContext) -> bool:
+        """Whether this run of the stage will show progress (a cached load shows none)."""
+        return self.timed
+
     def describe(self, ctx: RunContext) -> str:
         """The stage as the run's plan line shows it."""
-        return self.name
+        status = self.status(ctx)
+        return f"{self.name} [{status}]" if status else self.name
 
 
 class CachedStage(Stage):
     """A model stage with a debug checkpoint: compute under a StageTimer, or load the cache."""
 
     checkpoint: str = ""
+    timed = True
 
     def needs_compute(self, ctx: RunContext) -> bool:
         return not ctx.all_cached(self.checkpoint)
+
+    def status(self, ctx: RunContext) -> Optional[str]:
+        return "compute" if self.needs_compute(ctx) else "cached"
+
+    def timed_in(self, ctx: RunContext) -> bool:
+        return self.needs_compute(ctx)
 
     def run(self, ctx: RunContext, items: List[dict]) -> List[dict]:
         if self.needs_compute(ctx):
@@ -584,9 +608,6 @@ class CachedStage(Stage):
 
     def from_cache(self, ctx: RunContext, items: List[dict]) -> List[dict]:
         raise NotImplementedError
-
-    def describe(self, ctx: RunContext) -> str:
-        return f"{self.name} [{'compute' if self.needs_compute(ctx) else 'cached'}]"
 
 
 def _stage_run(processor, ctx: RunContext, items, timer):
@@ -603,14 +624,18 @@ class VadStage(Stage):
     enter stage 2 as bare carriers and get their vad_segments from the isolation cache."""
 
     name = "VAD"
+    key = "vad"
 
     def _vad_paths(self, ctx: RunContext) -> List[str]:
         return [p for p, cached in zip(ctx.audio_paths, ctx.isolation_cached()) if not cached]
 
-    def describe(self, ctx: RunContext) -> str:
+    def status(self, ctx: RunContext) -> Optional[str]:
         paths = self._vad_paths(ctx)
-        computes = bool(paths) and not ctx.all_cached("vad", paths)
-        return f"{self.name} [{'compute' if computes else 'cached'}]"
+        return "compute" if paths and not ctx.all_cached("vad", paths) else "cached"
+
+    def timed_in(self, ctx: RunContext) -> bool:
+        # Its timer also covers loading VAD's own cache, for every file isolation did not.
+        return bool(self._vad_paths(ctx))
 
     def run(self, ctx: RunContext, items: List[dict]) -> List[dict]:
         from cantocaptions_ai.pipeline.vad import VadProcessor
@@ -694,6 +719,7 @@ class VadStage(Stage):
 
 class VocalIsolationStage(CachedStage):
     name = "Vocal isolation"
+    key = "vocal_isolation"
     checkpoint = "vocal_isolation"
 
     def active(self, ctx):
@@ -741,6 +767,8 @@ class RealignAcousticStage(Stage):
     instead and rejoins at alignment."""
 
     name = "Transcript realignment"
+    key = "realign"
+    timed = True
 
     def active(self, ctx):
         return ctx.realign_acoustic
@@ -846,6 +874,7 @@ class AsrContextStage(_AsrPath):
     """
 
     name = "ASR context"
+    key = "asr_context"
 
     def active(self, ctx):
         return super().active(ctx) and bool(ctx.cfg.asr_context and ctx.reference_cues)
@@ -898,6 +927,7 @@ class AsrContextStage(_AsrPath):
 
 class TranscriptionStage(_CachedAsrPath):
     name = "Transcription"
+    key = "transcription"
     checkpoint = "transcription"
 
     def compute(self, ctx, items, timer):
@@ -940,6 +970,7 @@ class TranscriptionStage(_CachedAsrPath):
 
 class EnsembleStage(_CachedAsrPath):
     name = "Ensemble ASR (faster-whisper)"
+    key = "ensemble"
     checkpoint = "ensemble"
 
     def active(self, ctx):
@@ -972,6 +1003,8 @@ class ReferenceMatchStage(_AsrPath):
     """Pair each ASR segment with the reference subtitle's text, for LLM correction."""
 
     name = "Reference subtitle matching"
+    key = "reference_match"
+    timed = True
 
     def active(self, ctx):
         return super().active(ctx) and bool(ctx.cfg.llm_correction and ctx.reference_cues)
@@ -989,6 +1022,7 @@ class ReferenceMatchStage(_AsrPath):
 
 class LlmCorrectionStage(_CachedAsrPath):
     name = "LLM correction"
+    key = "llm_correction"
     checkpoint = "llm_correction"
 
     def active(self, ctx):
@@ -1039,6 +1073,8 @@ class RealignAsrStage(_AsrPath):
     is, and from this point on the pipeline is identical to the acoustic anchor."""
 
     name = "Transcript matching"
+    key = "realign_match"
+    timed = True
 
     def active(self, ctx):
         return super().active(ctx) and bool(ctx.cfg.realign)
@@ -1060,6 +1096,7 @@ class PreAlignCleanStage(_AsrPath):
     and that text is the user's anyway."""
 
     name = "Pre-alignment cleaning"
+    key = "pre_align_clean"
 
     def active(self, ctx):
         return super().active(ctx) and ctx.cleaner is not None and not ctx.cfg.realign
@@ -1072,6 +1109,8 @@ class PreAlignCleanStage(_AsrPath):
 
 class AlignmentStage(_AsrPath):
     name = "Alignment"
+    key = "alignment"
+    timed = True
 
     def active(self, ctx):
         return super().active(ctx) and not ctx.cfg.no_align
@@ -1128,6 +1167,7 @@ class AlignmentStage(_AsrPath):
 
 class TimestampsStage(_AsrPath):
     name = "ASR timestamps (no alignment)"
+    key = "timestamps"
 
     def active(self, ctx):
         return super().active(ctx) and bool(ctx.cfg.no_align)
@@ -1144,6 +1184,7 @@ class DiarizationStage(CachedStage):
     veto a merge across a speaker change."""
 
     name = "Diarization"
+    key = "diarization"
     checkpoint = "diarization"
 
     def active(self, ctx):
@@ -1156,6 +1197,7 @@ class DiarizationStage(CachedStage):
 
 class SpeakerAssignStage(Stage):
     name = "Speaker assignment"
+    key = "speaker_assign"
 
     def active(self, ctx):
         return bool(ctx.cfg.diarize)
@@ -1176,6 +1218,25 @@ DEFAULT_STAGES = (
 def build_stages(ctx: RunContext) -> List[Stage]:
     """This run's stages, in order: every default stage that is active for its config."""
     return [stage for stage in (cls() for cls in DEFAULT_STAGES) if stage.active(ctx)]
+
+
+def plan_entries(ctx: RunContext, stages: Sequence[Stage]) -> List[Dict[str, Any]]:
+    """The run's plan as data, for ``ProgressSink.plan``: one entry per stage, in order.
+
+    ``key`` and ``label`` as on Stage (a stage of the caller's own with no key gets its
+    class name); ``timed`` whether it will report progress this run; ``cached`` True/False
+    for a stage with a checkpoint (read back, or computed), None for one without.
+    """
+    out = []
+    for stage in stages:
+        status = stage.status(ctx)
+        out.append({
+            "key": stage.key or type(stage).__name__,
+            "label": stage.name,
+            "timed": stage.timed_in(ctx),
+            "cached": None if status is None else status == "cached",
+        })
+    return out
 
 
 def describe_plan(ctx: RunContext, stages: Sequence[Stage]) -> str:

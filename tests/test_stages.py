@@ -172,3 +172,79 @@ def test_a_stage_inserted_through_the_hook_runs_in_place(tmp_path, monkeypatch, 
     assert [seg["text"] for seg in witness.seen] == [t for _, t in scripted.script]
     assert not any(seg.get("words") for seg in witness.seen)
     assert watched == baseline
+
+
+# --- the plan a progress sink receives -------------------------------------------------
+
+def test_plan_entries_carry_stable_keys_and_what_will_run(tmp_path):
+    from cantocaptions_ai.pipeline.stages import plan_entries
+
+    ctx = ctx_for()
+    assert plan_entries(ctx, build_stages(ctx)) == [
+        {"key": "vad", "label": "VAD", "timed": True, "cached": False},
+        {"key": "transcription", "label": "Transcription", "timed": True, "cached": False},
+        {"key": "alignment", "label": "Alignment", "timed": True, "cached": None},
+    ]
+
+    cached = ctx_for(load_debug_dir=str(tmp_path))
+    _checkpoint(cached, "a.wav", "vad", tmp_path)
+    _checkpoint(cached, "a.wav", "transcription", tmp_path, marker="result.json")
+    vad, asr, _ = plan_entries(cached, build_stages(cached))
+    assert (vad["cached"], vad["timed"]) == (True, True)   # VAD's timer covers its cache load
+    assert (asr["cached"], asr["timed"]) == (True, False)  # a cached model stage runs no timer
+
+
+def test_every_stage_has_its_own_key():
+    from cantocaptions_ai.pipeline.stages import DEFAULT_STAGES
+
+    keys = [cls.key for cls in DEFAULT_STAGES]
+    assert all(keys) and len(keys) == len(set(keys))
+
+
+def test_realign_and_diarize_plans():
+    from cantocaptions_ai.pipeline.stages import plan_entries
+
+    ctx = ctx_for(realign="t.srt", realign_anchor="acoustic", diarize=True)
+    assert [e["key"] for e in plan_entries(ctx, build_stages(ctx))] == [
+        "vad", "realign", "diarization", "speaker_assign"]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+def test_a_sink_with_plan_gets_it_once_before_the_first_stage(tmp_path, monkeypatch):
+    from _pipeline_fakes import ScriptedAudio, install
+    from cantocaptions_ai.pipeline.transcribe import _execute_pipeline, validate_config
+
+    scripted = ScriptedAudio()
+    install(monkeypatch, scripted)
+    media = scripted.write_wav(tmp_path / "episode.wav")
+    cfg = PipelineConfig(device="cpu", print_progress=False, audio_normalize=False,
+                         output_dir=str(tmp_path / "out"))
+    validate_config(cfg)
+
+    class Sink:
+        def __init__(self):
+            self.events = []
+
+        def plan(self, stages):
+            self.events.append(("plan", [s["key"] for s in stages],
+                                [s["label"] for s in stages if s["timed"]]))
+
+        def stage_start(self, name):
+            self.events.append(("start", name))
+
+        def stage_end(self, name):
+            pass
+
+        def set_total(self, total, unit="it"):
+            pass
+
+        def advance(self, n=1):
+            pass
+
+    sink = Sink()
+    _execute_pipeline([media], cfg, collect=True, progress=sink)
+    assert sink.events[0][:2] == ("plan", ["vad", "transcription", "pre_align_clean",
+                                           "alignment"])
+    assert [e for e in sink.events if e[0] == "plan"] == [sink.events[0]]
+    started = [e[1] for e in sink.events if e[0] == "start"]
+    assert started == sink.events[0][2]   # every timed stage reports, by its plan label

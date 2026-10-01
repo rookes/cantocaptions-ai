@@ -648,7 +648,7 @@ def _execute_pipeline(
             )
 
     from cantocaptions_ai.pipeline.stages import (
-        RunContext, build_stages, describe_plan, run_stages,
+        RunContext, build_stages, describe_plan, plan_entries, run_stages,
     )
     ctx = RunContext(
         cfg=cfg, audio_paths=list(audio_paths), name_of=name_of, checkpoints=checkpoints,
@@ -661,6 +661,10 @@ def _execute_pipeline(
     if stages is not None:
         stage_list = list(stages(ctx, stage_list))
     logger.info("Pipeline: %s", describe_plan(ctx, stage_list))
+    # A sink that wants the whole plan up front (a UI's stage list) says so with plan().
+    send_plan = getattr(progress, "plan", None)
+    if callable(send_plan):
+        send_plan(plan_entries(ctx, stage_list))
 
     items: List[dict] = [
         {'audio_path': p, 'name': name_of[p], 'checkpoints': checkpoints} for p in audio_paths
