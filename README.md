@@ -294,9 +294,14 @@ Behaviour that depends on a particular model rather than a language is looked up
   languages it is trained for. The backends (Qwen3-ASR, Whisper, CTC) are registered in `pipeline/asr.py`
   (`ASR_BACKENDS`); an unregistered model's backend is read from its checkpoint's `model_type`.
 * `pipeline/align_profiles.py` — per alignment model: audio primer, hand-picked character substitutions
-  and the default substitution level (Jyutping homophones only for the Cantonese model), internal-gap
+  and the default substitution level (homophones only for the Cantonese model), internal-gap
   splitting, minimum input length. The model's own processor and emission frame rate come with it from
   `load_align_model`.
+* `pipeline/align_backends.py` — how each family of alignment model is loaded and run: any Hugging Face CTC
+  checkpoint (batched), or a torchaudio pipeline bundle by name. The family is read from the model itself.
+
+Substituting a character the align model has no token for (its variant form, or a homophone) needs to know
+how the language sounds, so that comes from the language pack (`char_readings`; Jyutping for Cantonese).
 
 Text cleaning is a language-independent engine (`cantocaptions_ai/cleaning/`: a manifest of TOML regex rule
 files and coded builtin steps) that each pack supplies with rules; cue assembly, alignment, realign and line

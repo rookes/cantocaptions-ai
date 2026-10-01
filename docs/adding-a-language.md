@@ -60,7 +60,10 @@ other language.
 | `track_selector` | `streams -> index`, when the audio-track tags need more than a language-code match (yue prefers an explicit Cantonese track, then any Chinese one). |
 | `correction_prompts` | `CorrectionPrompts` for `--llm_correction`. Without it, the option is refused for the language. |
 | `ensemble_model` | `(hub repo, CTranslate2 subfolder)` of a faster-whisper second opinion for `--ensemble_model`. |
+| `char_readings` | A factory returning a `CharReadings` (`languages/base.py`): each character's reading, the reading without its tone, a variant character's standard form, and corpus frequencies. Alignment uses it to give a character the align model has no token for the token of a variant or homophone it does have (`--align_char_substitution`). Without it, only the align model's own substitution table applies. Cantonese's is `languages/yue/readings.py`. Make it a factory that imports lazily, so reading the registry stays cheap. |
 
+The align model can be any Hugging Face CTC checkpoint (wav2vec2, wav2vec2-BERT, HuBERT, WavLM, ...) or a
+torchaudio pipeline bundle name; `pipeline/align_backends.py` tells them apart from the model itself.
 Align-model behaviour (an audio primer, hand-picked substitutions, the character-substitution level) is
 per *align model*, not per language: add an `AlignProfile` in `pipeline/align_profiles.py`.
 
