@@ -383,8 +383,8 @@ def load_model(
     takes the pack's conventions for the model (see languages/base.py). ``model`` and
     ``processor`` may be passed pre-built (e.g. a merged LoRA checkpoint).
 
-    Qwen3-ASR needs transformers' native qwen3_asr support (transformers>=5.13.0, the
-    ``transformers_qwen`` extra); torch.compile is opt-in for it (compile_enabled /
+    Qwen3-ASR needs transformers' native qwen3_asr support (transformers>=5.13.0, a base
+    dependency); torch.compile is opt-in for it (compile_enabled /
     --compile), a net loss by default -- see _asr_native._compile_and_warmup.
     """
     backend = backend_for(model_name, language, cache_dir=download_root,
@@ -392,7 +392,8 @@ def load_model(
     if backend.name == "qwen3-asr" and not _has_native_qwen3asr():
         raise ImportError(
             "Qwen3-ASR needs transformers' native qwen3_asr support (transformers>=5.13.0): "
-            "run `uv sync --extra transformers_qwen`"
+            "it is a base dependency, so update the install (`uv sync`, or "
+            "`pip install -U 'transformers>=5.13'`)"
         )
     logger.info("ASR backend: %s", backend.name)
     kwargs = dict(

@@ -55,7 +55,7 @@ def test_every_backend_loader_resolves():
 
 def test_qwen_without_native_support_says_how_to_get_it(monkeypatch):
     monkeypatch.setattr(asr, "_has_native_qwen3asr", lambda: False)
-    with pytest.raises(ImportError, match="transformers_qwen"):
+    with pytest.raises(ImportError, match="transformers>=5.13"):
         asr.load_model("cantocaptions-cantonese-ASR", device="cpu")
 
 

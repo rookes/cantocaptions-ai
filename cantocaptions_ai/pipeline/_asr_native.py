@@ -1,7 +1,7 @@
 """Native ASR backend: uses AutoModelForMultimodalLM, transformers' official Qwen3-ASR support.
 
 Loaded lazily by asr.load_model() when native qwen3_asr support is detected
-(transformers>=5.13.0, installed via `uv sync --extra transformers_qwen`).
+(transformers>=5.13.0, a base dependency).
 """
 from typing import List, Optional, Union
 
@@ -313,7 +313,7 @@ def load_model_native(
         except Exception as e:
             logger.warning(
                 "torch.compile failed (%s); falling back to eager mode. "
-                "Install the transformers_qwen extra for triton support.",
+                "Install the compile extra for triton support.",
                 e,
             )
 

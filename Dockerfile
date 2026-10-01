@@ -4,7 +4,7 @@
 #
 # Notes:
 #  * Linux x86_64 GPU target. Torch is pulled from the CUDA 12.8 index (pyproject).
-#  * Extras installed: transformers_qwen (ASR) + ensemble + llm. Diarization needs no
+#  * Extras installed: compile (triton) + ensemble + llm. Diarization needs no
 #    extra: pyannote-audio is a base dependency. The
 #    flash-attn extra is intentionally omitted — it compiles from source (needs the
 #    full CUDA toolkit and many minutes) for little gain here, and the default
@@ -36,7 +36,7 @@ COPY . .
 
 # Install the pipeline + server-relevant extras into a project venv.
 RUN uv sync --frozen \
-        --extra transformers_qwen \
+        --extra compile \
         --extra ensemble \
         --extra llm
 

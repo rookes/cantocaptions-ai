@@ -22,16 +22,14 @@ Cantonese. The target written Cantonese standard is the [CantoCaptions standard]
 ```bash
 git clone https://github.com/rookes/cantocaptions-ai
 cd cantocaptions-ai
-uv sync --extra transformers_qwen
+uv sync
 ```
 
-This installs all dependencies plus the recommended ASR backend into an isolated virtual
-environment and pins exact versions. Torch is pulled from the PyTorch CUDA 12.8 index on Linux and
-Windows; the CPU build is used on macOS.
-
-Note that bare `uv sync` does **not** install support for Qwen3-ASR, the default (Cantonese)
-model family; the `transformers_qwen` extra adds it. Whisper and CTC (wav2vec2) models run on the base
-install.
+This installs all dependencies into an isolated virtual environment and pins exact versions; every ASR
+family (Qwen3-ASR, Whisper, CTC) runs on it. Torch is pulled from the PyTorch CUDA 12.8 index on Linux
+and Windows; the CPU build is used on macOS. Optional extras: `compile` (triton, for `--compile`),
+`ensemble`, `llm`, `flash-attn`, or `full` for all of them. `transformers_qwen` is the old name of
+`compile` and still works.
 
 ## Basic Usage
 
@@ -99,7 +97,7 @@ checkpoint's own `config.json`:
 
 | Family | Examples | Notes |
 |---|---|---|
-| Qwen3-ASR | the models above | Needs the `transformers_qwen` extra. The only backend that takes `--asr_context`. |
+| Qwen3-ASR | the models above | The only backend that takes `--asr_context`. |
 | Whisper | `whisper-large-v3`, `whisper-large-v3-turbo`, or any Whisper checkpoint | Forced to transcribe in `--language`. Under Cantonese it gets the same post-processing as stock Qwen3-ASR. It punctuates little, so the end of each phrase it times is written as a comma. |
 | CTC (wav2vec2 family) | `alvanlii/wav2vec2-BERT-cantonese`; wav2vec2, wav2vec2-BERT, HuBERT, WavLM checkpoints | Decoded greedily. These models write no punctuation, so each pause of 0.3 s or more is written as a comma. |
 
@@ -264,7 +262,7 @@ known-good SRT, realigns its text, and reports how far each cue landed from wher
 Run the test suite (CPU only; no model downloads):
 
 ```bash
-uv sync --extra transformers_qwen --group dev
+uv sync --group dev
 uv run pytest
 ```
 

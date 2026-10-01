@@ -34,7 +34,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --frozen --extra transformers_qwen --group dev
+        run: uv sync --frozen --group dev
 
       - name: Run tests
         run: uv run --frozen pytest --cov=cantocaptions_ai --cov-report=term --cov-fail-under=75
