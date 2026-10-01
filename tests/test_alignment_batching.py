@@ -7,13 +7,17 @@ validated by scripts/bench_alignment_batching.py, which runs the real
 alignment model and asserts batched output matches the sequential path.
 """
 
+import gc
 import unittest
+import weakref
+from unittest import mock
 
 import numpy as np
 import torch
 
 from cantocaptions_ai.pipeline.alignment import (
     MIN_ALIGN_SAMPLES,
+    EmissionTimeline,
     _compute_vad_emissions,
     _compute_vad_emissions_batched,
 )
@@ -265,6 +269,63 @@ class TestTooShortToAlign(unittest.TestCase):
         timeline = EmissionTimeline.from_computed(segments, results)
         emission, times = timeline.slice(segments[1]["start"], segments[1]["end"])
         self.assertEqual(emission.shape[0], 0)
+
+
+class TestTimelineMemory(unittest.TestCase):
+    """The timeline must hold the file's emissions once, at float16. A user's 5.4k-line file
+    ran Windows out of memory at the end of alignment because ``from_computed`` kept every
+    float32 emission alive beside the float16 copy."""
+
+    def _segments_and_results(self, dtype=None):
+        segments = _make_segments([1600, 800, 1200])
+        results = _compute_vad_emissions(
+            segments, _FakeModel(), "huggingface", _fake_bert_processor, "cpu",
+            batch_size=2, vram_checks=False, dtype=dtype,
+        )
+        return segments, results
+
+    def test_from_computed_releases_its_input(self):
+        segments, results = self._segments_and_results()
+        refs = [weakref.ref(emission) for emission, _ in results]
+        timeline = EmissionTimeline.from_computed(segments, results)
+        del results
+        gc.collect()
+        self.assertEqual([r() for r in refs], [None] * len(refs))
+        emission, _ = timeline.slice(segments[0]["start"], segments[-1]["end"])
+        self.assertEqual(emission.shape[0], 1600 + 800 + 1200)
+
+    def test_emissions_can_leave_the_device_already_float16(self):
+        segments, wide = self._segments_and_results()
+        _, narrow = self._segments_and_results(dtype=EmissionTimeline.dtype)
+        for (w, _), (n, _) in zip(wide, narrow):
+            self.assertEqual(n.dtype, torch.float16)
+            self.assertTrue(torch.equal(w.to(torch.float16), n))
+
+    def test_float16_input_is_stored_without_a_copy(self):
+        segments, results = self._segments_and_results(dtype=EmissionTimeline.dtype)
+        timeline = EmissionTimeline.from_computed(segments, results)
+        for (emission, _), stored in zip(results, timeline._emissions):
+            self.assertEqual(stored.ctypes.data, emission.data_ptr())
+
+    def test_length_mismatch_is_an_error(self):
+        segments, results = self._segments_and_results()
+        with self.assertRaises(ValueError):
+            EmissionTimeline.from_computed(segments, results[:-1])
+
+    def test_run_alignment_drops_each_files_timeline(self):
+        from cantocaptions_ai.pipeline.transcribe import _run_alignment
+
+        timeline = object()
+        item = {"audio_path": "a.wav", "vad_segments": [], "emission_timeline": timeline,
+                "result": {"segments": [{"start": 0.0, "end": 1.0, "text": "x"}],
+                           "language": "yue"}}
+        with mock.patch("cantocaptions_ai.pipeline.alignment.align",
+                        return_value={"segments": []}) as align:
+            out = _run_alignment([item], object(), {}, "cpu", 0.04, 0.4, "nearest",
+                                 False, False, 4)
+        self.assertIs(align.call_args.kwargs["timeline"], timeline)
+        self.assertNotIn("emission_timeline", item)
+        self.assertNotIn("emission_timeline", out[0])
 
 
 if __name__ == "__main__":
