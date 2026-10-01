@@ -1,9 +1,15 @@
 """Whisper ASR backend: encoder-decoder transcription through transformers.
 
 Each VAD segment (at most ``chunk_size``, 28 s by default) fits Whisper's 30 s window as
-it is, so a segment is one forward pass with no long-form chunking. Timestamps are not
-requested -- forced alignment times the text afterwards, as for every backend. Batching,
-OOM handling, checkpointing and the language pack's normalization are BatchedAsrStage's.
+it is, so a segment is one forward pass with no long-form chunking. Batching, OOM handling,
+checkpointing and the language pack's normalization are BatchedAsrStage's.
+
+Whisper is asked for timestamps, but not for their times -- forced alignment does the
+timing, as for every backend. What they are used for is where they fall: Whisper closes a
+phrase with one, and on Cantonese it writes little punctuation of its own, so without
+them a whole VAD chunk came out as one unpunctuated run and became one cue (131 cues
+against 897 in the ground truth on the eval episodes). Each phrase boundary is written as
+a clause mark instead (``asr.join_clauses``).
 
 Whisper writes many languages in a generic standard form (Cantonese comes out much like
 stock Qwen3-ASR's, Mandarin-flavoured), so its conventions per language live in the
@@ -13,9 +19,16 @@ from typing import List, Optional, Union
 
 import torch
 
-from cantocaptions_ai.pipeline.asr import BatchedAsrStage
+from cantocaptions_ai.pipeline.asr import BatchedAsrStage, join_clauses
 from cantocaptions_ai.pipeline.model_profiles import get_model_profile
-from cantocaptions_ai.text_profiles import DEFAULT_NORMALIZATION, TextNormalization
+from cantocaptions_ai.text_profiles import (
+    DEFAULT_NORMALIZATION,
+    DEFAULT_PUNCTUATION,
+    DEFAULT_SCRIPT,
+    PunctuationConfig,
+    ScriptConfig,
+    TextNormalization,
+)
 from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.model_utils import (
@@ -44,6 +57,8 @@ class WhisperAsr(BatchedAsrStage):
         verbose: bool = False,
         vram_checks: bool = True,
         normalization: TextNormalization = DEFAULT_NORMALIZATION,
+        punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
+        script: ScriptConfig = DEFAULT_SCRIPT,
     ):
         super().__init__(
             device=device, language=language, batch_size=batch_size,
@@ -52,9 +67,13 @@ class WhisperAsr(BatchedAsrStage):
         )
         self.model = model
         self.processor = processor
+        self.punctuation = punctuation
+        self.script = script
+        # Token ids from <|0.00|> up are timestamps.
+        self._timestamp_begin = processor.tokenizer.convert_tokens_to_ids("<|0.00|>")
 
     def _infer_batch(self, wavs: List, language: str, contexts=None) -> List[str]:
-        """One batch of segments -> one text each, decoded without special tokens.
+        """One batch of segments -> one text each, its phrases joined as clauses.
 
         ``language`` is the ISO code Whisper's tokenizer takes (``yue``, ``en``, ...); forcing
         it, rather than letting Whisper detect per segment, keeps a short or noisy segment
@@ -70,10 +89,21 @@ class WhisperAsr(BatchedAsrStage):
         with torch.inference_mode():
             ids = self.model.generate(
                 input_features, attention_mask=attention_mask,
-                language=language, task="transcribe",
+                language=language, task="transcribe", return_timestamps=True,
             )
-        texts = self.processor.batch_decode(ids, skip_special_tokens=True)
-        return [t.strip() for t in texts]
+        return [self._join_phrases(row.tolist()) for row in ids]
+
+    def _join_phrases(self, ids: List[int]) -> str:
+        phrases, current = [], []
+        for token in ids:
+            if token >= self._timestamp_begin:
+                phrases.append(current)
+                current = []
+            else:
+                current.append(token)
+        phrases.append(current)
+        texts = self.processor.batch_decode(phrases, skip_special_tokens=True)
+        return join_clauses(texts, self.punctuation, self.script)
 
 
 def _whisper_dtype(compute_type: str, device: str) -> torch.dtype:
@@ -108,8 +138,11 @@ def load_model_whisper(
 
     from cantocaptions_ai.pipeline.asr import _resolve_normalization
 
+    from cantocaptions_ai.languages import get_language_pack
+
     model_id = get_model_profile(model_name, language).hf_id
     normalization = _resolve_normalization(model_name, language, normalization)
+    run_profile = get_language_pack(language).resolve(model_name)
 
     if model is None or processor is None:
         try:
@@ -140,4 +173,5 @@ def load_model_whisper(
         device=device_index if device == "cuda" else device,
         language=language, batch_size=batch_size, print_progress=print_progress,
         verbose=verbose, vram_checks=vram_checks, normalization=normalization,
+        punctuation=run_profile.punctuation, script=run_profile.script,
     )

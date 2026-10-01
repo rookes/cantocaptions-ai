@@ -132,7 +132,17 @@ def test_whisper_takes_qwens_cantonese_conventions():
     assert YUE.resolve("whisper-large-v3").cleaning.manifest == "pipeline_qwen.toml"
 
 
+_TS = 100  # the fakes' first timestamp token id
+_WORDS = {1: "準備好了嗎?", 2: "好厲害呀", 3: "我是小白"}
+
+
 class _FakeWhisperProcessor:
+    class tokenizer:
+        @staticmethod
+        def convert_tokens_to_ids(token):
+            assert token == "<|0.00|>"
+            return _TS
+
     def __call__(self, wavs, sampling_rate, return_tensors, return_attention_mask):
         import torch
 
@@ -140,34 +150,50 @@ class _FakeWhisperProcessor:
         return {"input_features": torch.zeros(len(wavs), 4, 6),
                 "attention_mask": torch.ones(len(wavs), 6, dtype=torch.long)}
 
-    def batch_decode(self, ids, skip_special_tokens):
+    def batch_decode(self, phrases, skip_special_tokens):
         assert skip_special_tokens
-        return [f" text {int(row[0])} " for row in ids]
+        return [" ".join(_WORDS[t] for t in phrase if t in _WORDS) for phrase in phrases]
 
 
 class _FakeWhisperModel:
+    """Every row: <|0.00|> phrase 1 <|1.00|><|1.20|> phrases 2 and 3 <|3.00|>, eos padding."""
+
     def __init__(self):
         import torch
 
         self.device, self.dtype, self.calls = torch.device("cpu"), torch.float32, []
 
-    def generate(self, input_features, attention_mask, language, task):
+    def generate(self, input_features, attention_mask, language, task, return_timestamps):
         import torch
 
-        self.calls.append((language, task, tuple(input_features.shape)))
-        return torch.arange(input_features.shape[0]).unsqueeze(1)
+        self.calls.append((language, task, return_timestamps, input_features.shape[0]))
+        row = [_TS, 1, _TS + 50, _TS + 60, 2, _TS + 70, _TS + 75, 3, _TS + 150, 0]
+        return torch.tensor([row] * input_features.shape[0])
 
 
-def test_whisper_forces_the_language_and_strips_the_decode():
+def test_whisper_joins_its_timestamped_phrases_as_clauses():
     from cantocaptions_ai.pipeline._asr_whisper import WhisperAsr
 
     model = _FakeWhisperModel()
     stage = WhisperAsr(model, _FakeWhisperProcessor(), device="cpu", language="yue", batch_size=2)
     result = stage.process(_segments(100, 200, 300))
-    assert [s["text"] for s in result["segments"]] == ["text 0", "text 1", "text 0"]
+    assert [s["text"] for s in result["segments"]] == ["準備好了嗎？好厲害呀，我是小白"] * 3
     assert result["language"] == "yue"
-    assert [c[:2] for c in model.calls] == [("yue", "transcribe")] * 2
-    assert [c[2][0] for c in model.calls] == [2, 1]
+    assert model.calls == [("yue", "transcribe", True, 2), ("yue", "transcribe", True, 1)]
+
+
+def test_join_clauses_marks_unpunctuated_boundaries_in_the_languages_own_marks():
+    from cantocaptions_ai.text_profiles import (
+        CJK_PUNCTUATION,
+        CJK_SCRIPT,
+        LATIN_PUNCTUATION,
+        SPACED_SCRIPT,
+    )
+
+    assert asr.join_clauses(["來吧, 天竺", "", "好呀!", "Hello there, Desmond"],
+                            CJK_PUNCTUATION, CJK_SCRIPT) == "來吧，天竺，好呀！Hello there, Desmond"
+    assert asr.join_clauses(["hello there.", "how are you", " fine "],
+                            LATIN_PUNCTUATION, SPACED_SCRIPT) == "hello there. how are you, fine"
 
 
 def test_whisper_loader_takes_the_common_load_arguments():

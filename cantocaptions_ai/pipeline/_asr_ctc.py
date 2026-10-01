@@ -10,15 +10,14 @@ drop blanks and turn the word delimiter into a space.
 CTC output carries no punctuation, and punctuation is where alignment cuts a chunk into
 clauses and cue assembly finds its boundaries: left bare, every VAD chunk (up to 28 s)
 becomes one cue. The greedy path already says where the speaker paused, though -- a long
-run of blank frames -- so each such pause is written as the language's mergeable clause
-mark (``，`` / ``,``). That gives alignment the clause cuts punctuation would, while cue
-assembly stays free to rejoin short clauses, since the mark is a mergeable one.
+run of blank frames -- so each such pause is written as a clause boundary
+(``asr.join_clauses``).
 """
 from typing import List, Optional, Union
 
 import torch
 
-from cantocaptions_ai.pipeline.asr import BatchedAsrStage
+from cantocaptions_ai.pipeline.asr import BatchedAsrStage, join_clauses
 from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 from cantocaptions_ai.text_profiles import (
     DEFAULT_NORMALIZATION,
@@ -70,8 +69,8 @@ class CtcAsr(BatchedAsrStage):
         )
         self.model = model
         self.processor = processor
+        self.punctuation = punctuation
         self.script = script
-        self.pause_mark = punctuation.mergeable_chars[0] if punctuation.mergeable_chars else None
         self.pause_seconds = pause_seconds
         tokenizer = processor.tokenizer
         # Frames that carry no character: CTC blank, and the word delimiter where there is one.
@@ -102,16 +101,11 @@ class CtcAsr(BatchedAsrStage):
     def _decode(self, ids: List[int], frame_rate: float) -> str:
         """Greedy CTC decode, with each long enough internal pause written as a clause mark."""
         pieces = [ids]
-        if self.pause_mark is not None and frame_rate > 0:
+        if frame_rate > 0:
             pieces = _split_at_pauses(ids, self._silent_ids,
                                       max(1, round(self.pause_seconds * frame_rate)))
-        text = ""
-        for piece in pieces:
-            words = self.processor.decode(piece).strip()
-            if not words:
-                continue
-            text = self.script.join(text + self.pause_mark, words) if text else words
-        return text
+        return join_clauses([self.processor.decode(piece) for piece in pieces],
+                            self.punctuation, self.script)
 
 
 def _split_at_pauses(ids: List[int], silent_ids, min_frames: int) -> List[List[int]]:

@@ -14,6 +14,7 @@ run longest-first through ``BatchExecutor`` (OOM halves the batch), scattered ba
 normalized per the language pack. A backend supplies only ``_infer_batch``.
 """
 import importlib
+import re
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -36,7 +37,13 @@ from cantocaptions_ai.utils.model_utils import (
 from cantocaptions_ai.utils.debug import load_transcription_debug, write_transcription_debug
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.output import LANGUAGES
-from cantocaptions_ai.text_profiles import DEFAULT_NORMALIZATION, TextNormalization
+from cantocaptions_ai.text_profiles import (
+    DEFAULT_NORMALIZATION,
+    LATIN_SPLIT_CHARS,
+    PunctuationConfig,
+    ScriptConfig,
+    TextNormalization,
+)
 
 logger = get_logger(__name__)
 
@@ -58,6 +65,42 @@ def _resolve_normalization(model_name: Optional[str], language: Optional[str], n
         return normalization
     from cantocaptions_ai.languages import get_language_pack
     return get_language_pack(language).resolve(model_name).normalization
+
+
+def join_clauses(pieces: List[str], punctuation: PunctuationConfig, script: ScriptConfig) -> str:
+    """Join phrases a model produced separately, marking each boundary as a clause.
+
+    Punctuation is where alignment cuts a chunk into clauses and cue assembly finds cue
+    boundaries; a model that writes little or none of it (CTC, Whisper on Cantonese) would
+    otherwise leave a whole VAD chunk -- up to 28 s -- as one cue. Each boundary gets the
+    language's *mergeable* mark (``，`` / ``,``), so cue assembly can still rejoin short
+    clauses; a phrase that already ends in punctuation keeps its own.
+
+    ASCII clause punctuation after a non-Latin character (Whisper writes ``嗎?``, ``呀,``)
+    becomes the language's own, since alignment splits only at the language's marks.
+    """
+    mark = punctuation.mergeable_chars[0] if punctuation.mergeable_chars else ""
+    text = ""
+    for piece in pieces:
+        piece = _native_punctuation(piece.strip(), punctuation)
+        if not piece:
+            continue
+        if text and text[-1] not in punctuation.split_chars:
+            text += mark
+        text = script.join(text, piece)
+    return text
+
+
+_ASCII_AFTER_NON_LATIN = re.compile(
+    r"(?<=[^\x00-\x7f])\s*([" + re.escape("".join(LATIN_SPLIT_CHARS)) + r"])\s*")
+
+
+def _native_punctuation(text: str, punctuation: PunctuationConfig) -> str:
+    native = punctuation.split_chars
+    if native == LATIN_SPLIT_CHARS or len(native) != len(LATIN_SPLIT_CHARS):
+        return text
+    to_native = dict(zip(LATIN_SPLIT_CHARS, native))
+    return _ASCII_AFTER_NON_LATIN.sub(lambda m: to_native[m.group(1)], text)
 
 
 def _normalize_language(language: str) -> str:

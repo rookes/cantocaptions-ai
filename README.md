@@ -100,8 +100,11 @@ checkpoint's own `config.json`:
 | Family | Examples | Notes |
 |---|---|---|
 | Qwen3-ASR | the models above | Needs the `transformers_qwen` extra. The only backend that takes `--asr_context`. |
-| Whisper | `whisper-large-v3`, `whisper-large-v3-turbo`, or any Whisper checkpoint | Forced to transcribe in `--language`. Under Cantonese it gets the same post-processing as stock Qwen3-ASR. |
-| CTC (wav2vec2 family) | `alvanlii/wav2vec2-BERT-cantonese`; wav2vec2, wav2vec2-BERT, HuBERT, WavLM checkpoints | Decoded greedily. These models write no punctuation, so each pause of 0.3 s or more is written as a comma to give cues somewhere to break. |
+| Whisper | `whisper-large-v3`, `whisper-large-v3-turbo`, or any Whisper checkpoint | Forced to transcribe in `--language`. Under Cantonese it gets the same post-processing as stock Qwen3-ASR. It punctuates little, so the end of each phrase it times is written as a comma. |
+| CTC (wav2vec2 family) | `alvanlii/wav2vec2-BERT-cantonese`; wav2vec2, wav2vec2-BERT, HuBERT, WavLM checkpoints | Decoded greedily. These models write no punctuation, so each pause of 0.3 s or more is written as a comma. |
+
+Those commas are what give the pipeline somewhere to break cues; without them, each speech chunk (up to 28 s)
+would be a single cue.
 
 Only the fine-tune is tuned for Cantonese subtitles; the others are there for other languages, and for comparison.
 
