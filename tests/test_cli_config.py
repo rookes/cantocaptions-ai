@@ -16,8 +16,8 @@ from unittest import mock
 from cantocaptions_ai.__main__ import build_parser
 from cantocaptions_ai.pipeline import cli_config
 from cantocaptions_ai.pipeline.cli_config import (
+    PRESETS_DIR,
     default_config_dir,
-    ensure_default_cfg_exists,
     load_cfg_file,
     resolve_cfg_path,
     resolve_pipeline_args,
@@ -53,13 +53,11 @@ class TestPipelineConfigDefaults(unittest.TestCase):
 
 
 class TestShippedDefaultCfg(unittest.TestCase):
-    """config/default.cfg ships tracked, so it must stay loadable and in step with
-    PipelineConfig -- a divergence makes --help state a default no CLI run uses."""
+    """presets/default.cfg ships with the package, so it must stay loadable and in step
+    with PipelineConfig -- a divergence makes --help state a default no CLI run uses."""
 
     def _path(self):
-        import os
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return Path(root) / "config" / "default.cfg"
+        return PRESETS_DIR / "default.cfg"
 
     def test_loads_without_error(self):
         # Regression: configparser does NOT strip trailing '#' comments by default, so
@@ -149,29 +147,6 @@ class TestLoadCfgFile(unittest.TestCase):
                 load_cfg_file(path, self.parser)
 
 
-class TestEnsureDefaultCfgExists(unittest.TestCase):
-    def test_creates_file_with_all_fields(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config_dir = Path(tmp) / "config"
-            path = ensure_default_cfg_exists(config_dir)
-            self.assertTrue(path.is_file())
-            import configparser
-            cp = configparser.ConfigParser()
-            cp.read(path)
-            from dataclasses import fields
-            self.assertEqual(set(cp["pipeline"].keys()), {f.name for f in fields(PipelineConfig)})
-
-    def test_does_not_clobber_existing_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config_dir = Path(tmp) / "config"
-            path = ensure_default_cfg_exists(config_dir)
-            path.write_text("[pipeline]\ndevice = marker_value\n", encoding="utf-8")
-
-            ensure_default_cfg_exists(config_dir)
-
-            self.assertIn("marker_value", path.read_text(encoding="utf-8"))
-
-
 class TestResolveCfgPath(unittest.TestCase):
     def setUp(self):
         self.parser = build_parser()
@@ -184,10 +159,21 @@ class TestResolveCfgPath(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 resolve_cfg_path("does_not_exist", self.parser, self.config_dir)
 
-    def test_none_creates_default(self):
+    def test_none_is_the_shipped_default_and_creates_nothing(self):
         path = resolve_cfg_path(None, self.parser, self.config_dir)
-        self.assertEqual(path, self.config_dir / "default.cfg")
-        self.assertTrue(path.is_file())
+        self.assertEqual(path, PRESETS_DIR / "default.cfg")
+        self.assertFalse(self.config_dir.exists())
+
+    def test_your_own_default_replaces_the_shipped_one(self):
+        self.config_dir.mkdir(parents=True)
+        (self.config_dir / "default.cfg").write_text("[pipeline]\ndevice = cpu\n", encoding="utf-8")
+        self.assertEqual(resolve_cfg_path(None, self.parser, self.config_dir),
+                         self.config_dir / "default.cfg")
+
+    def test_a_named_preset_falls_back_to_the_shipped_one(self):
+        self.assertEqual(resolve_cfg_path("cpu", self.parser, self.config_dir),
+                         PRESETS_DIR / "cpu.cfg")
+        self.assertEqual(cli_config.shipped_presets(), ["cpu", "fast_test"])
 
     def test_strips_redundant_extension(self):
         self.config_dir.mkdir(parents=True)
@@ -288,19 +274,29 @@ class TestConfigDirDiscovery(unittest.TestCase):
             self.assertEqual(default_config_dir(), cli_config._REPO_CONFIG_DIR)
         self.assertFalse((self.cwd / "config").exists())
 
-    def test_no_config_dir_anywhere_means_built_in_defaults(self):
+    def test_the_environment_variable_wins(self):
+        (self.cwd / "config").mkdir()
         with mock.patch.object(Path, "cwd", return_value=self.cwd), \
-                mock.patch.object(cli_config, "_REPO_CONFIG_DIR", self.cwd / "absent"):
+                mock.patch.dict("os.environ", {"CANTOCAPTIONS_CONFIG_DIR": str(self.cwd / "mine")}):
+            self.assertEqual(default_config_dir(), self.cwd / "mine")
+
+    def test_an_installed_package_reads_the_user_config_dir(self):
+        user_dir = self.cwd / "home-config"
+        user_dir.mkdir()
+        with mock.patch.object(Path, "cwd", return_value=self.cwd), \
+                mock.patch.object(cli_config, "_REPO_CONFIG_DIR", self.cwd / "absent"), \
+                mock.patch.object(cli_config, "_user_config_dir", return_value=user_dir):
+            self.assertEqual(default_config_dir(), user_dir)
+
+    def test_with_no_config_dir_the_shipped_presets_still_apply(self):
+        with mock.patch.object(Path, "cwd", return_value=self.cwd), \
+                mock.patch.object(cli_config, "_REPO_CONFIG_DIR", self.cwd / "absent"), \
+                mock.patch.object(cli_config, "_user_config_dir", return_value=self.cwd / "none"):
             self.assertIsNone(default_config_dir())
-            self.assertIsNone(resolve_cfg_path(None, self.parser))
+            self.assertEqual(resolve_cfg_path(None, self.parser), PRESETS_DIR / "default.cfg")
+            self.assertEqual(resolve_cfg_path("cpu", self.parser), PRESETS_DIR / "cpu.cfg")
             merged = resolve_pipeline_args(self.parser, {})
         self.assertEqual(merged, PipelineConfig.defaults())
-
-    def test_named_cfg_without_a_config_dir_fails_fast(self):
-        with mock.patch.object(Path, "cwd", return_value=self.cwd), \
-                mock.patch.object(cli_config, "_REPO_CONFIG_DIR", self.cwd / "absent"):
-            with _silent_parser_error(), self.assertRaises(SystemExit):
-                resolve_cfg_path("cpu", self.parser)
 
 
 if __name__ == "__main__":

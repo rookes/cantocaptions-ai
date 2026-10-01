@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     transcript_grp.add_argument("--realign_min_score", type=float, default=argparse.SUPPRESS, help="mean CTC path score below which a placed line is logged as weakly supported; purely diagnostic, but a run of them means the transcript and the audio have diverged")
 
     config_grp = parser.add_argument_group("config file")
-    config_grp.add_argument("--cfg", type=str, default=argparse.SUPPRESS, metavar="NAME", help="load config/NAME.cfg instead of the auto-created config/default.cfg (see config/cpu.cfg for a commented example); its values act as a layer beneath stage-preset and explicit CLI flags")
+    config_grp.add_argument("--cfg", type=str, default=argparse.SUPPRESS, metavar="NAME", help="load the NAME preset instead of default.cfg: NAME.cfg from your config directory, else the one shipped with the package (cpu, fast_test). Its values act as a layer beneath user.cfg, the stage presets and explicit flags")
 
     model_grp = parser.add_argument_group("model")
     model_grp.add_argument("--language", type=str, default=argparse.SUPPRESS, choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio (required; only yue/Cantonese is fully supported)")
@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     audio_grp.add_argument("--no_audio_normalize", dest="audio_normalize", action="store_false", default=argparse.SUPPRESS, help="do not level the file before processing. Levelling is on by default because the training corpus is cut that way; turn it off only to reproduce an older run, since an unlevelled file is a different input distribution than the model was trained on.")
 
     vad_grp = parser.add_argument_group("vad")
-    vad_grp.add_argument("--vad_method", type=str, default=argparse.SUPPRESS, choices=list(VAD_METHODS), help="VAD model: pyannote (segmentation-3.0; best, and fast on a GPU) or silero (Silero VAD v6; CPU only, lighter on a CPU-only machine). The thresholds are calibrated per model: see config/cpu.cfg for silero's")
+    vad_grp.add_argument("--vad_method", type=str, default=argparse.SUPPRESS, choices=list(VAD_METHODS), help="VAD model: pyannote (segmentation-3.0; best, and fast on a GPU) or silero (Silero VAD v6; CPU only, lighter on a CPU-only machine). The thresholds are calibrated per model: see the cpu preset (--cfg cpu) for silero's")
     vad_grp.add_argument("--vad_onset", type=float, default=argparse.SUPPRESS, help="Onset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected")
     vad_grp.add_argument("--vad_offset", type=float, default=argparse.SUPPRESS, help="Offset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected.")
     vad_grp.add_argument("--vad_pad_onset", type=float, default=argparse.SUPPRESS, help="seconds of audio to keep before each detected speech region, so word onsets are not clipped at the threshold crossing")

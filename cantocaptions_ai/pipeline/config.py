@@ -33,7 +33,7 @@ class PipelineConfig:
     reads them from ``PipelineConfig.defaults()`` for ``--help`` display and
     for the config-file/preset layering in ``pipeline/cli_config.py``.
 
-    These are kept in step with the shipped ``config/default.cfg``, which sits
+    These are kept in step with the shipped ``presets/default.cfg``, which sits
     one layer above them. They are not redundant: the cfg file is what a CLI
     user edits, while these are what a library caller and ``--help`` see, so a
     divergence makes ``--help`` state a default no CLI run actually uses. If
@@ -274,8 +274,7 @@ class PipelineConfig:
         """Every field's baseline default, resolving default_factory fields
         (currently only ``device``).
 
-        The one place ``--help`` text, config/default.cfg auto-generation,
-        and the base layer of the CLI's config-file/preset merge all read
+        The one place ``--help`` text and the base layer of the CLI's config-file/preset merge all read
         their baseline values from.
         """
         out: Dict[str, Any] = {}

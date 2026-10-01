@@ -1,4 +1,4 @@
-"""Silero VAD v6 as a score-curve backend -- the CPU option (see config/cpu.cfg).
+"""Silero VAD v6 as a score-curve backend -- the CPU option (see the cpu preset, presets/cpu.cfg).
 
 The model ships vendored in ``cantocaptions_ai/assets`` as the TorchScript file from the
 silero-vad 6.2.3 wheel (MIT, see ``silero_vad_LICENSE.txt``), so there is no pip dependency

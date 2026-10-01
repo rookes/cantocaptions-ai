@@ -48,13 +48,17 @@ process a whole folder (and `--recursive` to include its subfolders). Output mir
 tree, so `DIR/s1/ep01.mkv` and `DIR/s2/ep01.mkv` become `output/s1/ep01.srt` and `output/s2/ep01.srt`.
 
 You can configure more extensively using command-line flags (see below), but, more conveniently, you can also
-**put your own defaults in `config/user.cfg`** (not tracked by git; same format as `config/default.cfg`,
-holding only the keys you want to change). Settings are layered, each overriding the one before:
+**put your own defaults in `user.cfg`** in your config directory (`config/` in the repo, which git
+ignores; `~/.config/cantocaptions-ai/` for a pip install; or wherever `$CANTOCAPTIONS_CONFIG_DIR` points).
+It has the same format as the shipped [`default.cfg`](cantocaptions_ai/presets/default.cfg), holding only
+the keys you want to change, either in one `[pipeline]` block or grouped by section (`[vad]`, `[alignment]`,
+... the same groups as `--help`). Settings are layered, each overriding the one before:
 
 1. built-in defaults
-2. `config/default.cfg` (tracked; documents the shipped defaults), or the file picked with `--cfg NAME`
-   (for example `--cfg cpu` for `config/cpu.cfg`)
-3. `config/user.cfg`
+2. `default.cfg` (shipped with the package; documents the defaults), or the preset picked with
+   `--cfg NAME` (for example `--cfg cpu`, `--cfg fast_test`). A file of the same name in your config
+   directory takes its place
+3. `user.cfg`
 4. the `--vocal_isolation` / `--asr` / `--align` presets
 5. flags you type
 
@@ -127,8 +131,9 @@ important settings to adjust if there are issues with dropped speech:
   more speech than pyannote.
 
 Both models' scores go through the same thresholds, padding and chunking, but they are calibrated
-differently: the `vad_*` values in `config/default.cfg` are tuned for pyannote and the ones in
-`config/cpu.cfg` for silero, so copy the whole set when switching models.
+differently: the `vad_*` values in the default config are tuned for pyannote and the ones in
+the `cpu` preset (`cantocaptions_ai/presets/cpu.cfg`) for silero, so copy the whole set when switching
+models.
 
 ### Vocal isolation
 
@@ -188,7 +193,7 @@ uv run cantocaptions_ai video.mkv --hf_token hf_...
 ```
 
 You can also set the `HF_TOKEN` environment variable. Prefer either over putting the token in a
-config file; if you must, use the untracked `config/user.cfg`, never `config/default.cfg`.
+config file; if you must, use your untracked `user.cfg`, never a shipped preset.
 
 To fetch the model weights ahead of time rather than on first run:
 

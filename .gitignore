@@ -242,7 +242,8 @@ test/
 # Default output_dir: subtitles this tool writes are the user's, not the repo's.
 output/
 
-# config/default.cfg IS tracked: it documents the shipped defaults (a test pins
-# it to PipelineConfig). Personal settings go in config/user.cfg, which layers on
-# top of it and stays out of git.
+# The shipped defaults live in cantocaptions_ai/presets/default.cfg (a test pins them
+# to PipelineConfig). Personal settings go in config/user.cfg, which layers on top of
+# them and stays out of git, as does a personal config/default.cfg replacing them.
 config/user.cfg
+config/default.cfg

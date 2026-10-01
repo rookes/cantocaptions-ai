@@ -42,7 +42,7 @@ FULL_FILES = [
 def _default_model_name() -> str:
     """The ``model`` a plain run uses, read off PipelineConfig without calling
     ``defaults()`` -- that resolves the ``device`` default_factory, which imports torch.
-    It is equal to config/default.cfg's own value by test (test_cli_config.py). Unset
+    It is equal to presets/default.cfg's own value by test (test_cli_config.py). Unset
     (None) means the default language's own model, resolved through the language packs.
     """
     from dataclasses import fields
