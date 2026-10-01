@@ -91,8 +91,8 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertEqual(dict(profile.spotchecks), {})
 
     def test_published_finetune_is_registered_from_the_hub(self):
-        # The published checkpoint needs no env var: it is a plain hub id, always a valid
-        # --model choice, and carries the same clean-slate conventions as the LoRA build.
+        # The published checkpoint needs no env var: it is a plain hub id, always a
+        # registered --model name, and carries the same clean-slate conventions as the LoRA build.
         self.assertIn("cantocaptions-cantonese-ASR", MODEL_PROFILES)
         self.assertEqual(get_model_profile("cantocaptions-cantonese-ASR").languages, {"yue"})
         profile = get_language_pack("yue").resolve("cantocaptions-cantonese-ASR")
@@ -112,8 +112,8 @@ class TestGetModelProfile(unittest.TestCase):
         conventions = get_language_pack("yue").conventions
         self.assertIs(conventions["cantocaptions-cantonese-ASR"], conventions["Qwen3-ASR-lora"])
 
-    def test_registry_keys_are_the_cli_choices_source(self):
-        # __main__ derives --model choices from these keys.
+    def test_registry_keys_are_the_cli_help_source(self):
+        # __main__ lists these keys in --model's help.
         self.assertIn("Qwen3-ASR", MODEL_PROFILES)
         self.assertIn("cantocaptions-cantonese-ASR", MODEL_PROFILES)
 

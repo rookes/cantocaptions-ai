@@ -32,7 +32,7 @@ class ModelProfile:
 
 # Env var pointing at a *local* merged-weights directory. Kept out of the source tree so no
 # machine-specific path ships in git: the "Qwen3-ASR-lora" profile is only registered (and
-# only offered as a --model choice) when this is set. It is the personal/debugging escape
+# only listed in --model's help) when this is set. It is the personal/debugging escape
 # hatch for an unpublished build — the published checkpoint is "cantocaptions-cantonese-ASR",
 # which is pulled from the hub and needs no env var. See _build_profiles.
 _LORA_MODEL_DIR_ENV = "CANTOCAPTIONS_LORA_MODEL_DIR"
@@ -54,8 +54,8 @@ def _build_profiles() -> Dict[str, ModelProfile]:
         "whisper-large-v3-turbo": ModelProfile("openai/whisper-large-v3-turbo", backend=_WHISPER),
     }
     # The same fine-tune, pointed at a local directory instead. Registered only when the
-    # env var is set; otherwise --model Qwen3-ASR-lora is simply not a valid choice (clean
-    # argparse error) rather than a broken hardcoded path.
+    # env var is set; otherwise --model Qwen3-ASR-lora is read as a hub id that does not
+    # exist (a not-found error) rather than a broken hardcoded path.
     lora_dir = os.environ.get(_LORA_MODEL_DIR_ENV)
     if lora_dir:
         profiles["Qwen3-ASR-lora"] = ModelProfile(lora_dir, _CANTONESE_ONLY, _QWEN)

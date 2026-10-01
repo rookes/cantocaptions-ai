@@ -31,7 +31,7 @@ EN = LanguagePack(
     code="en",
     script=SPACED_SCRIPT,          # words joined with spaces, 42-char lines, word-wrapped
     punctuation=LATIN_PUNCTUATION, # sentence splits at . ? ! ; and a comma lets cues join
-    default_model="Qwen3-ASR",     # any MODEL_PROFILES key, or a hub id
+    default_model="whisper-large-v3",  # any MODEL_PROFILES key, or a hub id / path
     default_align_model="WAV2VEC2_ASR_BASE_960H",
 )
 ```
@@ -39,6 +39,11 @@ EN = LanguagePack(
 Register it next to yue in `languages/__init__.py` (`_register_builtin_packs`), or from your own code
 with `register_language_pack(EN)`. With only this, `--language en` needs no `--model`, but still needs
 `--no_clean_text`: `fully_supported` means a default model **and** cleaning rules.
+
+The model can be any Qwen3-ASR, Whisper or wav2vec2-family CTC checkpoint: the backend is read from
+its `config.json` (`pipeline/asr.py`, `backend_for`). A family with no backend yet needs a
+`BatchedAsrStage` subclass (one `_infer_batch` method; see `pipeline/_asr_whisper.py`) registered in
+`ASR_BACKENDS`.
 
 If the ASR model is trained for particular languages only, list them on its `ModelProfile`
 (`pipeline/model_profiles.py`, `languages=frozenset({...})`). `validate_config` then refuses it for any

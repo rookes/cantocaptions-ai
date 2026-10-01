@@ -94,6 +94,17 @@ non-standard written Cantonese, both of these models are put through extensive p
 Post-processing includes using the alignment model as a phonetic guide to check for certain variants 
 such as gam2 噉 vs. gam3 咁.
 
+`model` also takes any Hugging Face hub id or local checkpoint path, and the ASR backend follows from the
+checkpoint's own `config.json`:
+
+| Family | Examples | Notes |
+|---|---|---|
+| Qwen3-ASR | the models above | Needs the `transformers_qwen` extra. The only backend that takes `--asr_context`. |
+| Whisper | `whisper-large-v3`, `whisper-large-v3-turbo`, or any Whisper checkpoint | Forced to transcribe in `--language`. Under Cantonese it gets the same post-processing as stock Qwen3-ASR. |
+| CTC (wav2vec2 family) | `alvanlii/wav2vec2-BERT-cantonese`; wav2vec2, wav2vec2-BERT, HuBERT, WavLM checkpoints | Decoded greedily. These models write no punctuation, so each pause of 0.3 s or more is written as a comma to give cues somewhere to break. |
+
+Only the fine-tune is tuned for Cantonese subtitles; the others are there for other languages, and for comparison.
+
 ### Speech detection (VAD)
 
 Before transcribing, the pipeline finds where the speech in the audio is and cuts it into chunks. Three 
@@ -276,7 +287,9 @@ is `languages/yue/`; the old `cantocaptions_ai.cantonese` import paths still wor
 
 Behaviour that depends on a particular model rather than a language is looked up per model:
 
-* `pipeline/model_profiles.py` — per ASR model: where its weights are, and which languages it is trained for.
+* `pipeline/model_profiles.py` — per ASR model: where its weights are, which backend runs it, and which
+  languages it is trained for. The backends (Qwen3-ASR, Whisper, CTC) are registered in `pipeline/asr.py`
+  (`ASR_BACKENDS`); an unregistered model's backend is read from its checkpoint's `model_type`.
 * `pipeline/align_profiles.py` — per alignment model: audio primer, hand-picked character substitutions
   and the default substitution level (Jyutping homophones only for the Cantonese model), internal-gap
   splitting, minimum input length. The model's own processor and emission frame rate come with it from

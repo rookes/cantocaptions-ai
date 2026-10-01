@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_grp.add_argument("--cfg", type=str, default=argparse.SUPPRESS, metavar="NAME", help="load config/NAME.cfg instead of the auto-created config/default.cfg (see config/cpu.cfg for a commented example); its values act as a layer beneath stage-preset and explicit CLI flags")
 
     model_grp = parser.add_argument_group("model")
-    model_grp.add_argument("--model", default=argparse.SUPPRESS, choices=list(MODEL_PROFILES.keys()), help="name of the ASR model to use (see pipeline/model_profiles.py). Unset, the language's own model is used: cantocaptions-cantonese-ASR for yue; other languages must name one")
+    model_grp.add_argument("--model", default=argparse.SUPPRESS, metavar="MODEL", help=f"the ASR model: a registered name ({', '.join(MODEL_PROFILES)}), or any Hugging Face hub id or local checkpoint path of a supported family (Qwen3-ASR, Whisper, or a wav2vec2-family CTC model). Unset, the language's own model is used: cantocaptions-cantonese-ASR for yue; other languages must name one")
     model_grp.add_argument("--model_cache_only", type=str2bool, default=argparse.SUPPRESS, help="If True, will not attempt to download models, instead using cached models from --model_dir")
     model_grp.add_argument("--model_dir", type=str, default=argparse.SUPPRESS, help="the path to save/load model files; if unset, defers to huggingface_hub's own cache resolution (~/.cache/huggingface/hub, or $HF_HOME/$XDG_CACHE_HOME if set)")
 
