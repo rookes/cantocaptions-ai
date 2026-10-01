@@ -283,3 +283,35 @@ def test_english_needs_its_own_model_and_no_cantonese_cleaning(tmp_path):
     with pytest.raises(ConfigError) as err:
         validate_config(PipelineConfig(device="cpu", language="en"))
     assert "--model" in str(err.value) and "--no_clean_text" in str(err.value)
+
+
+def test_a_registered_pack_adds_a_fully_supported_language(tmp_path, monkeypatch):
+    """One LanguagePack is all a new language needs: its cleaning rules, noise tokens and
+    default model all take effect, and the raw-pipeline restrictions no longer apply."""
+    from cantocaptions_ai import languages
+    from cantocaptions_ai.languages import CleaningSpec, LanguagePack
+    from cantocaptions_ai.text_profiles import LATIN_PUNCTUATION, SPACED_SCRIPT
+
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    (rules / "pipeline.toml").write_text(
+        '[[steps]]\ntype = "rules"\nfile = "polite.toml"\n'
+        '[[steps]]\ntype = "builtin"\nname = "shout"\n', encoding="utf-8")
+    (rules / "polite.toml").write_text(
+        '[[rules]]\npattern = "fine"\nreplace = "very well"\n', encoding="utf-8")
+    pack = LanguagePack(
+        "en", SPACED_SCRIPT, LATIN_PUNCTUATION,
+        default_model="some/english-asr", default_align_model="some/english-align",
+        cleaning=CleaningSpec(rules_dir=rules, builtin_steps=lambda: {"shout": str.upper},
+                              noise_tokens=("UM.",)),
+    )
+    monkeypatch.setitem(languages._PACKS, "en", pack)
+    monkeypatch.setattr("cantocaptions_ai.pipeline.alignment._punkt_splitter", lambda lang: None)
+
+    english = ScriptedAudio(script=((1.0, "fine thanks."), (4.0, "um.")), duration=6.0)
+    install(monkeypatch, english)
+    media = english.write_wav(tmp_path / "english.wav")
+    # No --model, no --no_clean_text: the pack supplies both.
+    cfg = _cfg(tmp_path, language="en")
+    texts = [s["text"] for s in _run([media], cfg)[0]["result"]["segments"]]
+    assert texts == ["VERY WELL THANKS."]

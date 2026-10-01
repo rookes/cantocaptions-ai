@@ -35,12 +35,12 @@ _STAGE_FIELDS: Dict[str, Tuple[str, ...]] = {
     "vocal_isolation": (
         "vocal_isolation_method", "vocal_isolation_segment_mode", "vocal_isolation_compute_type",
     ),
-    "transcription": ("model", "language", "asr_compute_type"),
+    "transcription": ("language", "asr_compute_type"),
     "ensemble": ("ensemble_model",),
     "llm_correction": ("llm_model", "reference_correction_semantic"),
     "diarization": ("diarize_model", "diarize_scope", "min_speakers", "max_speakers"),
     "realign": (
-        "realign_anchor", "realign_window", "realign_commit_margin", "realign_normalize", "align_model",
+        "realign_anchor", "realign_window", "realign_commit_margin", "realign_normalize",
         "align_compute_type", "align_char_substitution", "align_substitutions",
     ),
 }
@@ -59,12 +59,23 @@ def _vad_derived(cfg) -> Dict[str, Any]:
 
 
 def _transcription_derived(cfg) -> Dict[str, Any]:
+    # The model that actually ran: an unset `model` is the language pack's default, and
+    # recording the resolved name keeps a checkpoint valid whichever way it was spelled.
+    from cantocaptions_ai.pipeline.model_profiles import resolve_model_name
+    derived: Dict[str, Any] = {"model": resolve_model_name(cfg.model, cfg.language)}
     if not cfg.asr_context:
-        return {"context": None}
-    return {"context": [
+        derived["context"] = None
+        return derived
+    derived["context"] = [
         cfg.reference_subtitle, cfg.reference_offset, cfg.asr_context_template,
         cfg.asr_context_scope, cfg.asr_context_neighbours, cfg.asr_context_max_chars,
-    ]}
+    ]
+    return derived
+
+
+def _realign_derived(cfg) -> Dict[str, Any]:
+    from cantocaptions_ai.languages import get_language_pack
+    return {"align_model": cfg.align_model or get_language_pack(cfg.language).default_align_model}
 
 
 def _llm_derived(cfg) -> Dict[str, Any]:
@@ -78,6 +89,7 @@ _STAGE_DERIVED: Dict[str, Callable[[Any], Dict[str, Any]]] = {
     "vad": _vad_derived,
     "transcription": _transcription_derived,
     "llm_correction": _llm_derived,
+    "realign": _realign_derived,
 }
 
 # The stages whose output each stage consumed, in pipeline order.

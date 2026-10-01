@@ -38,6 +38,11 @@ class TestWhatInvalidatesWhat:
     def test_vocal_isolation_invalidates_what_reads_its_audio(self):
         assert _changed(vocal_isolation_method="mbroformer") == set(cp.STAGES) - {"vad"}
 
+    def test_the_default_model_spelled_out_is_the_same_checkpoint(self):
+        # model=None means the language's own model; naming it must not invalidate caches.
+        assert _changed(model="cantocaptions-cantonese-ASR") == set()
+        assert _changed(align_model="alvanlii/wav2vec2-BERT-cantonese") == set()
+
     def test_throughput_knobs_invalidate_nothing(self):
         # A different batch size must not throw away an hour of ASR.
         assert _changed(batch_size=24, align_batch_size=6, diarize_batch_size=8,

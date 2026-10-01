@@ -24,6 +24,15 @@ def _has_native_qwen3asr() -> bool:
 # Shared utilities used by both backends
 # ---------------------------------------------------------------------------
 
+def _resolve_normalization(model_name: Optional[str], language: Optional[str], normalization):
+    """The post-ASR normalization to apply: the caller's, else the language pack's
+    conventions for this model (e.g. OpenCC for stock Qwen3-ASR writing Cantonese)."""
+    if normalization is not None:
+        return normalization
+    from cantocaptions_ai.languages import get_language_pack
+    return get_language_pack(language).resolve(model_name).normalization
+
+
 def _normalize_language(language: str) -> str:
     """Convert an ISO code or bare name to the canonical Qwen3-ASR form (e.g. 'yue' → 'Cantonese')."""
     if not language:
@@ -95,8 +104,12 @@ def load_model(
     vram_checks: bool = True,
     vram_headroom_mb: int = 512,
     processor=None,
+    normalization=None,
 ) -> QwenPipeline:
     """Load a Qwen3-ASR model, auto-selecting the backend based on the installed transformers.
+
+    ``model_name`` None loads the language pack's default model. ``normalization`` None
+    takes the pack's conventions for the model (see languages/base.py).
 
     With transformers>=5.13.0 (uv sync --extra transformers_qwen, recommended):
       → QwenPipelineNative using Qwen/Qwen3-ASR-1.7B-hf. torch.compile is opt-in
@@ -130,6 +143,7 @@ def load_model(
             vram_checks=vram_checks,
             vram_headroom_mb=vram_headroom_mb,
             processor=processor,
+            normalization=normalization,
         )
     else:
         logger.info(
@@ -149,4 +163,5 @@ def load_model(
             batch_size=batch_size,
             print_progress=print_progress,
             verbose=verbose,
+            normalization=normalization,
         )

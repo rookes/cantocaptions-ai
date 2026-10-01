@@ -14,12 +14,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cantocaptions_ai.cantonese.acronyms import format_acronyms
-from cantocaptions_ai.cantonese.cleaner import SubtitleCleaner
-from cantocaptions_ai.cantonese.numbers import convert_chinese_numbers
-from cantocaptions_ai.cantonese.questions import is_question, split_segments
-from cantocaptions_ai.cantonese.rules import BUILTIN_RULES_DIR, load_ruleset
-from cantocaptions_ai.cantonese.text import is_removable
+from cantocaptions_ai.languages.yue.acronyms import format_acronyms
+from cantocaptions_ai.languages.yue.builtins import CantoneseCleaner as SubtitleCleaner
+from cantocaptions_ai.languages.yue.numbers import convert_chinese_numbers
+from cantocaptions_ai.languages.yue.questions import is_question, split_segments
+from cantocaptions_ai.cleaning.rules import load_ruleset
+from cantocaptions_ai.languages.yue.paths import RULES_DIR as BUILTIN_RULES_DIR
+from cantocaptions_ai.languages.yue.text import is_removable
 
 
 def _cleaner() -> SubtitleCleaner:
@@ -161,7 +162,7 @@ class TestRuleLoader(unittest.TestCase):
             rules = load_ruleset(path)
             self.assertEqual([r.pattern.pattern for r in rules], ["a", "b"])
             # Sequential application: a -> b, then that b also -> c
-            from cantocaptions_ai.cantonese.rules import apply_ruleset
+            from cantocaptions_ai.cleaning.rules import apply_ruleset
             self.assertEqual(apply_ruleset("ab", rules), "cc")
 
     def test_bad_regex_names_file_and_index(self):
@@ -222,7 +223,7 @@ class TestCleanerConstruction(unittest.TestCase):
 class TestCommaConjunctions(unittest.TestCase):
 
     def setUp(self):
-        from cantocaptions_ai.cantonese.rules import apply_ruleset
+        from cantocaptions_ai.cleaning.rules import apply_ruleset
         rules = load_ruleset(BUILTIN_RULES_DIR / "comma_conjunctions.toml")
         self.apply = lambda text: apply_ruleset(text, rules)
 
@@ -617,7 +618,7 @@ class TestMergeAndWrite(unittest.TestCase):
     def test_layout_breaks_lines_without_a_cleaner(self):
         # --no_clean_text turns off rewriting, not the user's line limits: line breaking
         # used to live only inside the cleaner, so it silently stopped with it.
-        from cantocaptions_ai.cantonese.cleaner import linebreak_step
+        from cantocaptions_ai.cleaning.layout import linebreak_step
         from cantocaptions_ai.pipeline.transcribe import _merge_and_write
 
         written = {}
@@ -639,7 +640,7 @@ class TestMergeAndWrite(unittest.TestCase):
         self.assertIn("\n", written["segments"][0]["text"])
 
     def test_single_line_limit_has_no_linebreak_step(self):
-        from cantocaptions_ai.cantonese.cleaner import linebreak_step
+        from cantocaptions_ai.cleaning.layout import linebreak_step
         self.assertIsNone(linebreak_step(12, 1))
 
 

@@ -42,12 +42,15 @@ FULL_FILES = [
 def _default_model_name() -> str:
     """The ``model`` a plain run uses, read off PipelineConfig without calling
     ``defaults()`` -- that resolves the ``device`` default_factory, which imports torch.
-    It is equal to config/default.cfg's own value by test (test_cli_config.py).
+    It is equal to config/default.cfg's own value by test (test_cli_config.py). Unset
+    (None) means the default language's own model, resolved through the language packs.
     """
     from dataclasses import fields
     from cantocaptions_ai.pipeline.config import PipelineConfig
+    from cantocaptions_ai.pipeline.model_profiles import resolve_model_name
 
-    return next(f.default for f in fields(PipelineConfig) if f.name == "model")
+    defaults = {f.name: f.default for f in fields(PipelineConfig) if f.name in ("model", "language")}
+    return resolve_model_name(defaults["model"], defaults["language"])
 
 
 def _is_hub_id(hf_id: str) -> bool:

@@ -10,7 +10,7 @@ Covers:
 
 import unittest
 
-from cantocaptions_ai.cantonese.text import (
+from cantocaptions_ai.languages.yue.text import (
     DEFAULT_NORMALIZATION,
     PunctuationConfig,
     SegmentationConfig,
@@ -19,6 +19,7 @@ from cantocaptions_ai.cantonese.text import (
     normalize_segment_text,
     standardize_chars_hk,
 )
+from cantocaptions_ai.languages import get_language_pack
 from cantocaptions_ai.pipeline.model_profiles import MODEL_PROFILES, get_model_profile
 from cantocaptions_ai.text_profiles import (
     CJK_PUNCTUATION,
@@ -28,42 +29,51 @@ from cantocaptions_ai.text_profiles import (
 
 
 class TestForLanguage(unittest.TestCase):
-    """Language-dependent fields a profile leaves unset come from the run's language."""
+    """The run's text conventions come from its language pack, resolved for the model."""
 
     def test_cantonese_keeps_the_cjk_conventions(self):
-        profile = get_model_profile("cantocaptions-cantonese-ASR").for_language("yue")
+        profile = get_language_pack("yue").resolve("cantocaptions-cantonese-ASR")
         self.assertEqual(profile.punctuation, CJK_PUNCTUATION)
         self.assertEqual(profile.script, CJK_SCRIPT)
 
     def test_a_space_separated_language_gets_latin_conventions(self):
-        profile = get_model_profile("some/english-model").for_language("en")
+        profile = get_language_pack("en").resolve("some/english-model")
         self.assertEqual(profile.punctuation, LATIN_PUNCTUATION)
         self.assertEqual(profile.script.word_separator, " ")
         self.assertEqual(profile.script.layout, "word")
 
-    def test_fields_the_profile_sets_win(self):
+    def test_a_models_own_conventions_win(self):
         import dataclasses
-        custom = dataclasses.replace(get_model_profile("x"), punctuation=LATIN_PUNCTUATION)
-        self.assertEqual(custom.for_language("yue").punctuation, LATIN_PUNCTUATION)
+        from cantocaptions_ai.languages import ModelConventions
+
+        pack = dataclasses.replace(
+            get_language_pack("yue"),
+            conventions={"x": ModelConventions(punctuation=LATIN_PUNCTUATION)})
+        self.assertEqual(pack.resolve("x").punctuation, LATIN_PUNCTUATION)
 
 
 class TestGetModelProfile(unittest.TestCase):
     def test_unknown_model_is_all_default_noop(self):
-        profile = get_model_profile("some/random-model-path")
-        self.assertEqual(profile.hf_id, "some/random-model-path")
-        # No OpenCC, no HK-variant rewriting.
+        self.assertEqual(get_model_profile("some/random-model-path").hf_id, "some/random-model-path")
+        profile = get_language_pack("yue").resolve("some/random-model-path")
+        # No OpenCC, no HK-variant rewriting, no spot checks, no discourse markers.
         self.assertIsNone(profile.normalization.opencc_config)
         self.assertFalse(profile.normalization.chars_hk)
-        # No alignment spot checks.
         self.assertEqual(dict(profile.spotchecks), {})
-        # Punctuation is left to the language (see TestForLanguage).
-        self.assertIsNone(profile.punctuation)
-        # No discourse markers get a widened rescue window.
         self.assertEqual(profile.segmentation, SegmentationConfig())
+        self.assertEqual(profile.cleaning.manifest, "pipeline.toml")
+
+    def test_none_is_the_languages_default_model(self):
+        # mj-asr-worker reads get_model_profile(cfg.model).hf_id with model left unset.
+        self.assertEqual(get_model_profile(None).hf_id, "rookes/cantocaptions-cantonese-asr")
+        self.assertEqual(get_model_profile(None, "yue").hf_id, "rookes/cantocaptions-cantonese-asr")
+        with self.assertRaises(ValueError):
+            get_model_profile(None, "en")  # no default model for English
 
     def test_vanilla_qwen_preserves_behavior(self):
-        profile = get_model_profile("Qwen3-ASR")
-        self.assertEqual(profile.hf_id, "Qwen/Qwen3-ASR-1.7B-hf")
+        self.assertEqual(get_model_profile("Qwen3-ASR").hf_id, "Qwen/Qwen3-ASR-1.7B-hf")
+        self.assertIsNone(get_model_profile("Qwen3-ASR").languages)  # multilingual
+        profile = get_language_pack("yue").resolve("Qwen3-ASR")
         self.assertEqual(profile.normalization.opencc_config, "s2t_c.json")
         self.assertTrue(profile.normalization.chars_hk)
         # The 咁 spot-check keeps the historical +0.8 bias toward 噉.
@@ -73,42 +83,34 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertAlmostEqual(gam.weights.get("噉"), 0.8)
         # Qwen punctuates leading discourse markers off as their own clause.
         self.assertIn("嗱", profile.segmentation.leading_markers)
+        self.assertEqual(profile.cleaning.manifest, "pipeline_qwen.toml")
 
-    def test_finetuned_lora_is_clean_slate(self):
-        # Whether registered (env set) or resolved as a passthrough (env unset), the
-        # LoRA model gets no text normalization or spot checks.
-        profile = get_model_profile("Qwen3-ASR-lora")
+    def test_qwen_carries_no_cantonese_conventions_for_another_language(self):
+        profile = get_language_pack("en").resolve("Qwen3-ASR")
         self.assertIsNone(profile.normalization.opencc_config)
-        self.assertFalse(profile.normalization.chars_hk)
         self.assertEqual(dict(profile.spotchecks), {})
 
     def test_published_finetune_is_registered_from_the_hub(self):
         # The published checkpoint needs no env var: it is a plain hub id, always a valid
-        # --model choice, and carries the same clean-slate profile as the local LoRA build.
+        # --model choice, and carries the same clean-slate conventions as the LoRA build.
         self.assertIn("cantocaptions-cantonese-ASR", MODEL_PROFILES)
-        profile = get_model_profile("cantocaptions-cantonese-ASR")
+        self.assertEqual(get_model_profile("cantocaptions-cantonese-ASR").languages, {"yue"})
+        profile = get_language_pack("yue").resolve("cantocaptions-cantonese-ASR")
         self.assertEqual(profile.hf_id, "rookes/cantocaptions-cantonese-asr")
         self.assertIsNone(profile.normalization.opencc_config)
         self.assertFalse(profile.normalization.chars_hk)
         self.assertEqual(dict(profile.spotchecks), {})
-        self.assertEqual(profile.for_language("yue").punctuation, PunctuationConfig())
+        self.assertEqual(profile.punctuation, PunctuationConfig())
         # Cue assembly matches Qwen's: the fine-tune clauses off 嗱/喂 the same way.
         self.assertEqual(
-            profile.segmentation, get_model_profile("Qwen3-ASR").segmentation,
+            profile.segmentation, get_language_pack("yue").resolve("Qwen3-ASR").segmentation,
         )
         self.assertIn("嗱", profile.segmentation.leading_markers)
 
-    def test_published_finetune_and_lora_share_one_profile_shape(self):
-        # The two differ only in where the weights come from; every downstream field must
-        # stay identical, which is what _finetuned_profile exists to guarantee.
-        import dataclasses
-        from cantocaptions_ai.pipeline.model_profiles import _finetuned_profile
-
-        published = dataclasses.asdict(_finetuned_profile("rookes/x"))
-        local = dataclasses.asdict(_finetuned_profile("/models/lora-merged"))
-        published.pop("hf_id")
-        local.pop("hf_id")
-        self.assertEqual(published, local)
+    def test_published_finetune_and_lora_share_one_convention(self):
+        # The two differ only in where the weights come from.
+        conventions = get_language_pack("yue").conventions
+        self.assertIs(conventions["cantocaptions-cantonese-ASR"], conventions["Qwen3-ASR-lora"])
 
     def test_registry_keys_are_the_cli_choices_source(self):
         # __main__ derives --model choices from these keys.

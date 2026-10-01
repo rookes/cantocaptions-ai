@@ -278,8 +278,11 @@ class TestCorrectWithReferenceExamples(unittest.TestCase):
         self.assertEqual(c._generate.call_count, 1)  # only called for seg 0
 
     def test_conservative_mode_uses_correct_prompt(self):
-        """Conservative mode sends _PASS_REF_SYSTEM; semantic sends _PASS_REF_SEMANTIC_SYSTEM."""
-        from cantocaptions_ai.pipeline.llm_correction import _PASS_REF_SYSTEM, _PASS_REF_SEMANTIC_SYSTEM
+        """Conservative mode sends the reference prompt; semantic sends the semantic one."""
+        from cantocaptions_ai.languages.yue.prompts import (
+            REFERENCE as _PASS_REF_SYSTEM,
+            REFERENCE_SEMANTIC as _PASS_REF_SEMANTIC_SYSTEM,
+        )
 
         c_cons = _corrector(semantic=False)
         c_cons._generate = MagicMock(return_value='unchanged')

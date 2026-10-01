@@ -46,12 +46,13 @@ def _select_audio_track(path: str, language: Optional[str] = "yue",
     ext = os.path.splitext(path)[1].lower()
     if ext not in _VIDEO_EXTENSIONS:
         return 0
-    from cantocaptions_ai.utils.audio import probe_audio_tracks, select_track
+    from cantocaptions_ai.languages import get_language_pack
+    from cantocaptions_ai.utils.audio import probe_audio_tracks
     streams = probe_audio_tracks(path)
     if not streams:
         logger.warning("No audio streams found via ffprobe for '%s'; using default track", path)
         return 0
-    track = select_track(streams, language)
+    track = get_language_pack(language).choose_track(streams)
     if track != 0:
         logger.info("Selected audio track index %d (%s) for '%s'", track, language, path)
     return track
@@ -618,54 +619,50 @@ def _merge_and_write(
 
 
 def _validate_language_support(cfg) -> None:
-    """Refuse a configuration that would run Cantonese-specific parts on another language.
+    """Refuse a configuration that would run another language's parts on this one.
 
-    Only FULLY_SUPPORTED_LANGUAGES have their own ASR model, cleaning rules and conventions.
-    Another language can still run as a raw pipeline -- an ASR model that speaks it, an
-    align model for it, no text cleaning -- and each missing piece is named in the error.
+    The language pack (``languages/``) says what the language has. A fully supported one
+    (a default model and cleaning rules: yue) runs end to end. Any other runs as a raw
+    pipeline -- an ASR model that speaks it, an align model for it, no text cleaning -- and
+    each missing piece is named in the error.
     """
     from cantocaptions_ai.errors import ConfigError
-    from cantocaptions_ai.pipeline.model_profiles import (
-        CANTONESE_MODELS,
-        FULLY_SUPPORTED_LANGUAGES,
-    )
+    from cantocaptions_ai.languages import LANGUAGE_PACKS, get_language_pack
+    from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 
     language = cfg.language
-    if cfg.ensemble_model != "none":
-        from cantocaptions_ai.pipeline.ensemble import ENSEMBLE_MODELS
-        if language not in ENSEMBLE_MODELS:
-            raise ConfigError(f"ensemble_model has no model for language '{language}' "
-                              f"(available: {', '.join(sorted(ENSEMBLE_MODELS))})")
-    if cfg.llm_correction:
-        from cantocaptions_ai.pipeline.llm_correction import CORRECTION_PROMPTS
-        if language not in CORRECTION_PROMPTS:
-            raise ConfigError(f"llm_correction has no prompts for language '{language}' "
-                              f"(available: {', '.join(sorted(CORRECTION_PROMPTS))})")
-    if language in FULLY_SUPPORTED_LANGUAGES:
-        return
+    pack = get_language_pack(language)
+    if cfg.ensemble_model != "none" and pack.ensemble_model is None:
+        raise ConfigError(f"ensemble_model has no model for language '{language}' (available: "
+                          f"{', '.join(sorted(c for c, p in LANGUAGE_PACKS.items() if p.ensemble_model))})")
+    if cfg.llm_correction and pack.correction_prompts is None:
+        raise ConfigError(f"llm_correction has no prompts for language '{language}' (available: "
+                          f"{', '.join(sorted(c for c, p in LANGUAGE_PACKS.items() if p.correction_prompts))})")
 
     needed = []
-    if cfg.model in CANTONESE_MODELS:
-        needed.append(f"a --model that transcribes '{language}' ({cfg.model} is a Cantonese model)")
-    if not cfg.no_align and cfg.align_model is None:
-        from cantocaptions_ai.pipeline.alignment import (
-            DEFAULT_ALIGN_MODELS_HF,
-            DEFAULT_ALIGN_MODELS_TORCH,
-        )
-        if language not in DEFAULT_ALIGN_MODELS_TORCH and language not in DEFAULT_ALIGN_MODELS_HF:
-            needed.append(f"an --align_model for '{language}' (or --no_align)")
-    if not cfg.no_clean_text:
-        needed.append("--no_clean_text (the text cleaning rules are written for Cantonese)")
+    model = pack.model_name(cfg.model)
+    if model is None:
+        needed.append(f"a --model that transcribes '{language}' (it has no default)")
+    else:
+        languages = get_model_profile(model, language).languages
+        if languages is not None and language not in languages:
+            needed.append(f"a --model that transcribes '{language}' ({model} is trained for "
+                          f"{', '.join(sorted(languages))} only)")
+    if not cfg.no_align and cfg.align_model is None and pack.default_align_model is None:
+        needed.append(f"an --align_model for '{language}' (or --no_align)")
+    if pack.cleaning is None and not cfg.no_clean_text:
+        needed.append(f"--no_clean_text (there are no cleaning rules for '{language}')")
     if needed:
+        supported = sorted(c for c, p in LANGUAGE_PACKS.items() if p.fully_supported)
         raise ConfigError(
-            f"language '{language}' is not fully supported (only "
-            f"{', '.join(sorted(FULLY_SUPPORTED_LANGUAGES))}); to run it anyway, set "
-            + "; ".join(needed)
+            f"language '{language}' is not fully supported (only {', '.join(supported)}); "
+            "to run it anyway, set " + "; ".join(needed)
         )
-    warnings.warn(
-        f"language '{language}' runs as a raw pipeline: the ASR model's text is timed and "
-        f"laid out, but not cleaned or checked against conventions for it"
-    )
+    if not pack.fully_supported:
+        warnings.warn(
+            f"language '{language}' runs as a raw pipeline: the ASR model's text is timed and "
+            f"laid out, but not cleaned or checked against conventions for it"
+        )
 
 
 def validate_config(cfg) -> None:
@@ -916,7 +913,6 @@ def _execute_pipeline(
     its outputs and debug checkpoints use; by default, each file's stem. Raises
     ConfigError if two inputs would share a name.
     """
-    from cantocaptions_ai.pipeline.model_profiles import get_model_profile
     from huggingface_hub.utils.tqdm import disable_progress_bars
 
     # HF Hub's own tqdm download bars race StageTimer's spinner over the same
@@ -947,11 +943,15 @@ def _execute_pipeline(
 
     align_language = cfg.language
 
-    # The ASR model's profile drives the downstream path: post-ASR text normalization
-    # (applied inside the ASR backend), the alignment particle spot-checks, and the
-    # punctuation set used for sentence splitting / line merging. Unregistered models get
-    # an all-default (no-op) profile. See pipeline/model_profiles.py.
-    profile = get_model_profile(cfg.model).for_language(cfg.language)
+    # The language pack, resolved for the ASR model, drives the downstream path: post-ASR
+    # text normalization (applied inside the ASR backend), the alignment particle
+    # spot-checks, the punctuation and script used for sentence splitting / cue assembly /
+    # line layout, and the cleaning rules. A model the pack has no conventions for gets
+    # all-default (no-op) ones. See languages/base.py.
+    from cantocaptions_ai.languages import get_language_pack
+    pack = get_language_pack(cfg.language)
+    profile = pack.resolve(cfg.model)
+    align_model_name = cfg.align_model or pack.default_align_model
 
     qwen_threads = torch.get_num_threads()
     if cfg.threads > 0:
@@ -992,20 +992,23 @@ def _execute_pipeline(
                 "(it is already a finished subtitle, not a raw transcript)", realign_mode,
             )
     elif not cfg.no_clean_text:
-        from cantocaptions_ai.cantonese.cleaner import SubtitleCleaner
+        from cantocaptions_ai.cleaning import SubtitleCleaner
+        spec = pack.cleaning  # validate_config guarantees one when cleaning is on
         cleaner = SubtitleCleaner(
-            rules_dir=cfg.clean_rules_dir,
+            rules_dir=cfg.clean_rules_dir or spec.rules_dir,
             line_max_length=cfg.max_line_width or 21,
             max_line_count=cfg.max_line_count,
             # How much cleaning the text needs depends on how the model writes it, so the
-            # step manifest comes from the profile like every other output convention.
+            # step manifest comes from the model's conventions like every other output one.
             manifest=profile.cleaning.manifest,
+            builtin_steps=spec.builtin_steps(),
+            noise_tokens=spec.noise_tokens,
             layout=profile.script.layout,
         )
     elif cfg.max_line_width:
         # --no_clean_text turns off the rewriting, not the line limits the user also set:
         # line breaking lives in the cleaner's manifest, so it is applied on its own here.
-        from cantocaptions_ai.cantonese.cleaner import linebreak_step
+        from cantocaptions_ai.cleaning.layout import linebreak_step
         layout = linebreak_step(cfg.max_line_width, cfg.max_line_count, profile.script.layout)
 
     if cfg.load_debug_dir:
@@ -1207,7 +1210,7 @@ def _execute_pipeline(
             align_model, align_metadata = load_with_offline_fallback(
                 load_align_model,
                 align_language, cfg.device, cfg.device_index,
-                model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
+                model_name=align_model_name, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
                 compute_type=cfg.align_compute_type,
                 vram_checks=cfg.vram_checks,
                 char_substitution=cfg.align_char_substitution,
@@ -1321,7 +1324,8 @@ def _execute_pipeline(
             with StageTimer("Transcription", summary, progress=progress) as stage:
                 with model_scope(
                     load_model,
-                    cfg.model,
+                    profile.model,
+                    normalization=profile.normalization,
                     device=cfg.device,
                     device_index=cfg.device_index,
                     download_root=cfg.model_dir,
@@ -1430,7 +1434,7 @@ def _execute_pipeline(
                 align_model, align_metadata = load_with_offline_fallback(
                     load_align_model,
                     align_language, cfg.device, cfg.device_index,
-                    model_name=cfg.align_model, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
+                    model_name=align_model_name, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
                     compute_type=cfg.align_compute_type,
                     vram_checks=cfg.vram_checks,
                     char_substitution=cfg.align_char_substitution,

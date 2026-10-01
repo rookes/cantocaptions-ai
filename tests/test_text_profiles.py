@@ -5,7 +5,8 @@ space-separated script -- at each point the pipeline used to assume CJK.
 """
 import pytest
 
-from cantocaptions_ai.cantonese.cleaner import LAYOUTS, SubtitleCleaner, linebreak_step
+from cantocaptions_ai.cleaning import LAYOUTS, SubtitleCleaner, linebreak_step
+from cantocaptions_ai.languages.yue.builtins import CantoneseCleaner
 from cantocaptions_ai.pipeline.realign import realign_punctuation
 from cantocaptions_ai.text_profiles import (
     CJK_PUNCTUATION,
@@ -68,12 +69,12 @@ def test_cleaner_takes_its_own_builtins_and_noise(tmp_path):
     rules.mkdir()
     (rules / "pipeline.toml").write_text(
         '[[steps]]\ntype = "builtin"\nname = "shout"\n', encoding="utf-8")
-    cleaner = SubtitleCleaner(rules_dir=str(rules), builtin_steps={"shout": str.upper},
+    cleaner = SubtitleCleaner(rules_dir=rules, builtin_steps={"shout": str.upper},
                               noise_tokens=("UM",))
     assert cleaner.clean("hello") == "HELLO"
     assert cleaner.is_noise(cleaner.clean("um")) and not cleaner.is_noise("HELLO")
-    # The Cantonese defaults are still what a plain SubtitleCleaner gets.
-    assert SubtitleCleaner().is_noise("嗯")
+    # The Cantonese preset keeps the Cantonese defaults.
+    assert CantoneseCleaner().is_noise("嗯")
 
 
 def test_a_space_is_a_realign_pause_only_without_word_spacing():

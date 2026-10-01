@@ -150,7 +150,7 @@ def load_cfg_file(path: Path, parser: argparse.ArgumentParser) -> Dict[str, Any]
 
     Fails fast (via parser.error) on a missing section, unknown key, or a
     value that fails type=/choices= validation -- mirroring
-    cantocaptions_ai/cantonese/cleaner.py's SubtitleCleaner._load_steps,
+    cantocaptions_ai/cleaning/engine.py's SubtitleCleaner._load_steps,
     which fails fast on a bad manifest/rule file so problems surface at
     pipeline start rather than mid-run.
     """

@@ -1,9 +1,10 @@
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from cantocaptions_ai.languages.base import CorrectionPrompts
 from cantocaptions_ai.utils.schema import ProgressCallback, SingleSegment, TranscriptionResult
 from cantocaptions_ai.utils.model_utils import PipelineStage, ensure_hf_model_downloaded, guard_model_load
 from cantocaptions_ai.utils.debug import load_llm_correction_debug, write_llm_correction_debug
@@ -16,66 +17,34 @@ _SUBSTITUTION_RE = re.compile(r'^(.+?)→(.+)$')
 
 _CANTONESE_PARTICLES = frozenset('嘅喎囉啦㗎呀喇吖咋咩乜')
 
-_PASS_A_SYSTEM = (
-    "你係一個粵語字幕校對員。你嘅工作係修正ASR轉寫錯誤，特別係語氣助詞"
-    "（譬如：喇/囉/喎/㗎/啩/呢/啦）嘅誤用，以及明顯嘅錯別字。\n"
-    "規則：\n"
-    "1. 只輸出修正後嘅粵語文字，唔好加任何解釋或標點嘅字元。\n"
-    "2. 如果兩個版本相同或差距極少，保留主要ASR版本。\n"
-    "3. 唔好改動內容意思，唔好翻譯成普通話。\n"
-    "4. 保持繁體中文香港標準。"
-)
-
-_PASS_B_SYSTEM = (
-    "你係一個粵語字幕校對員。任務：審視整份字幕，找出所有人名、地名、品牌名等專有名詞，"
-    "確保全文用法一致。只修改明顯不一致嘅專有名詞，唔好改其他內容。\n"
-    "輸出格式：每行一個替換指令，格式為「錯誤寫法→正確寫法」。如果唔需要修正，輸出「無需修正」。"
-)
-
-_PASS_REF_SYSTEM = (
-    "你係一個粵語字幕校對員。你會收到一段粵語ASR字幕同埋對應嘅普通話參考字幕。\n"
-    "任務：只修正因粵語同音字而造成嘅ASR錯誤，例如人名、地名、成語入面嘅錯別字。\n"
-    "嚴格規則：\n"
-    "1. 只輸出修正後嘅粵語文字，唔好加任何解釋。\n"
-    "2. 唔好將粵語詞語改寫成普通話。禁止：將「嘅」改成「的」、「唔」改成「不」、"
-    "「係」改成「是」、「佢」改成「他／她」、「喺」改成「在」、「哋」改成「們」。\n"
-    "3. 只修正明顯係同音字錯誤嘅部分。如果唔確定，保留原文。\n"
-    "4. 唔好增加原文冇嘅內容，唔好改動原文意思。"
-)
-
-_PASS_REF_SEMANTIC_SYSTEM = (
-    "你係一個粵語字幕校對員。你會收到一段粵語ASR字幕同埋對應嘅普通話參考字幕。\n"
-    "任務：修正ASR字幕入面嘅錯誤，包括同音字錯誤同埋缺漏嘅關鍵字（例如否定詞「唔」、標點）。\n"
-    "嚴格規則：\n"
-    "1. 只輸出修正後嘅粵語文字，唔好加任何解釋。\n"
-    "2. 唔好將粵語詞語改寫成普通話。禁止：將「嘅」改成「的」、「唔」改成「不」、"
-    "「係」改成「是」、「佢」改成「他／她」、「喺」改成「在」、「哋」改成「們」。\n"
-    "3. 可以修正：同音字錯誤；如果普通話參考清晰顯示缺漏嘅否定詞或關鍵標點，可以補回。\n"
-    "4. 如果普通話參考同ASR意思差異過大（例如係唔同版本），保留原文。\n"
-    "5. 最多只能補充少量缺漏字，唔好大幅改寫句子。"
-)
+# The system prompts are the language pack's (languages/<code>/prompts.py). Correction is
+# written for one language at a time: the prompts, and the particle-aware sanitising of the
+# model's answers below, are Cantonese, and validate_config refuses llm_correction for a
+# language whose pack has none rather than feed Cantonese instructions another language.
+def correction_prompts(language: str) -> Optional[CorrectionPrompts]:
+    from cantocaptions_ai.languages import get_language_pack
+    return get_language_pack(language).correction_prompts
 
 
-@dataclass(frozen=True)
-class CorrectionPrompts:
-    """The system prompts for one language's correction passes (see LLMCorrector)."""
-    particles: str              # pass A: per-segment particle / typo fix against the ensemble
-    names: str                  # pass B: whole-document proper-noun consistency
-    reference: str              # reference subtitle: homophone fixes only
-    reference_semantic: str     # reference subtitle: also restore missing key words
+class _PromptsByLanguage(Mapping):
+    """``CORRECTION_PROMPTS[code]``: a read-only view of the registered packs' prompts."""
+
+    def _table(self) -> Dict[str, CorrectionPrompts]:
+        from cantocaptions_ai.languages import LANGUAGE_PACKS
+        return {code: p.correction_prompts for code, p in LANGUAGE_PACKS.items()
+                if p.correction_prompts is not None}
+
+    def __getitem__(self, code):
+        return self._table()[code]
+
+    def __iter__(self):
+        return iter(self._table())
+
+    def __len__(self):
+        return len(self._table())
 
 
-# Correction is written for one language at a time: the prompts, and the particle-aware
-# sanitising of the model's answers, are Cantonese. validate_config refuses llm_correction
-# for a language with no entry here rather than feed Cantonese instructions another language.
-CORRECTION_PROMPTS: Dict[str, CorrectionPrompts] = {
-    "yue": CorrectionPrompts(
-        particles=_PASS_A_SYSTEM,
-        names=_PASS_B_SYSTEM,
-        reference=_PASS_REF_SYSTEM,
-        reference_semantic=_PASS_REF_SEMANTIC_SYSTEM,
-    ),
-}
+CORRECTION_PROMPTS: Mapping[str, CorrectionPrompts] = _PromptsByLanguage()
 
 
 def _edit_distance(a: str, b: str) -> int:
@@ -138,7 +107,10 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
         self._tokenizer = tokenizer
         self._device = device
         self._semantic_mode = semantic_mode
-        self._prompts = CORRECTION_PROMPTS[language]
+        prompts = correction_prompts(language)
+        if prompts is None:
+            raise ValueError(f"no LLM correction prompts for language '{language}'")
+        self._prompts = prompts
 
     @staticmethod
     def read_debug(audio_path, debug_dir): return load_llm_correction_debug(audio_path, debug_dir)

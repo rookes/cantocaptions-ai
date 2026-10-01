@@ -4,7 +4,7 @@ candidates, the reverse direction of numbers.py. Pure logic, no model needed.
 
 import unittest
 
-from cantocaptions_ai.cantonese.numeral_candidates import has_digits, numeral_readings
+from cantocaptions_ai.languages.yue.numeral_candidates import has_digits, numeral_readings
 
 
 class TestHasDigits(unittest.TestCase):

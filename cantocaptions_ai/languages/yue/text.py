@@ -1,5 +1,8 @@
 """
-A utility library for Cantonese parsing of raw text
+Cantonese text utilities: OpenCC / HK-variant normalization, final particles, noise lines.
+
+Part of the yue language pack (``languages/yue``). The generic value types that used to be
+defined here now live in ``cantocaptions_ai/text_profiles.py`` and are re-exported below.
 """
 
 import re
@@ -10,7 +13,7 @@ from typing import List, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     from cantocaptions_ai.utils.schema import SingleSegment
 
-_OPENCC_DIR = Path(__file__).parent / "opencc"
+_OPENCC_DIR = Path(__file__).parent / "opencc"  # == paths.OPENCC_DIR
 
 MAX_CHARS = 18
 
@@ -45,7 +48,7 @@ MERGEABLE_CHARS = list(CJK_MERGEABLE_CHARS)
 
 @lru_cache(maxsize=None)
 def _get_opencc(config_name: str):
-    """Build (and cache) an OpenCC converter for a config file under cantonese/opencc/."""
+    """Build (and cache) an OpenCC converter for a config file under languages/yue/opencc/."""
     from opencc import OpenCC
     return OpenCC(str(_OPENCC_DIR / config_name))
 
@@ -54,8 +57,9 @@ def simplified_to_traditional(text: str, config_name: str = "s2t_c.json") -> str
 
 def standardize_chars_hk(text: str) -> str:
     """Convert character variants to the Hong Kong standard forms (rules/chars_hk.toml)."""
-    from cantocaptions_ai.cantonese.rules import apply_ruleset, get_builtin_ruleset
-    return apply_ruleset(text, get_builtin_ruleset("chars_hk"))
+    from cantocaptions_ai.cleaning.rules import apply_ruleset, load_ruleset_cached
+    from cantocaptions_ai.languages.yue.paths import RULES_DIR
+    return apply_ruleset(text, load_ruleset_cached(RULES_DIR / "chars_hk.toml"))
 
 def normalize_segment_text(
     segment: "SingleSegment", normalization: TextNormalization = DEFAULT_NORMALIZATION,
