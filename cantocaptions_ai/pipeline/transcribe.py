@@ -517,6 +517,7 @@ def _merge_and_write(
     max_line_width: Optional[int] = None,
     max_line_count: Optional[int] = None,
     merge: bool = True,
+    max_cue_duration: float = 0.0,
     order_cues: bool = False,
     *,
     collect: bool = False,
@@ -568,6 +569,7 @@ def _merge_and_write(
             is_noise=is_noise,
             script=script,
             merge=merge,
+            max_cue_duration=max_cue_duration,
         )
 
         if order_cues and debug_dir is not None:
@@ -694,6 +696,11 @@ def validate_config(cfg) -> None:
     # threshold would otherwise only surface after ASR and alignment have already run.
     if not 0 < cfg.speaker_confidence <= 1:
         raise ConfigError(f"speaker_confidence must be in (0, 1], got {cfg.speaker_confidence}")
+    if cfg.max_cue_duration and cfg.max_cue_duration < 2 * cfg.min_cue_duration:
+        raise ConfigError(
+            f"max_cue_duration must be 0 (no cap) or at least twice min_cue_duration "
+            f"({cfg.min_cue_duration}), got {cfg.max_cue_duration}"
+        )
     if not 0 < cfg.speaker_conflict_share <= 1:
         raise ConfigError(
             f"speaker_conflict_share must be in (0, 1], got {cfg.speaker_conflict_share}"
@@ -1514,6 +1521,7 @@ def _execute_pipeline(
         # are not an artifact to be undone, so the two passes that join cues are off; the
         # noise drop and the duration floor still run.
         merge=not cfg.realign,
+        max_cue_duration=cfg.max_cue_duration,
         order_cues=bool(cfg.realign),
         collect=collect, audio_start_offset=audio_start_offset, display_paths=display_paths,
     )

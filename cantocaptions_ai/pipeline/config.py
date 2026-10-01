@@ -106,6 +106,10 @@ class PipelineConfig:
     align_release: float = 0.64
     align_merge_distance: float = 0.08
     min_cue_duration: float = 0.5
+    # Longest a cue may run, in seconds: joins that would pass it are refused, and a cue
+    # alignment produced longer is cut at its longest internal pause
+    # (segmentation._split_long_cues). 0 turns the cap off.
+    max_cue_duration: float = 4.0
     merge_gap: float = 0.25
     align_batch_size: int = 2
     align_compute_type: str = "float16"

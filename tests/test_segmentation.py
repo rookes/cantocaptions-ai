@@ -581,3 +581,83 @@ class TestEmptyCuesAreRefused(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def timed(words, start=0.0, step=0.4, pauses=None):
+    """A cue whose ``words`` are timed one ``step`` apart, plus ``pauses[i]`` seconds of
+    silence after word i. Text is the words joined with a space (or not, for CJK)."""
+    pauses = pauses or {}
+    out, t = [], start
+    for i, w in enumerate(words):
+        out.append({"word": w, "start": round(t, 3), "end": round(t + step, 3)})
+        t += step + pauses.get(i, 0.0)
+    return out
+
+
+def cue_of(words, sep=" "):
+    return {"start": words[0]["start"], "end": words[-1]["end"],
+            "text": sep.join(w["word"] for w in words), "words": words, "chars": None}
+
+
+class TestMaxCueDuration(unittest.TestCase):
+    """The cap on how long a cue runs: joins refused past it, pass E cutting what is longer."""
+
+    def test_a_join_past_the_cap_is_refused(self):
+        cues = assemble_cues(
+            [seg(0.0, 2.5, "我哋今日去咗街，"), seg(2.54, 5.0, "跟住返屋企食飯")],
+            min_cue_duration=0, max_chars=40, max_cue_duration=4.0,
+        )
+        self.assertEqual(len(cues), 2)
+        uncapped = assemble_cues(
+            [seg(0.0, 2.5, "我哋今日去咗街，"), seg(2.54, 5.0, "跟住返屋企食飯")],
+            min_cue_duration=0, max_chars=40,
+        )
+        self.assertEqual(len(uncapped), 1)
+
+    def test_a_long_unpunctuated_cue_is_cut_at_its_longest_pause(self):
+        words = timed("the quick brown fox jumps over the lazy dog again and again".split(),
+                      pauses={3: 0.15, 6: 0.6, 8: 0.2})
+        cues = assemble_cues([cue_of(words)], min_cue_duration=0.5, max_cue_duration=4.0,
+                             script=_spaced())
+        self.assertEqual(texts(cues), ["the quick brown fox jumps over the",
+                                       "lazy dog again and again"])
+        self.assertEqual(cues[0]["end"], words[6]["end"])
+        self.assertEqual(cues[1]["start"], words[7]["start"])
+        self.assertTrue(all(c["end"] - c["start"] <= 4.0 for c in cues))
+        self.assertIn("split_long", cues[0]["notes"][0])
+
+    def test_with_no_pause_it_cuts_at_punctuation_then_near_the_middle(self):
+        chars = list("一二三四五六七，八九十一二三四五六七八")
+        words = timed(chars, step=0.25)
+        cues = assemble_cues([cue_of(words, sep="")], min_cue_duration=0.5,
+                             max_cue_duration=4.0)
+        self.assertEqual(texts(cues), ["一二三四五六七，", "八九十一二三四五六七八"])
+
+        plain = timed(list("一二三四五六七八九十一二三四五六七八九十"), step=0.25)
+        cues = assemble_cues([cue_of(plain, sep="")], min_cue_duration=0.5,
+                             max_cue_duration=4.0)
+        self.assertEqual([len(c["text"]) for c in cues], [10, 10])
+
+    def test_every_piece_fits_and_none_is_a_fragment(self):
+        words = timed([f"w{i}" for i in range(40)], step=0.3)   # 12 s, no pauses at all
+        cues = assemble_cues([cue_of(words)], min_cue_duration=0.5, max_cue_duration=4.0,
+                             script=_spaced())
+        durations = [c["end"] - c["start"] for c in cues]
+        self.assertTrue(all(1.0 <= d <= 4.0 for d in durations), durations)
+        self.assertEqual(" ".join(texts(cues)), cue_of(words)["text"])
+
+    def test_a_cue_without_word_timings_is_left_whole(self):
+        cues = assemble_cues([seg(0.0, 9.0, "冇字幕時間")], min_cue_duration=0.5,
+                             max_cue_duration=4.0)
+        self.assertEqual(len(cues), 1)
+
+    def test_authoritative_boundaries_are_not_cut(self):
+        words = timed([f"w{i}" for i in range(20)], step=0.3)
+        cues = assemble_cues([cue_of(words)], min_cue_duration=0.5, max_cue_duration=4.0,
+                             merge=False, script=_spaced())
+        self.assertEqual(len(cues), 1)
+
+
+def _spaced():
+    from cantocaptions_ai.text_profiles import SPACED_SCRIPT
+    return SPACED_SCRIPT

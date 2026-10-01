@@ -219,8 +219,13 @@ def _word_offsets(
     return spans
 
 
-def _split_one(segment: Mapping, gaps: Sequence[InternalGap]) -> Optional[List[dict]]:
-    """Cut one cue at each of ``gaps``. ``None`` if it cannot be done safely."""
+def _split_one(segment: Mapping, gaps: Sequence[InternalGap],
+               kind: str = "split_gap") -> Optional[List[dict]]:
+    """Cut one cue at each of ``gaps``. ``None`` if it cannot be done safely.
+
+    ``kind`` names the reason in each piece's note (``split_gap``: a silence;
+    ``segmentation`` also cuts over-long cues here, as ``split_long``).
+    """
     text = str(segment.get("text", ""))
     words = list(segment.get("words") or [])
     spans = _word_offsets(text, words)
@@ -254,7 +259,7 @@ def _split_one(segment: Mapping, gaps: Sequence[InternalGap]) -> Optional[List[d
                      float(words[gap.before_idx]["end"]))
         if not head["text"].strip():
             return None
-        add_note(head, f"split_gap:{gap.gap:.1f}s after {gap.before}")
+        add_note(head, f"{kind}:{gap.gap:.1f}s after {gap.before}")
         pieces.append(head)
         word_from, text_from = gap.after_idx, spans[gap.after_idx][0]
         start = float(words[gap.after_idx]["start"])
@@ -262,7 +267,7 @@ def _split_one(segment: Mapping, gaps: Sequence[InternalGap]) -> Optional[List[d
     tail = piece(None, None, float(segment["end"]))
     if not tail["text"].strip() or tail["end"] < tail["start"]:
         return None
-    add_note(tail, f"split_gap:{gaps[-1].gap:.1f}s before {gaps[-1].after}")
+    add_note(tail, f"{kind}:{gaps[-1].gap:.1f}s before {gaps[-1].after}")
     pieces.append(tail)
     return pieces
 

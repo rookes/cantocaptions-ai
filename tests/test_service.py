@@ -300,3 +300,12 @@ class TestLanguageSupport(unittest.TestCase):
             validate_config(PipelineConfig(**base, llm_correction=True))
         with self.assertRaisesRegex(ConfigError, "ensemble_model"):
             validate_config(PipelineConfig(**base, ensemble_model="whisper", llm_correction=True))
+
+
+class TestMaxCueDuration(unittest.TestCase):
+    def test_a_cap_too_short_to_hold_two_minimum_cues_is_refused(self):
+        with self.assertRaises(ConfigError):
+            validate_config(PipelineConfig(max_cue_duration=0.8))   # min_cue_duration 0.5
+
+    def test_zero_turns_the_cap_off(self):
+        validate_config(PipelineConfig(max_cue_duration=0))

@@ -5,7 +5,7 @@ punctuation mark so the Viterbi pass can place a pause at each clause boundary, 
 subsegment per clause. Those fragments have to be glued back into cues that read naturally,
 which is what this module does.
 
-Four passes run in order over one file's segments:
+Five passes run in order over one file's segments:
 
   A. **Adjacency merge** — the classic rule: join neighbours that are touching and whose join
      boundary is punctuation-clean, up to a single-line character budget.
@@ -15,8 +15,14 @@ Four passes run in order over one file's segments:
      a continuous speech run ("嗱，", "喂，") collapses to a handful of frames and ends up as its
      own 40 ms cue. Those fragments are merged into whichever neighbour reads best, with the
      punctuation rule relaxed from a hard gate to a ranking signal.
+  E. **Long-cue split** — a cue still longer than ``max_cue_duration`` (one clause the ASR
+     never punctuated, typically) is cut at its best internal boundary: the longest pause
+     between two of its timed words or characters, favouring punctuation and the middle.
   D. **Duration floor** — whatever is still too short to read, and had no neighbour to join,
      gets its end extended into the following silence.
+
+Passes A and C also refuse a join that would make a cue longer than ``max_cue_duration``, so
+pass E only ever sees a cue that alignment produced long.
 
 Everything is a pure function over segment dicts: no models, no I/O, no config objects beyond
 the plain value types from ``text_profiles.py``. Set ``min_cue_duration=0`` to disable
@@ -35,6 +41,7 @@ from cantocaptions_ai.text_profiles import (
     boundary_is_mergeable,
     is_mergeable,
 )
+from cantocaptions_ai.pipeline.align_checks import InternalGap, _split_one
 from cantocaptions_ai.pipeline.speaker_assign import speaker_scope
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.schema import SingleAlignedSegment, merge_segments
@@ -59,6 +66,12 @@ def _duration(seg: SingleAlignedSegment) -> float:
 
 def _text(seg: SingleAlignedSegment) -> str:
     return seg["text"].strip()
+
+
+def _within_cap(left: SingleAlignedSegment, right: SingleAlignedSegment,
+                max_cue_duration: float) -> bool:
+    """Whether joining *left* and *right* keeps the cue within ``max_cue_duration`` (0: no cap)."""
+    return not max_cue_duration or right["end"] - left["start"] <= max_cue_duration + GAP_EPS
 
 
 # Longest cue text shown in a veto log line before it is elided.
@@ -141,6 +154,7 @@ def _adjacency_merge(
     min_cue_duration: float,
     vetoes: "_MergeVetoLog",
     script: ScriptConfig = DEFAULT_SCRIPT,
+    max_cue_duration: float = 0.0,
 ) -> List[SingleAlignedSegment]:
     """Pass A: greedily join touching neighbours with a clean join boundary.
 
@@ -169,6 +183,7 @@ def _adjacency_merge(
         mergeable = (
             not defer
             and gap <= threshold + GAP_EPS
+            and _within_cap(prev, segment, max_cue_duration)
             and is_mergeable(_text(prev), _text(segment), punctuation, max_chars=max_chars,
                              script=script)
         )
@@ -208,6 +223,7 @@ def _rescue_short_cues(
     rescue_max_chars: int,
     vetoes: "_MergeVetoLog",
     script: ScriptConfig = DEFAULT_SCRIPT,
+    max_cue_duration: float = 0.0,
 ) -> List[SingleAlignedSegment]:
     """Pass C: merge each too-short cue into whichever neighbour reads best.
 
@@ -250,6 +266,8 @@ def _rescue_short_cues(
                 left, right = cues[left_idx], cues[left_idx + 1]
                 if len(script.join(_text(left), _text(right))) > rescue_max_chars:
                     continue
+                if not _within_cap(left, right, max_cue_duration):
+                    continue
                 gap = right["start"] - left["end"]
                 if gap > gap_limit + GAP_EPS:
                     continue
@@ -278,6 +296,79 @@ def _rescue_short_cues(
             break
 
     return cues
+
+
+# Pass E's choice of where to cut a long cue. The pause between two timed words dominates
+# (seconds of silence, punctuation spanning it included); a punctuation mark at the cut is
+# worth this much pause on top, and every 0.1 of the cue's length off-centre costs a tenth of
+# BALANCE_WEIGHT seconds -- enough to pick the middlemost of several equal pauses, not to beat
+# a real one.
+PUNCTUATION_BONUS = 0.25
+BALANCE_WEIGHT = 0.5
+
+
+def _best_cut(seg: SingleAlignedSegment, punctuation: PunctuationConfig,
+              min_piece: float) -> Optional[InternalGap]:
+    """Where to cut *seg*: between two consecutive timed content words (CJK: characters),
+    leaving at least ``min_piece`` seconds each side. None if nowhere qualifies."""
+    split = set(punctuation.split_chars)
+    words = seg.get("words") or []
+    content = [
+        (i, w) for i, w in enumerate(words)
+        if w.get("start") is not None and w.get("end") is not None
+        and str(w.get("word", "")).strip() and str(w.get("word", "")).strip() not in split
+    ]
+    start, end = float(seg["start"]), float(seg["end"])
+    duration = end - start
+    best, best_score = None, None
+    for (i, a), (j, b) in zip(content, content[1:]):
+        head, tail = float(a["end"]) - start, end - float(b["start"])
+        if head < min_piece or tail < min_piece:
+            continue
+        pause = max(0.0, float(b["start"]) - float(a["end"]))
+        marked = any(str(w.get("word", "")).strip()[-1:] in split for w in words[i:j])
+        centre = (float(a["end"]) + float(b["start"])) / 2
+        off_centre = abs(centre - (start + end) / 2) / duration
+        score = pause + (PUNCTUATION_BONUS if marked else 0.0) - BALANCE_WEIGHT * off_centre
+        if best_score is None or score > best_score:
+            best_score = score
+            best = InternalGap(i, j, round(pause, 3), round(float(a["end"]), 3),
+                               str(a.get("word", "")), str(b.get("word", "")))
+    return best
+
+
+def _split_long_cues(
+    segments: Sequence[SingleAlignedSegment],
+    max_cue_duration: float,
+    punctuation: PunctuationConfig,
+) -> List[SingleAlignedSegment]:
+    """Pass E: cut every cue longer than ``max_cue_duration`` until its pieces fit.
+
+    Each cut leaves at least a quarter of the cap (a second, at 4 s) on either side, so a cue
+    is never shaved into a fragment for pass D to stretch. A cue with nowhere to cut -- no
+    word timings, or no boundary far enough from both ends -- is left as it is. The cut
+    itself is ``align_checks._split_one``'s, so text, words and characters stay in step.
+    """
+    min_piece = max_cue_duration / 4
+    out: List[SingleAlignedSegment] = []
+    pending = list(segments)[::-1]
+    cuts = 0
+    while pending:
+        seg = pending.pop()
+        if _duration(seg) <= max_cue_duration + GAP_EPS:
+            out.append(seg)
+            continue
+        cut = _best_cut(seg, punctuation, min_piece)
+        pieces = _split_one(seg, [cut], kind="split_long") if cut is not None else None
+        if not pieces:
+            out.append(seg)
+            continue
+        cuts += 1
+        pending.extend(reversed(pieces))
+    if cuts:
+        logger.info("Split %d cue(s) longer than %.1fs at their longest internal pause",
+                    cuts, max_cue_duration)
+    return out
 
 
 def _apply_duration_floor(
@@ -319,8 +410,9 @@ def assemble_cues(
     is_noise: Optional[Callable[[str], bool]] = None,
     merge: bool = True,
     script: ScriptConfig = DEFAULT_SCRIPT,
+    max_cue_duration: float = 0.0,
 ) -> List[SingleAlignedSegment]:
-    """Turn aligned subsegments into displayable cues (passes A-D; see module docstring).
+    """Turn aligned subsegments into displayable cues (passes A-E; see module docstring).
 
     ``punctuation``, ``segmentation`` and ``script`` come from the ASR model's profile,
     resolved for the language. ``script`` decides how two cues' text is joined (nothing for
@@ -332,8 +424,12 @@ def assemble_cues(
 
     ``min_cue_duration=0`` reduces this to pass A alone.
 
+    ``max_cue_duration`` caps how long a cue may run (0, the default here, means no cap): the
+    joining passes respect it, and pass E cuts whatever alignment produced longer.
+
     ``merge=False`` turns off the two passes that *join* cues (A and B's rescue sibling C),
-    leaving only the noise drop and the duration floor. Use it when the incoming cue
+    leaving only the noise drop and the duration floor (pass E is off too: it cuts cues the
+    same over-splitting made). Use it when the incoming cue
     boundaries are authoritative rather than an artifact of over-splitting -- under
     --realign the boundaries come from the source transcript's own line breaks, so there is
     nothing to glue back together, and a merge pass would instead destroy them. Note that
@@ -366,7 +462,7 @@ def assemble_cues(
     if merge:
         cues = _adjacency_merge(
             segments, punctuation, align_merge_distance, align_padding, max_chars,
-            leading_markers, min_cue_duration, vetoes, script,
+            leading_markers, min_cue_duration, vetoes, script, max_cue_duration,
         )
     else:
         cues = [dict(seg) for seg in segments]
@@ -377,8 +473,11 @@ def assemble_cues(
         if merge:
             cues = _rescue_short_cues(
                 cues, punctuation, segmentation, min_cue_duration, merge_gap, rescue_max_chars,
-                vetoes, script,
+                vetoes, script, max_cue_duration,
             )
+    if merge and max_cue_duration > 0:
+        cues = _split_long_cues(cues, max_cue_duration, punctuation)
+    if min_cue_duration > 0:
         cues = _apply_duration_floor(cues, min_cue_duration, align_padding)
 
     vetoes.report()

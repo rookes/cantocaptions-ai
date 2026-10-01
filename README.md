@@ -148,6 +148,8 @@ By default, the model used is [alvanlii's wav2vec2-BERT model for Cantonese](htt
 After alignment, subtitles are split and re-merged to maintain output standards. Line segmentation can be manipulated with:
 
 * `min_cue_duration` — the shortest subtitle allowed before it is merged into a neighbour
+* `max_cue_duration` (default: 4) — the longest a subtitle may run: neighbours are not merged past it, and a
+  longer cue (usually a clause the ASR never punctuated) is cut at its longest internal pause. `0` turns it off
 * `max_line_width` / `max_line_count` (default: 18 / 2) — control forced line breaks and how text is wrapped
 
 More extensive text processing, such as OpenCC simplified -> traditional options and regex substitutions, are configurable via .toml
