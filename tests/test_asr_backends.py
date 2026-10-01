@@ -292,3 +292,31 @@ def test_asr_context_is_refused_for_a_backend_without_it(tmp_path, model):
                          model_cache_only=True)
     with pytest.raises(ConfigError, match="asr_context is not supported"):
         validate_config(cfg)
+
+
+def test_ctc_pauses_cut_only_inside_long_internal_silences():
+    from cantocaptions_ai.pipeline._asr_ctc import _split_at_pauses
+
+    _, a, b = 0, 5, 6
+    path = [_, _, _, a, _, _, b, _, _, _, _, a, _, _, _]
+    # Leading/trailing silence is never a cut; the 2-frame gap is too short; the 4-frame one cuts.
+    assert _split_at_pauses(path, {0}, 3) == [path[:9], path[9:]]
+    assert _split_at_pauses(path, {0}, 5) == [path]
+
+
+def test_ctc_writes_pauses_as_the_languages_mergeable_mark(tmp_path):
+    from transformers import AutoProcessor
+
+    from cantocaptions_ai.pipeline._asr_ctc import CtcAsr
+    from cantocaptions_ai.text_profiles import LATIN_PUNCTUATION, SPACED_SCRIPT
+
+    processor = AutoProcessor.from_pretrained(_tiny_ctc_checkpoint(tmp_path))
+    a, b, c, bar = (_CTC_VOCAB.index(t) for t in ("a", "b", "c", "|"))
+    path = [a, b, bar, c] + [0] * 10 + [b, a]   # "ab c", a 0.4 s pause at 25 fps, "ba"
+
+    cjk = CtcAsr(None, processor, device="cpu", vram_checks=False)
+    assert cjk._decode(path, frame_rate=25.0) == "ab c，ba"
+    latin = CtcAsr(None, processor, device="cpu", vram_checks=False,
+                   punctuation=LATIN_PUNCTUATION, script=SPACED_SCRIPT)
+    assert latin._decode(path, frame_rate=25.0) == "ab c, ba"
+    assert latin._decode(path, frame_rate=100.0) == "ab cba"   # a 0.1 s gap: no cut
