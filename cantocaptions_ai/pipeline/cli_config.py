@@ -33,7 +33,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from cantocaptions_ai.pipeline.config import PipelineConfig
+from cantocaptions_ai.pipeline.config import CONFIG_SECTIONS, PipelineConfig
 from cantocaptions_ai.utils.output import str2bool
 
 CONFIG_DIR_NAME = "config"
@@ -145,8 +145,12 @@ def resolve_cfg_path(
 
 
 def load_cfg_file(path: Path, parser: argparse.ArgumentParser) -> Dict[str, Any]:
-    """Read the [pipeline] section, coercing each value via the matching
-    argparse action's type=/choices=.
+    """Read the file's settings, coercing each value via the matching argparse action's
+    type=/choices=.
+
+    Settings may sit in one flat ``[pipeline]`` block, in per-section blocks (``[vad]``,
+    ``[alignment]``, ... -- see config.CONFIG_SECTIONS), or both. A setting in a section
+    block must belong to that section, and none may be given twice.
 
     Fails fast (via parser.error) on a missing section, unknown key, or a
     value that fails type=/choices= validation -- mirroring
@@ -157,14 +161,31 @@ def load_cfg_file(path: Path, parser: argparse.ArgumentParser) -> Dict[str, Any]
     cp = configparser.ConfigParser(inline_comment_prefixes=("#",))
     if not cp.read(path, encoding="utf-8"):
         parser.error(f"could not read config file: {path}")
-    if not cp.has_section(_SECTION):
-        parser.error(f"{path}: missing required [{_SECTION}] section")
+    unknown_sections = [s for s in cp.sections() if s != _SECTION and s not in CONFIG_SECTIONS]
+    if unknown_sections:
+        parser.error(
+            f"{path}: unknown section(s) {', '.join(f'[{s}]' for s in unknown_sections)} "
+            f"(use [{_SECTION}] or one of: {', '.join(CONFIG_SECTIONS)})"
+        )
+    if not cp.sections():
+        parser.error(f"{path}: no settings: expected a [{_SECTION}] block or section blocks")
 
     dest_to_action = {
         a.dest: a for a in parser._actions if a.dest in _PIPELINE_FIELD_NAMES
     }
     resolved: Dict[str, Any] = {}
-    for key, raw in cp[_SECTION].items():
+    entries = [
+        (section, key, raw)
+        for section in cp.sections()
+        for key, raw in cp.items(section, raw=True)
+    ]
+    for section, key, raw in entries:
+        if key in _PIPELINE_FIELD_NAMES and section != _SECTION:
+            home = PipelineConfig.section_of(key)
+            if home != section:
+                parser.error(f"{path}: '{key}' belongs in [{home}], not [{section}]")
+        if key in resolved:
+            parser.error(f"{path}: '{key}' is set more than once")
         if key in REMOVED_KEYS:
             warnings.warn(
                 f"{path}: '{key}' has been removed and is ignored (it never had any "
@@ -253,3 +274,40 @@ class ConfigAwareHelpFormatter(argparse.HelpFormatter):
         if action.dest in self._defaults and "(default:" not in help_str:
             help_str = f"{help_str} (default: {self._defaults[action.dest]})"
         return help_str
+
+
+def describe_config(parser: Optional[argparse.ArgumentParser] = None) -> list:
+    """Every setting, by section, as plain data: what a settings UI needs to draw a form.
+
+    Each section is ``{"name", "title", "settings": [...]}`` in ``--help`` order, and each
+    setting ``{"name", "flag", "default", "type", "choices", "help"}``. Help text and
+    choices come from the CLI's own flags, so this cannot drift from ``--help``.
+    """
+    import typing
+
+    from cantocaptions_ai.pipeline.config import SECTION_TITLES
+
+    if parser is None:
+        from cantocaptions_ai.__main__ import build_parser
+        parser = build_parser()
+    actions = {a.dest: a for a in parser._actions if a.dest in _PIPELINE_FIELD_NAMES}
+    types = {
+        name: hint.__name__ if isinstance(hint, type) else str(hint).replace("typing.", "")
+        for name, hint in typing.get_type_hints(PipelineConfig).items()
+    }
+    defaults = PipelineConfig.defaults()
+    out = []
+    for section, keys in CONFIG_SECTIONS.items():
+        settings = []
+        for key in keys:
+            action = actions[key]
+            settings.append({
+                "name": key,
+                "flag": max(action.option_strings, key=len),
+                "default": defaults[key],
+                "type": types[key],
+                "choices": list(action.choices) if action.choices is not None else None,
+                "help": action.help,
+            })
+        out.append({"name": section, "title": SECTION_TITLES[section], "settings": settings})
+    return out

@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field, fields, MISSING
-from typing import Any, Dict, Optional
+from types import MappingProxyType
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 def _detect_default_device() -> str:
@@ -283,3 +284,127 @@ class PipelineConfig:
             else:
                 raise TypeError(f"PipelineConfig.{f.name} has no default")
         return out
+
+    @staticmethod
+    def section_of(name: str) -> str:
+        """The section (a ``CONFIG_SECTIONS`` key) that setting *name* belongs to."""
+        try:
+            return _SECTION_OF[name]
+        except KeyError:
+            raise KeyError(f"no pipeline setting named {name!r}") from None
+
+    def section(self, name: str) -> Mapping[str, Any]:
+        """A read-only view of one section's settings, by their flat names."""
+        return MappingProxyType({key: getattr(self, key) for key in CONFIG_SECTIONS[name]})
+
+    @staticmethod
+    def flatten(nested: Mapping[str, Any]) -> Dict[str, Any]:
+        """Flat settings from a mapping that may group them by section.
+
+        ``{"vad": {"vad_onset": 0.15}, "language": "yue"}`` gives
+        ``{"vad_onset": 0.15, "language": "yue"}``: a section's table holds that section's
+        settings under their usual flat names, and flat keys may sit beside the tables. A key
+        in the wrong section, one given twice, or one that is no setting at all raises
+        ValueError -- the same rules as a sectioned .cfg file.
+        """
+        out: Dict[str, Any] = {}
+
+        def put(key: str, value: Any, where: str) -> None:
+            if key not in _SECTION_OF:
+                raise ValueError(f"{where}: unknown pipeline setting {key!r}")
+            if key in out:
+                raise ValueError(f"{where}: {key!r} is set twice")
+            out[key] = value
+
+        for key, value in nested.items():
+            if key in CONFIG_SECTIONS and isinstance(value, Mapping):
+                for inner, inner_value in value.items():
+                    home = _SECTION_OF.get(inner)
+                    if home is not None and home != key:
+                        raise ValueError(
+                            f"[{key}]: {inner!r} belongs in [{home}], not [{key}]")
+                    put(inner, inner_value, f"[{key}]")
+            else:
+                put(key, value, "top level")
+        return out
+
+
+# --- Sections --------------------------------------------------------------------------
+#
+# Every setting belongs to exactly one section: the stage or concern it configures. The flat
+# field names above stay the only names a setting has -- in flags, .cfg keys, the worker's
+# TOML, checkpoint fingerprints -- and a section only groups them: in --help (each section
+# is one argument group, titled as below), in .cfg files (a [vad] block may hold the VAD
+# settings), and for callers that want one stage's settings (PipelineConfig.section).
+# tests/test_cli_config.py pins this table to the fields and to the CLI's argument groups.
+
+SECTION_TITLES: Mapping[str, str] = MappingProxyType({
+    "model": "model",
+    "inference": "inference",
+    "output": "output",
+    "audio": "audio",
+    "vad": "vad",
+    "vocal_isolation": "vocal isolation",
+    "ensemble": "ensemble & LLM correction",
+    "asr_context": "asr context (experimental)",
+    "alignment": "alignment",
+    "cues": "cue timing",
+    "subtitles": "subtitle formatting",
+    "cleaning": "text cleaning",
+    "diarization": "diarization",
+    "realign": "existing transcript",
+})
+
+CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
+    "model": ("language", "model", "model_dir", "model_cache_only"),
+    "inference": (
+        "device", "device_index", "batch_size", "asr_compute_type", "attn_implementation",
+        "threads", "hf_token", "compile",
+    ),
+    "output": (
+        "output_dir", "output_format", "verbose", "print_progress", "vram_checks",
+        "vram_headroom_mb", "debug_dir", "load_debug_dir",
+    ),
+    "audio": ("audio_start", "audio_end", "audio_downmix", "audio_track", "audio_normalize"),
+    "vad": (
+        "vad_method", "vad_onset", "vad_offset", "vad_pad_onset", "vad_pad_offset",
+        "vad_min_duration_off", "chunk_size",
+    ),
+    "vocal_isolation": (
+        "vocal_isolation_method", "vocal_isolation_batch_size", "vocal_isolation_compute_type",
+        "vocal_isolation_segment_mode",
+    ),
+    "ensemble": (
+        "ensemble_model", "llm_correction", "llm_model", "llm_model_dir", "reference_subtitle",
+        "reference_correction_semantic", "reference_offset",
+    ),
+    "asr_context": (
+        "asr_context", "asr_context_template", "asr_context_scope", "asr_context_neighbours",
+        "asr_context_max_chars", "asr_context_vad_expand", "asr_context_padding",
+    ),
+    "alignment": (
+        "align_model", "interpolate_method", "no_align", "return_char_alignments",
+        "align_batch_size", "align_compute_type", "align_char_substitution",
+        "align_substitutions", "align_split_gap",
+    ),
+    "cues": (
+        "align_padding", "align_release", "align_merge_distance", "min_cue_duration",
+        "max_cue_duration", "merge_gap",
+    ),
+    "subtitles": ("max_line_width", "max_line_count"),
+    "cleaning": ("no_clean_text", "clean_rules_dir"),
+    "diarization": (
+        "diarize", "min_speakers", "max_speakers", "diarize_model", "diarize_scope",
+        "diarize_batch_size", "speaker_embeddings", "speaker_confidence",
+        "speaker_conflict_share", "flag_speaker_conflicts", "speaker_labels",
+    ),
+    "realign": (
+        "realign", "realign_mode", "realign_max_scale", "realign_cut_policy",
+        "realign_adjust_tolerance", "realign_normalize", "realign_sync_anchor_density",
+        "realign_anchor", "realign_window", "realign_commit_margin", "realign_min_score",
+    ),
+})
+
+_SECTION_OF: Dict[str, str] = {
+    key: section for section, keys in CONFIG_SECTIONS.items() for key in keys
+}
