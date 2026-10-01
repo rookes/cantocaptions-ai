@@ -113,3 +113,68 @@ def test_the_language_packs_normalization_is_applied():
     result = stage.process(_segments(10))
     assert result["segments"][0]["text"] == "en:10"  # nothing HK-specific to rewrite here
     assert stage.normalization.chars_hk
+
+
+# --- whisper -------------------------------------------------------------------------
+
+def test_whisper_models_are_registered_and_detected(tmp_path):
+    from transformers import WhisperConfig
+
+    assert backend_for("whisper-large-v3").name == "whisper"
+    assert backend_for(_save_config(tmp_path, WhisperConfig())).name == "whisper"
+    assert not backend_for("whisper-large-v3-turbo").supports_context
+
+
+def test_whisper_takes_qwens_cantonese_conventions():
+    from cantocaptions_ai.languages.yue import YUE
+
+    assert YUE.conventions["whisper-large-v3"] is YUE.conventions["Qwen3-ASR"]
+    assert YUE.resolve("whisper-large-v3").cleaning.manifest == "pipeline_qwen.toml"
+
+
+class _FakeWhisperProcessor:
+    def __call__(self, wavs, sampling_rate, return_tensors, return_attention_mask):
+        import torch
+
+        assert sampling_rate == 16000 and return_tensors == "pt"
+        return {"input_features": torch.zeros(len(wavs), 4, 6),
+                "attention_mask": torch.ones(len(wavs), 6, dtype=torch.long)}
+
+    def batch_decode(self, ids, skip_special_tokens):
+        assert skip_special_tokens
+        return [f" text {int(row[0])} " for row in ids]
+
+
+class _FakeWhisperModel:
+    def __init__(self):
+        import torch
+
+        self.device, self.dtype, self.calls = torch.device("cpu"), torch.float32, []
+
+    def generate(self, input_features, attention_mask, language, task):
+        import torch
+
+        self.calls.append((language, task, tuple(input_features.shape)))
+        return torch.arange(input_features.shape[0]).unsqueeze(1)
+
+
+def test_whisper_forces_the_language_and_strips_the_decode():
+    from cantocaptions_ai.pipeline._asr_whisper import WhisperAsr
+
+    model = _FakeWhisperModel()
+    stage = WhisperAsr(model, _FakeWhisperProcessor(), device="cpu", language="yue", batch_size=2)
+    result = stage.process(_segments(100, 200, 300))
+    assert [s["text"] for s in result["segments"]] == ["text 0", "text 1", "text 0"]
+    assert result["language"] == "yue"
+    assert [c[:2] for c in model.calls] == [("yue", "transcribe")] * 2
+    assert [c[2][0] for c in model.calls] == [2, 1]
+
+
+def test_whisper_loader_takes_the_common_load_arguments():
+    from cantocaptions_ai.pipeline._asr_whisper import load_model_whisper
+
+    params = inspect.signature(load_model_whisper).parameters
+    for name in ("model_name", "device", "device_index", "compute_type", "language",
+                 "download_root", "local_files_only", "batch_size", "vram_checks",
+                 "vram_headroom_mb", "normalization"):
+        assert name in params, name

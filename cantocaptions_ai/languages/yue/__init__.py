@@ -89,6 +89,9 @@ YUE = LanguagePack(
     conventions={
         "Qwen3-ASR": _QWEN,
         "Qwen3-ASR-0.6B": _QWEN,
+        # Whisper's Cantonese is generic written Chinese too, so it takes Qwen's chain.
+        "whisper-large-v3": _QWEN,
+        "whisper-large-v3-turbo": _QWEN,
         "cantocaptions-cantonese-ASR": _FINETUNED,
         "Qwen3-ASR-lora": _FINETUNED,
     },

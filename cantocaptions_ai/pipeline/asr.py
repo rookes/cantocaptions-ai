@@ -270,12 +270,14 @@ ASR_BACKENDS: Dict[str, AsrBackend] = {
     backend.name: backend for backend in (
         AsrBackend("qwen3-asr", "cantocaptions_ai.pipeline._asr_native:load_model_native",
                    supports_context=True),
+        AsrBackend("whisper", "cantocaptions_ai.pipeline._asr_whisper:load_model_whisper"),
     )
 }
 
 # A checkpoint's config.json model_type -> backend, for models with no registered profile.
 _MODEL_TYPE_BACKENDS = {
     "qwen3_asr": "qwen3-asr",
+    "whisper": "whisper",
 }
 
 

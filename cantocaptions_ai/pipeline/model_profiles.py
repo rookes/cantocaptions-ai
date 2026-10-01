@@ -42,6 +42,7 @@ _CANTOCAPTIONS_HF_ID = "rookes/cantocaptions-cantonese-asr"
 
 _CANTONESE_ONLY = frozenset({"yue"})
 _QWEN = "qwen3-asr"
+_WHISPER = "whisper"
 
 
 def _build_profiles() -> Dict[str, ModelProfile]:
@@ -49,6 +50,8 @@ def _build_profiles() -> Dict[str, ModelProfile]:
         "Qwen3-ASR": ModelProfile("Qwen/Qwen3-ASR-1.7B-hf", backend=_QWEN),
         "Qwen3-ASR-0.6B": ModelProfile("Qwen/Qwen3-ASR-0.6B-hf", backend=_QWEN),
         "cantocaptions-cantonese-ASR": ModelProfile(_CANTOCAPTIONS_HF_ID, _CANTONESE_ONLY, _QWEN),
+        "whisper-large-v3": ModelProfile("openai/whisper-large-v3", backend=_WHISPER),
+        "whisper-large-v3-turbo": ModelProfile("openai/whisper-large-v3-turbo", backend=_WHISPER),
     }
     # The same fine-tune, pointed at a local directory instead. Registered only when the
     # env var is set; otherwise --model Qwen3-ASR-lora is simply not a valid choice (clean

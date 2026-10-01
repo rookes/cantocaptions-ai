@@ -1,0 +1,143 @@
+"""Whisper ASR backend: encoder-decoder transcription through transformers.
+
+Each VAD segment (at most ``chunk_size``, 28 s by default) fits Whisper's 30 s window as
+it is, so a segment is one forward pass with no long-form chunking. Timestamps are not
+requested -- forced alignment times the text afterwards, as for every backend. Batching,
+OOM handling, checkpointing and the language pack's normalization are BatchedAsrStage's.
+
+Whisper writes many languages in a generic standard form (Cantonese comes out much like
+stock Qwen3-ASR's, Mandarin-flavoured), so its conventions per language live in the
+language pack like any other model's.
+"""
+from typing import List, Optional, Union
+
+import torch
+
+from cantocaptions_ai.pipeline.asr import BatchedAsrStage
+from cantocaptions_ai.pipeline.model_profiles import get_model_profile
+from cantocaptions_ai.text_profiles import DEFAULT_NORMALIZATION, TextNormalization
+from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
+from cantocaptions_ai.utils.log_utils import get_logger
+from cantocaptions_ai.utils.model_utils import (
+    MemoryPolicy,
+    ensure_hf_model_downloaded,
+    guard_model_load,
+    resolve_torch_compute_dtype,
+)
+
+logger = get_logger(__name__)
+
+
+class WhisperAsr(BatchedAsrStage):
+    """Whisper (``WhisperForConditionalGeneration``), forced to transcribe in one language."""
+
+    backend_label = "whisper"
+
+    def __init__(
+        self,
+        model,
+        processor,
+        device: Union[int, str, "torch.device"],
+        language: Optional[str] = None,
+        batch_size: Optional[int] = None,
+        print_progress: bool = False,
+        verbose: bool = False,
+        vram_checks: bool = True,
+        normalization: TextNormalization = DEFAULT_NORMALIZATION,
+    ):
+        super().__init__(
+            device=device, language=language, batch_size=batch_size,
+            print_progress=print_progress, verbose=verbose, vram_checks=vram_checks,
+            normalization=normalization,
+        )
+        self.model = model
+        self.processor = processor
+
+    def _infer_batch(self, wavs: List, language: str, contexts=None) -> List[str]:
+        """One batch of segments -> one text each, decoded without special tokens.
+
+        ``language`` is the ISO code Whisper's tokenizer takes (``yue``, ``en``, ...); forcing
+        it, rather than letting Whisper detect per segment, keeps a short or noisy segment
+        from coming back in another language.
+        """
+        features = self.processor(
+            wavs, sampling_rate=SAMPLE_RATE, return_tensors="pt", return_attention_mask=True,
+        )
+        input_features = features["input_features"].to(self.model.device, self.model.dtype)
+        attention_mask = features.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.model.device)
+        with torch.inference_mode():
+            ids = self.model.generate(
+                input_features, attention_mask=attention_mask,
+                language=language, task="transcribe",
+            )
+        texts = self.processor.batch_decode(ids, skip_special_tokens=True)
+        return [t.strip() for t in texts]
+
+
+def _whisper_dtype(compute_type: str, device: str) -> torch.dtype:
+    if compute_type == "default":
+        compute_type = "float16" if device == "cuda" else "float32"
+    if compute_type == "int8":
+        logger.warning("Whisper does not run at int8 here; using float16 (float32 off CUDA).")
+        compute_type = "float16"
+    return resolve_torch_compute_dtype(compute_type, device, "ASR")
+
+
+def load_model_whisper(
+    model_name: Optional[str],
+    device: str,
+    device_index: int = 0,
+    compute_type: str = "default",
+    attn_implementation: str = "sdpa",
+    language: Optional[str] = "yue",
+    model=None,
+    download_root: Optional[str] = None,
+    local_files_only: bool = False,
+    batch_size: Optional[int] = None,
+    print_progress: bool = False,
+    verbose: bool = False,
+    vram_checks: bool = True,
+    vram_headroom_mb: int = 512,
+    processor=None,
+    normalization=None,
+) -> WhisperAsr:
+    """Load a Whisper checkpoint (hub id or path, via the model registry) as an ASR stage."""
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+    from cantocaptions_ai.pipeline.asr import _resolve_normalization
+
+    model_id = get_model_profile(model_name, language).hf_id
+    normalization = _resolve_normalization(model_name, language, normalization)
+
+    if model is None or processor is None:
+        try:
+            ensure_hf_model_downloaded(model_id, cache_dir=download_root, local_files_only=local_files_only)
+        except Exception as e:
+            logger.warning("Could not download %r: %s — using cached version if available.", model_id, e)
+
+    dtype = _whisper_dtype(compute_type, device)
+    logger.info("Loading ASR model %r (whisper backend, %s)", model_id, dtype)
+    if model is None:
+        model = guard_model_load(
+            "ASR",
+            "consider a lower --batch_size",
+            lambda: AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_id, dtype=dtype, attn_implementation=attn_implementation,
+                local_files_only=local_files_only, cache_dir=download_root,
+            ).to(resolve_device(device, device_index)).eval(),
+        )
+    if processor is None:
+        processor = AutoProcessor.from_pretrained(
+            model_id, local_files_only=local_files_only, cache_dir=download_root,
+        )
+    if device == "cuda":
+        MemoryPolicy(vram_checks, vram_headroom_mb).cap_after_load(device_index)
+
+    return WhisperAsr(
+        model=model, processor=processor,
+        device=device_index if device == "cuda" else device,
+        language=language, batch_size=batch_size, print_progress=print_progress,
+        verbose=verbose, vram_checks=vram_checks, normalization=normalization,
+    )
