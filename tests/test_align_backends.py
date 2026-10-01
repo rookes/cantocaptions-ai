@@ -217,3 +217,23 @@ def test_hf_metadata_keeps_the_keys_callers_read(tmp_path):
             "profile"} <= set(metadata)
     assert metadata["type"] == "huggingface"
     assert align_backends.get_align_backend(metadata["type"]) is ALIGN_BACKENDS["huggingface"]
+
+
+# --- the default model comes from the language pack -----------------------------------
+
+def test_a_registered_packs_default_align_model_reaches_library_callers(fake_bundle, monkeypatch):
+    from cantocaptions_ai import languages
+    from cantocaptions_ai.languages import LanguagePack
+    from cantocaptions_ai.text_profiles import LATIN_PUNCTUATION, SPACED_SCRIPT
+
+    pack = LanguagePack("xx", SPACED_SCRIPT, LATIN_PUNCTUATION, default_align_model=fake_bundle)
+    monkeypatch.setitem(languages._PACKS, "xx", pack)
+    _, metadata = alignment.load_align_model("xx", "cpu", vram_checks=False,
+                                             char_substitution="off")
+    assert metadata["type"] == "torchaudio"
+    assert metadata["language"] == "xx"
+
+
+def test_a_language_with_no_default_align_model_still_says_so():
+    with pytest.raises(ValueError, match="No default align-model for language: sw"):
+        alignment.load_align_model("sw", "cpu", vram_checks=False)

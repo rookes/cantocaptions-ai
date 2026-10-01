@@ -1026,11 +1026,11 @@ def load_align_model(
     accuracy.
     """
     if model_name is None:
-        if language_code in DEFAULT_ALIGN_MODELS_TORCH:
-            model_name = DEFAULT_ALIGN_MODELS_TORCH[language_code]
-        elif language_code in DEFAULT_ALIGN_MODELS_HF:
-            model_name = DEFAULT_ALIGN_MODELS_HF[language_code]
-        else:
+        # The language pack's choice; an unregistered language's generic pack takes the
+        # built-in tables (languages/align_defaults.py).
+        from cantocaptions_ai.languages import get_language_pack
+        model_name = get_language_pack(language_code).default_align_model
+        if model_name is None:
             logger.error(
                 f"No default alignment model for language: {language_code}. "
                 f"Please find a wav2vec2.0 model finetuned on this language at https://huggingface.co/models, "
