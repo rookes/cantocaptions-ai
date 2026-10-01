@@ -482,6 +482,7 @@ def _compute_vad_emissions_sequential(
     model_type: str,
     processor,
     device: str,
+    dtype: Optional[torch.dtype] = None,
 ) -> List[Tuple[torch.Tensor, float]]:
     """Run inference on each VAD segment one at a time.
 
@@ -497,7 +498,7 @@ def _compute_vad_emissions_sequential(
             seg_audio = seg_audio.unsqueeze(0)
 
         emissions = _run_model_inference(model, model_type, seg_audio, processor, device)
-        emission = emissions[0].cpu().detach()
+        emission = emissions[0].detach().to("cpu", dtype=dtype)
         vad_duration = vad_seg["end"] - vad_seg["start"]
         frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
         results.append((emission, frame_rate))
@@ -544,6 +545,7 @@ def _compute_vad_emissions_batched(
     batch_size: int,
     vram_checks: bool = True,
     primer: Optional["AudioPrimer"] = None,
+    dtype: Optional[torch.dtype] = None,
 ) -> List[Tuple[torch.Tensor, float]]:
     """Batch VAD segments through a Hugging Face CTC align model via BatchExecutor.
 
@@ -647,7 +649,7 @@ def _compute_vad_emissions_batched(
                     f"contains ({real_len} < {keep} frames). The primer must return its "
                     f"prefix followed by the original audio unchanged."
                 )
-            emission = emissions[row, real_len - keep:real_len, :].cpu().detach()
+            emission = emissions[row, real_len - keep:real_len, :].detach().to("cpu", dtype=dtype)
             vad_duration = vad_segments[i]["end"] - vad_segments[i]["start"]
             frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
             results[i] = (emission, frame_rate)
@@ -683,6 +685,7 @@ def _compute_vad_emissions(
     vram_checks: bool = True,
     primer: Optional["AudioPrimer"] = None,
     min_samples: int = MIN_ALIGN_SAMPLES,
+    dtype: Optional[torch.dtype] = None,
 ) -> List[Tuple[torch.Tensor, float]]:
     """Run inference on each full VAD segment. Returns (log_softmax_emission, frame_rate) per segment.
 
@@ -693,6 +696,12 @@ def _compute_vad_emissions(
     ``primer`` reaches only the batched path. The sequential fallback exists for torchaudio
     bundles, none of which carry a profile primer today; priming there would need the same
     exact frame-length bookkeeping for no current caller, so it warns instead of half-doing it.
+
+    ``dtype`` casts each segment's emission as it leaves the device; ``None`` keeps the
+    model's own. ``EmissionTimeline`` passes its storage dtype, because the conversion has to
+    happen per batch: casting after this returns means the whole file sits here at float32
+    first -- about 1 GB an hour of audio for the 2.7k-token Cantonese vocabulary, three times
+    what the timeline itself keeps.
     """
     if not vad_segments:
         return []
@@ -723,7 +732,7 @@ def _compute_vad_emissions(
             )
         computed = _compute_vad_emissions_batched(
             segments, model, processor, device, batch_size,
-            vram_checks=vram_checks, primer=primer,
+            vram_checks=vram_checks, primer=primer, dtype=dtype,
         )
     else:
         if primer is not None:
@@ -732,19 +741,22 @@ def _compute_vad_emissions(
                 "sequential path, which does not apply it. First-character timings may be "
                 "pinned to each segment's start."
             )
-        computed = _compute_vad_emissions_sequential(segments, model, model_type, processor, device)
+        computed = _compute_vad_emissions_sequential(
+            segments, model, model_type, processor, device, dtype=dtype,
+        )
 
     vocab = computed[0][0].shape[-1] if computed else 0
-    results: List[Tuple[torch.Tensor, float]] = [(torch.zeros((0, vocab)), 0.0)] * len(vad_segments)
+    empty = torch.zeros((0, vocab), dtype=dtype or torch.float32)
+    results: List[Tuple[torch.Tensor, float]] = [(empty, 0.0)] * len(vad_segments)
     for i, result in zip(usable, computed):
         results[i] = result
     logger.info("Alignment emissions computed in %.1fs", time.perf_counter() - start)
     return results
 
 
-def compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size: int = 4, vram_checks: bool = True, primer=None, min_samples: int = MIN_ALIGN_SAMPLES):
+def compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size: int = 4, vram_checks: bool = True, primer=None, min_samples: int = MIN_ALIGN_SAMPLES, dtype=None):
     """Public wrapper around _compute_vad_emissions, for callers outside this module."""
-    return _compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size, vram_checks=vram_checks, primer=primer, min_samples=min_samples)
+    return _compute_vad_emissions(vad_segments, model, model_type, processor, device, batch_size, vram_checks=vram_checks, primer=primer, min_samples=min_samples, dtype=dtype)
 
 
 class EmissionTimeline:
@@ -770,8 +782,13 @@ class EmissionTimeline:
 
     Emissions are held as float16 and upcast per slice. Two hours is then about 1 GB against
     the 2 GB float32 copy ``align()`` holds today, and the same copy serves both the placement
-    search and the final alignment -- one encoder pass over the file instead of two.
+    search and the final alignment -- one encoder pass over the file instead of two. That
+    figure holds only if nothing else keeps the float32 emissions alive: a compute_fn should
+    return ``dtype`` already (``compute_vad_emissions(..., dtype=EmissionTimeline.dtype)``),
+    and ``from_computed`` must not hold on to the list it was given.
     """
+
+    dtype = torch.float16
 
     def __init__(
         self,
@@ -824,14 +841,18 @@ class EmissionTimeline:
                    if self._emissions[i] is None]
         if not missing:
             return
-        results = self._compute([self._segments[i] for i in missing])
-        for i, (emission, _rate) in zip(missing, results):
-            arr = emission.detach().cpu().numpy().astype(np.float16, copy=False)
+        self._store(missing, self._compute([self._segments[i] for i in missing]))
+
+    def _store(self, indices: Sequence[int], results) -> None:
+        for i, (emission, _rate) in zip(indices, results):
+            # A no-copy view when the emission is already self.dtype on the CPU, so the
+            # caller dropping its tensor leaves exactly one copy behind.
+            arr = emission.detach().to("cpu", dtype=self.dtype).numpy()
             self._emissions[i] = arr
             n = arr.shape[0]
             step = (self._ends[i] - self._starts[i]) / n if n else 0.0
             self._times[i] = self._starts[i] + np.arange(n, dtype=np.float64) * step
-        self.computed += len(missing)
+            self.computed += 1
 
     def slice(self, t0: float, t1: float) -> Tuple[torch.Tensor, np.ndarray]:
         """(emission[frames, vocab] as float32, absolute start time of each frame)."""
@@ -863,11 +884,23 @@ class EmissionTimeline:
 
     @classmethod
     def from_computed(cls, vad_segments, results, frame_rate: Optional[float] = None):
-        """Wrap emissions that have already been computed, so nothing is encoded twice."""
-        by_start = {float(s["start"]): r for s, r in zip(vad_segments, results)}
-        timeline = cls(vad_segments, lambda segs: [by_start[float(s["start"])] for s in segs],
-                       frame_rate=frame_rate)
-        timeline.ensure(0, len(vad_segments))
+        """Wrap emissions that have already been computed, so nothing is encoded twice.
+
+        Nothing here may keep ``results`` alive once it has been stored. This used to serve it
+        through a compute_fn closure, which pinned every float32 emission for the life of the
+        timeline beside the float16 copy and tripled alignment's memory: a user's 5.4k-line
+        file ran Windows out of commit at the very end of the alignment pass.
+        """
+        results = list(results)
+        if len(results) != len(vad_segments):
+            raise ValueError(
+                f"{len(results)} emissions for {len(vad_segments)} VAD segments")
+
+        def _already_computed(segs):
+            raise RuntimeError("EmissionTimeline.from_computed holds every chunk already")
+
+        timeline = cls(vad_segments, _already_computed, frame_rate=frame_rate)
+        timeline._store(range(len(results)), results)
         return timeline
 
 
@@ -1420,6 +1453,7 @@ def align(
             _compute_vad_emissions(
                 vad_segments, model, model_type, processor, device, batch_size,
                 vram_checks=vram_checks, primer=profile.primer, min_samples=profile.min_samples,
+                dtype=EmissionTimeline.dtype,
             ),
             frame_rate=align_model_metadata.get("frame_rate"),
         )

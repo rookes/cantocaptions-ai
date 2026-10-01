@@ -90,6 +90,10 @@ def _run_alignment(
     aligned_items = []
     for item in items:
         result = item['result']
+        # Popped, not read: the file's emissions are ~0.5 GB an hour of audio, and the caller's
+        # list still holds this item, so leaving the timeline on it would keep every file's
+        # alive through the rest of the batch and every later stage.
+        timeline = item.pop('emission_timeline', None)
         if align_model is not None and len(result["segments"]) > 0:
             logger.info("Performing alignment...")
             aligned_result: AlignedTranscriptionResult = align(
@@ -108,7 +112,7 @@ def _run_alignment(
                 vram_checks=vram_checks,
                 spotchecks=spotchecks,
                 punctuation=punctuation,
-                timeline=item.get('emission_timeline'),
+                timeline=timeline,
                 split_gap=split_gap, script=script,
             )
             aligned_result['language'] = result['language']
@@ -336,12 +340,15 @@ def _run_realign(
             return compute_vad_emissions(
                 segments, _model, align_metadata["type"], align_metadata["processor"], device,
                 batch_size, vram_checks=vram_checks, primer=profile.primer,
-                min_samples=profile.min_samples,
+                min_samples=profile.min_samples, dtype=EmissionTimeline.dtype,
             )
 
         # One timeline for the whole file, built here and handed to the alignment stage
         # below: the placements and the final alignment read the same emissions, so the
         # encoder runs once over the file instead of once per pass.
+        # TODO: run realign and alignment per file. Every file's timeline is built here before
+        # any is aligned, so a batch peaks at the sum of them (~0.5 GB an hour of audio each);
+        # _run_alignment frees each one only after the whole batch has been realigned.
         timeline = EmissionTimeline(
             vad_segments, compute, frame_rate=align_metadata.get("frame_rate"))
 
