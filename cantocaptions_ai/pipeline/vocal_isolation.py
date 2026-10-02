@@ -1,5 +1,6 @@
 import importlib.resources
 import time
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -67,6 +68,29 @@ _COMPILE_MIN_CHUNKS = 200
 _COMPILED_SHAPES: set = set()
 # Set when a compile fails, so the process stops trying (e.g. no working Triton).
 _COMPILE_FAILED = False
+
+
+@contextmanager
+def _deterministic():
+    """Deterministic algorithms for the compiled model's calls, and only those.
+
+    Compiled, the model is not reproducible on its own: Inductor picks among reduction
+    kernel configurations by benchmarking them as each process starts, and the choice
+    changes the float rounding, so the same input gave a few different outputs across runs
+    (up to ~4e-4). With deterministic algorithms on, Inductor uses one fixed configuration
+    instead. Together with istft running eagerly (see mbroformer/model.py), output is
+    bit-identical from run to run, at no measurable cost in speed. The setting is
+    process-wide, so it is restored after each call rather than left on for the rest of the
+    pipeline. Compiling happens inside the first call, so the graph is built under the same
+    setting it runs under.
+    """
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
 def _compile_model(model):
@@ -252,7 +276,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                     if progress_callback is not None:
                         progress_callback.advance(1)
                     continue
-                offsets = list(range(0, total_length, step))
+                offsets = self._chunk_offsets(total_length, padded)
                 seg_state[key] = {
                     'mixture': mixture,
                     'total_length': total_length,
@@ -341,13 +365,30 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         sizing (which always uses _prepare_mixture's real, exact total_length).
         """
         approx_len = round(len(seg['audio']) * self.model_sample_rate / SAMPLE_RATE)
-        if approx_len > 2 * self._border and self._border > 0:
+        padded = approx_len > 2 * self._border and self._border > 0
+        if padded:
             approx_len += 2 * self._border
         if approx_len <= 0:
             return 0
         if self._mode == "whole" and approx_len <= self._whole_max:
             return 1
-        return len(range(0, approx_len, self._step))
+        return len(self._chunk_offsets(approx_len, padded))
+
+    def _chunk_offsets(self, total_length: int, padded: bool) -> List[int]:
+        """Where the chunks of a (padded) segment start: every step, skipping any chunk
+        that would hold border padding only.
+
+        The grid always ends with one such chunk. The border is chunk_size - step, so the
+        real audio ends a border before total_length and the last grid point at or past
+        that end sees nothing but reflected padding. That chunk's output lands in the
+        border, which _finalize_segment cuts off: skipping it changes no output sample
+        (the chunk before it already reaches past total_length, so it keeps its own
+        no-fade-out end), and saves one chunk per segment, ~13% of them on the eval
+        episodes.
+        """
+        lo, hi = (self._border, total_length - self._border) if padded else (0, total_length)
+        return [off for off in range(0, total_length, self._step)
+                if off < hi and off + self._C > lo]
 
     def _shape_key(self, batch: int):
         params = getattr(self.model, "parameters", None)
@@ -396,7 +437,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                 batch_t = torch.cat([batch_t, batch_t.new_zeros((target - n, *batch_t.shape[1:]))])
             try:
                 with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
-                    with torch.no_grad():
+                    with torch.no_grad(), _deterministic():
                         out = compiled(batch_t)
             except Exception as e:
                 if "out of memory" in str(e).lower():

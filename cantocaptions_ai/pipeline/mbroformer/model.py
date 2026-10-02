@@ -17,6 +17,18 @@ from einops import rearrange, pack, unpack, reduce, repeat
 from librosa import filters
 
 
+@torch.compiler.disable
+def _istft(stft_repr, **kwargs):
+    """torch.istft, kept out of torch.compile graphs (a no-op when the model runs eagerly).
+
+    Inductor compiles istft's overlap-add to atomic adds, whose order varies from call to
+    call, so a compiled model gave a slightly different output (up to ~4e-4) every time it
+    ran on the same input. Eager istft is deterministic, and costs little next to the
+    transformer around it.
+    """
+    return torch.istft(stft_repr, **kwargs)
+
+
 # helper functions
 
 def exists(val):
@@ -506,8 +518,8 @@ class MelBandRoformer(Module):
 
         stft_repr = rearrange(stft_repr, 'b n (f s) t -> (b n s) f t', s=self.audio_channels)
 
-        recon_audio = torch.istft(stft_repr, **self.stft_kwargs, window=stft_window, return_complex=False,
-                                  length=istft_length)
+        recon_audio = _istft(stft_repr, **self.stft_kwargs, window=stft_window, return_complex=False,
+                             length=istft_length)
 
         recon_audio = rearrange(recon_audio, '(b n s) t -> b n s t', b=batch, s=self.audio_channels, n=num_stems)
 
