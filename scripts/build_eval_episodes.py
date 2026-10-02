@@ -7,7 +7,7 @@ alignment, cue assembly, cleaning -- and a reference SRT whose timings are exact
 construction: every cue sits at its clip's offset plus the cue's own offset inside the clip.
 
 Uses the held-out ``test`` split by default, so a fine-tuned model is not scored on audio it
-trained on.
+trained on, plus a few chosen shows from the other splits (``INCLUDE``), which can be.
 
     uv run python scripts/build_eval_episodes.py --out ../cantocaptions-eval/episodes
     # -> episodes/<show>.wav (16 kHz mono) and episodes/gt/<show>.srt
@@ -41,6 +41,20 @@ def _ts(seconds):
     m, ms = divmod(ms, 60_000)
     s, ms = divmod(ms, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+# Test-split shows whose subtitles are not a transcript of what is said, so a model can't be
+# scored against them. Echoes of the Rainbow's carry English lines with Chinese translations,
+# glosses and pronunciations in brackets, romanised syllables, and spelling the dataset's
+# standardization report rates nonstandard (0.23).
+NOT_VERBATIM = ["echoes-of-the-rainbow-2010"]
+
+# Shows from outside the split that are added to it, for more shows than the test split has.
+# Both have verbatim subtitles (standardization 0.98 and 1.00). They are not held out:
+# ReZero is in dev, used to pick checkpoints, and War of the Genders is in train, so
+# rookes/cantocaptions-cantonese-asr has been fine-tuned on its audio and scores better on
+# it than on unseen speech. Its timing and segmentation scores aren't affected.
+INCLUDE = ["re-zero-starting-life-in-another-world-2016", "war-of-the-genders-2000"]
 
 
 def build_show(data_dir, show, max_seconds, gap):
@@ -80,12 +94,20 @@ def main():
     ap.add_argument("--split", default="test")
     ap.add_argument("--minutes-per-show", type=float, default=10.0, help="0 = every clip")
     ap.add_argument("--gap", type=float, default=1.0, help="seconds of silence between clips")
+    ap.add_argument("--exclude", nargs="*", default=NOT_VERBATIM, metavar="SHOW",
+                    help="shows to leave out (default: those whose subtitles aren't verbatim)")
+    ap.add_argument("--include", nargs="*", default=INCLUDE, metavar="SHOW",
+                    help="shows from other splits to add (default: %(default)s)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     with open(os.path.join(args.dataset, "splits.json"), encoding="utf-8") as f:
         splits = json.load(f)
-    shows = sorted(s for s, v in splits.items() if v["split"] == args.split)
+    unknown = sorted(set(args.include) - set(splits))
+    if unknown:
+        ap.error(f"not in the dataset: {', '.join(unknown)}")
+    shows = sorted(s for s, v in splits.items()
+                   if (v["split"] == args.split or s in args.include) and s not in args.exclude)
     os.makedirs(os.path.join(args.out, "gt"), exist_ok=True)
     manifest = defaultdict(dict)
     for show in shows:

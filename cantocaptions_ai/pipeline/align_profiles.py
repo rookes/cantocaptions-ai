@@ -63,6 +63,12 @@ class TailPrimer:
     before the trellis runs either way, and reversed and forward tails were measured to
     agree on 12 of 14 segments (the two exceptions differing by one frame and by 0.85 s on
     a 3.3 s segment).
+
+    Primed output is for forced alignment only; don't decode text from it. At the real onset
+    the first character is often too weak to win the argmax (log-probability -1 to -3 where
+    it wins at frame 0 unprimed), so a greedy decode drops it, and a one-word segment can
+    decode to nothing. Sharing one primed pass between CTC transcription and alignment was
+    tried and reverted for this reason: it lost 6 of 701 matched cues on the eval episodes.
     """
 
     seconds: float = 1.0
@@ -105,9 +111,20 @@ class AlignProfile:
     # substitution reads Cantonese (Jyutping) pronunciations, so it is only right for a
     # Cantonese model's vocabulary; everything else defaults to no substitution.
     char_substitution: str = "off"
+    # Whether the model's input is normalised to zero mean and unit variance before the
+    # encoder sees it. None leaves the checkpoint's own processor to decide. Set False for
+    # the Hugging Face copies of models torchaudio ships as pipeline bundles: torchaudio
+    # feeds those the raw waveform, as they were trained, while the Hugging Face processor
+    # normalises -- the one difference between the two (same weights, bit-identical
+    # output given the same input).
+    normalize_input: Optional[bool] = None
 
 
 DEFAULT_ALIGN_PROFILE = AlignProfile()
+
+# The Hugging Face releases of the torchaudio bundles that used to be these languages'
+# defaults (languages/align_defaults.py), fed the same raw waveform the bundles were.
+_RAW_INPUT = AlignProfile(normalize_input=False)
 
 ALIGN_PROFILES: Dict[str, AlignProfile] = {
     "alvanlii/wav2vec2-BERT-cantonese": AlignProfile(
@@ -115,6 +132,10 @@ ALIGN_PROFILES: Dict[str, AlignProfile] = {
         substitutions="wav2vec2-bert-cantonese.toml",
         char_substitution="homophone",
     ),
+    "facebook/wav2vec2-base-960h": _RAW_INPUT,
+    "facebook/wav2vec2-base-10k-voxpopuli-ft-fr": _RAW_INPUT,
+    "facebook/wav2vec2-base-10k-voxpopuli-ft-de": _RAW_INPUT,
+    "facebook/wav2vec2-base-10k-voxpopuli-ft-it": _RAW_INPUT,
 }
 
 

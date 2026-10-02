@@ -32,7 +32,7 @@ EN = LanguagePack(
     script=SPACED_SCRIPT,          # words joined with spaces, 42-char lines, word-wrapped
     punctuation=LATIN_PUNCTUATION, # sentence splits at . ? ! ; and a comma lets cues join
     default_model="whisper-large-v3",  # any MODEL_PROFILES key, or a hub id / path
-    default_align_model="WAV2VEC2_ASR_BASE_960H",
+    default_align_model="facebook/wav2vec2-base-960h",
 )
 ```
 

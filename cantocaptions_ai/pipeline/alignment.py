@@ -1050,6 +1050,9 @@ def load_align_model(
     pipeline_type = backend.name
 
     profile = get_align_profile(model_name)
+    if profile.normalize_input is not None and processor is not None:
+        extractor = getattr(processor, "feature_extractor", processor)
+        extractor.do_normalize = profile.normalize_input
     if char_substitution is None:
         char_substitution = profile.char_substitution
     readings = pack.char_readings() if pack.char_readings is not None else None
