@@ -141,6 +141,13 @@ models.
 transcribes the isolated vocals. Improves subtitle quality significantly, but is very slow. Requires
 ~600 MB download on first use. Off by default.
 
+On CUDA the separator is compiled with `torch.compile`, which roughly halves its time once
+compiled. Compiling costs about 12 s per process (about 50 s the first time on a machine), so with
+the default `vocal_isolation_compile = auto` it happens only when there's enough audio to repay
+it (about 13 minutes of speech), or when the process has compiled it already. `on` and `off`
+force it either way. It needs Triton: included on Linux; on Windows install the `compile` extra.
+Without it, isolation runs uncompiled.
+
 ### Alignment
 
 To get an accurate timing for the subtitles, an alignment model is used (`no_align = True` to skip the timing step). 

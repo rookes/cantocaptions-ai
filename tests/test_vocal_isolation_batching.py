@@ -12,11 +12,13 @@ duration instead of being bounded per file/window.
 """
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+from cantocaptions_ai.pipeline import vocal_isolation as vi
 from cantocaptions_ai.pipeline.vocal_isolation import MbRoformerProcessor
 
 
@@ -231,6 +233,117 @@ class TestWholeSegmentMode(unittest.TestCase):
         items = _make_items(n_files=1, segs_per_file=1, audio_len=1600)
         proc.run(items, debug_dir=None, load_debug_dir=None)
         self.assertGreater(model.calls, 1)
+
+
+class _FakeCompiled:
+    """Stands in for torch.compile's output: records the batch sizes it is fed, and can
+    raise once to act out a failed compile or an OOM."""
+
+    def __init__(self, model, fail=None):
+        self.model, self.fail, self.batches = model, fail, []
+
+    def __call__(self, batch_t):
+        self.batches.append(batch_t.shape[0])
+        if self.fail is not None:
+            error, self.fail = self.fail, None
+            raise error
+        return self.model(batch_t)
+
+
+class TestCompiledChunks(unittest.TestCase):
+    """--vocal_isolation_compile: when the chunked path compiles, and that a compiled run
+    sees one batch shape and gives the eager run's output.
+
+    40 chunks per file here: 4 segments of 256 samples, each reflect-padded to 320 and
+    cut at a 32-sample step. At batch_size 3 every file ends on a 1-chunk batch.
+    """
+
+    def setUp(self):
+        vi._COMPILED_SHAPES.clear()
+        vi._COMPILE_FAILED = False
+        self.compiled = []
+
+    tearDown = setUp
+
+    def _compile(self, fail=None):
+        def compile_model(model):
+            self.compiled.append(_FakeCompiled(model, fail))
+            return self.compiled[-1]
+        return mock.patch.object(vi, "_compile_model", side_effect=compile_model)
+
+    @staticmethod
+    def _proc(compile, mode="chunked", batch_size=3):
+        return MbRoformerProcessor(
+            model=_FakeMbModel(), config=_no_resample_config(), device=torch.device("cpu"),
+            batch_size=batch_size, segment_mode=mode, compile=compile,
+        )
+
+    @staticmethod
+    def _noisy_items(n_files):
+        rng = np.random.default_rng(0)
+        items = _make_items(n_files=n_files, segs_per_file=4)
+        for item in items:
+            for seg in item["vad_segments"]:
+                seg["audio"] = rng.standard_normal(256).astype(np.float32)
+        return items
+
+    def test_off_never_compiles(self):
+        with self._compile():
+            self._proc("off").run(_make_items(2, 4), debug_dir=None, load_debug_dir=None)
+        self.assertEqual(self.compiled, [])
+
+    def test_compiled_run_sees_one_batch_size_and_matches_eager(self):
+        eager = self._proc("off").run(self._noisy_items(2), debug_dir=None, load_debug_dir=None)
+        with self._compile():
+            out = self._proc("on").run(self._noisy_items(2), debug_dir=None, load_debug_dir=None)
+        self.assertEqual(set(self.compiled[0].batches), {3})  # each file's last batch padded
+        for a, b in zip(eager, out):
+            for sa, sb in zip(a["vad_segments"], b["vad_segments"]):
+                np.testing.assert_array_equal(sa["audio"], sb["audio"])
+
+    def test_auto_compiles_only_a_run_long_enough_to_repay_it(self):
+        with self._compile(), mock.patch.object(vi, "_can_compile", return_value=True), \
+                mock.patch.object(vi, "_COMPILE_MIN_CHUNKS", 100):
+            self._proc("auto").run(_make_items(2, 4), debug_dir=None, load_debug_dir=None)
+            self.assertEqual(self.compiled, [])  # 80 chunks
+            self._proc("auto").run(_make_items(3, 4), debug_dir=None, load_debug_dir=None)
+            self.assertEqual(len(self.compiled), 1)  # 120 chunks
+            # Compiled already in this process: free, so even a short run uses it.
+            self._proc("auto").run(_make_items(1, 1), debug_dir=None, load_debug_dir=None)
+            self.assertEqual(len(self.compiled), 2)
+
+    def test_auto_does_not_compile_without_cuda_and_triton(self):
+        with self._compile(), mock.patch.object(vi, "_COMPILE_MIN_CHUNKS", 1):
+            self._proc("auto").run(_make_items(3, 4), debug_dir=None, load_debug_dir=None)
+        self.assertEqual(self.compiled, [])  # a CPU device
+
+    def test_whole_mode_does_not_compile(self):
+        with self._compile():
+            self._proc("on", mode="whole").run(_make_items(1, 2), debug_dir=None,
+                                              load_debug_dir=None)
+        self.assertEqual(self.compiled, [])
+
+    def test_a_failed_compile_falls_back_to_eager_for_the_process(self):
+        with self._compile(fail=RuntimeError("triton: no working compiler")):
+            with self.assertLogs(vi.logger, "WARNING"):
+                out = self._proc("on").run(self._noisy_items(1), debug_dir=None,
+                                           load_debug_dir=None)
+            self.assertEqual(self.compiled[0].batches, [3])  # tried once, never again
+            self.assertTrue(vi._COMPILE_FAILED)
+            self._proc("on").run(_make_items(1, 1), debug_dir=None, load_debug_dir=None)
+            self.assertEqual(len(self.compiled), 1)
+        eager = self._proc("off").run(self._noisy_items(1), debug_dir=None, load_debug_dir=None)
+        for sa, sb in zip(eager[0]["vad_segments"], out[0]["vad_segments"]):
+            np.testing.assert_array_equal(sa["audio"], sb["audio"])
+
+    def test_padding_follows_an_oom_retry_down(self):
+        # Padding a retried half batch back up to full size would run out of memory again.
+        with self._compile(fail=torch.cuda.OutOfMemoryError("CUDA out of memory")):
+            self._proc("on", batch_size=4).run(_make_items(1, 4), debug_dir=None,
+                                               load_debug_dir=None)
+        batches = self.compiled[0].batches
+        self.assertEqual(batches[0], 4)
+        self.assertEqual(set(batches[1:]), {2})
 
 
 if __name__ == "__main__":

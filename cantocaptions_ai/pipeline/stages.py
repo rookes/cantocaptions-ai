@@ -745,6 +745,7 @@ class VocalIsolationStage(CachedStage):
             model_dir=cfg.model_dir,
             local_files_only=cfg.model_cache_only,
             segment_mode=cfg.vocal_isolation_segment_mode,
+            compile=cfg.vocal_isolation_compile,
         )
         timer.mark_inference_start()
         items = _stage_run(processor, ctx, items, timer)

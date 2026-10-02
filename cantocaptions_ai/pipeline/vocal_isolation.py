@@ -1,4 +1,5 @@
 import importlib.resources
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -48,6 +49,40 @@ _DURATION_TOLERANCE_S = 0.005  # seconds
 # comfortably under typical machine RAM and far above a normal ~50 segs/file, so
 # it essentially never triggers in normal operation.
 _MAX_SEGMENTS_PER_WINDOW = 128
+
+# torch.compile for the chunked path (--vocal_isolation_compile). Every chunk is the same
+# (batch, 2, chunk_size) shape, so one static graph serves a whole run, once each file's
+# short last batch is padded up to size. Measured on a 3080 Ti at batch 4: eager ~152
+# ms/chunk, compiled ~77 ms/chunk, output within ~1e-6. That is not batching paying off:
+# eager spends most of its time on many small elementwise kernels and their launch
+# overhead, which compiling fuses away. The cost is paid once per process: ~12 s with a
+# warm Inductor disk cache, ~50 s the first time on a machine. A model loaded again in the
+# same process (the worker's next job) reuses the compiled code in ~0.3 s.
+#
+# "auto" compiles once a run is long enough to repay a warm compile: ~75 ms saved per
+# chunk against ~12 s is ~160 chunks, so 200 (about 13 minutes of speech at the 4 s
+# step). It always compiles when this process already has, since that costs nothing.
+_COMPILE_MIN_CHUNKS = 200
+# (batch, dtype, device) shapes this process has compiled and run.
+_COMPILED_SHAPES: set = set()
+# Set when a compile fails, so the process stops trying (e.g. no working Triton).
+_COMPILE_FAILED = False
+
+
+def _compile_model(model):
+    """torch.compile for one fixed chunk shape. A hook so tests can stand in for it."""
+    return torch.compile(model, dynamic=False)
+
+
+def _can_compile(device: torch.device) -> bool:
+    """Whether "auto" may compile here: CUDA with a Triton that Inductor can use."""
+    if device.type != "cuda" or _COMPILE_FAILED:
+        return False
+    try:
+        from torch.utils._triton import has_triton
+    except ImportError:
+        return False
+    return has_triton()
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +169,23 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         device: torch.device,
         batch_size: Optional[int] = None,
         segment_mode: Optional[str] = None,
+        compile: str = "off",
     ):
         self.model = model
         self.config = config
         self.device = device
         self.model_sample_rate: int = config.model.sample_rate
         self._batch_size = batch_size
+        if compile not in ("auto", "on", "off"):
+            raise ValueError(f"unknown vocal isolation compile setting {compile!r} "
+                             "(expected 'auto', 'on' or 'off')")
+        self._compile = compile
+        # Set per run by _choose_forward: the compiled model, or None to run eagerly.
+        self._compiled = None
+        self._compile_started = None
+        # The batch size short batches are padded to. Halved when a padded batch runs out
+        # of memory, following BatchExecutor's own retry down.
+        self._pad_to = batch_size or 1
         inference = config.inference
         self._C = inference.chunk_size
         self._step = self._C // inference.num_overlap
@@ -177,17 +223,19 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             for idx, item in to_compute
         }
 
+        # Cheap approximate total (no resampling/allocation). It sizes the progress bar
+        # as a single continuous bar across every window below instead of resetting
+        # once per file (StageTimer._start_determinate closes/replaces the bar on
+        # every call, so set_total must only be called once, up front), and decides
+        # whether compiling pays.
+        total_jobs = sum(
+            self._estimate_num_offsets(seg)
+            for _, item in to_compute
+            for seg in item['vad_segments']
+        )
         if progress_callback is not None:
-            # Cheap approximate total (no resampling/allocation) so progress stays a
-            # single continuous bar across every window below instead of resetting
-            # once per file (StageTimer._start_determinate closes/replaces the bar on
-            # every call, so set_total must only be called once, up front).
-            total_jobs = sum(
-                self._estimate_num_offsets(seg)
-                for _, item in to_compute
-                for seg in item['vad_segments']
-            )
             progress_callback.set_total(total_jobs, unit="chunk")
+        self._compiled = self._choose_forward(total_jobs)
 
         for window in self._iter_windows(to_compute):
             seg_state: Dict[Tuple[int, int], dict] = {}
@@ -231,9 +279,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                             part = nn.functional.pad(part, (0, C - plen), mode='constant', value=0)
                     parts.append(part)
                 batch_t = torch.stack(parts, dim=0).to(self.device)
-                with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
-                    with torch.no_grad():
-                        out = self.model(batch_t)  # (B, 2, C) for the single-stem vocals model
+                out = self._separate_chunks(batch_t)  # (B, 2, C) for the single-stem vocals model
                 out = out.float().cpu().numpy()
                 for bi, (key, off) in enumerate(batch):
                     st = seg_state[key]
@@ -302,6 +348,77 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         if self._mode == "whole" and approx_len <= self._whole_max:
             return 1
         return len(range(0, approx_len, self._step))
+
+    def _shape_key(self, batch: int):
+        params = getattr(self.model, "parameters", None)
+        first = next(params(), None) if params is not None else None
+        return (batch, first.dtype if first is not None else None, str(self.device))
+
+    def _choose_forward(self, n_chunks: int):
+        """The compiled model for this run's chunks, or None to run eagerly.
+
+        Only chunked mode compiles: its chunks share one shape, while whole mode's
+        segments are each a new length. A fixed batch size is needed for the same reason.
+        """
+        if (self._compile == "off" or self._mode != "chunked" or not self._batch_size
+                or n_chunks == 0 or _COMPILE_FAILED):
+            return None
+        warm = self._shape_key(self._pad_to) in _COMPILED_SHAPES
+        if self._compile == "auto" and not (
+            _can_compile(self.device) and (warm or n_chunks >= _COMPILE_MIN_CHUNKS)
+        ):
+            return None
+        if not warm:
+            logger.info("Compiling the vocal isolation model for %d-chunk batches (once per "
+                        "process; about 10-50 s)...", self._pad_to)
+        # The model's rotary embeddings (rotary_embedding_torch) fill a frequency cache on
+        # their first call, and the cache's length is part of what a compiled graph assumes,
+        # so compiling before that call means compiling twice. One eager pass fills it; a
+        # single chunk does, since the cache is sized by the chunk's length, not the batch.
+        with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
+            with torch.no_grad():
+                self.model(torch.zeros((1, 2, self._C), device=self.device))
+        self._compile_started = None if warm else time.perf_counter()
+        return _compile_model(self.model)
+
+    def _separate_chunks(self, batch_t: torch.Tensor) -> torch.Tensor:
+        """Run a batch of chunks through the model, compiled when the run chose it.
+
+        The compiled model is fed one batch size only. A file's short last batch is padded
+        with silent chunks and their output dropped, so it doesn't trigger a recompile.
+        """
+        global _COMPILE_FAILED
+        n = batch_t.shape[0]
+        compiled = self._compiled
+        if compiled is not None:
+            target = max(n, self._pad_to)
+            if n < target:
+                batch_t = torch.cat([batch_t, batch_t.new_zeros((target - n, *batch_t.shape[1:]))])
+            try:
+                with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
+                    with torch.no_grad():
+                        out = compiled(batch_t)
+            except Exception as e:
+                if "out of memory" in str(e).lower():
+                    # BatchExecutor retries at half the batch; pad to that from now on.
+                    self._pad_to = max(1, target // 2)
+                    raise
+                logger.warning("Compiling the vocal isolation model failed; running it "
+                               "uncompiled for the rest of this process. %s: %s",
+                               type(e).__name__, e)
+                _COMPILE_FAILED = True
+                self._compiled = None
+                batch_t = batch_t[:n]
+            else:
+                _COMPILED_SHAPES.add(self._shape_key(target))
+                if self._compile_started is not None:
+                    logger.info("Compiled the vocal isolation model in %.0f s",
+                                time.perf_counter() - self._compile_started)
+                    self._compile_started = None
+                return out[:n]
+        with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
+            with torch.no_grad():
+                return self.model(batch_t)
 
     def _run_whole(self, key, seg, mixture, padded, item_out) -> None:
         """Separate one segment in a single forward pass at its natural length.
@@ -392,6 +509,7 @@ def load_vocal_isolation(
     vram_checks: bool = True,
     local_files_only: bool = False,
     segment_mode: Optional[str] = None,
+    compile: str = "off",
 ) -> VocalIsolationProcessor:
     """Load a vocal isolation model and return a processor.
 
@@ -403,6 +521,8 @@ def load_vocal_isolation(
     compute_type="float16" halves the model's weight VRAM footprint; inference still
     runs under the existing autocast (see infer_fn) so activations/STFT stay numerically
     safe regardless of the stored weight dtype.
+    compile is "on", "off" or "auto" (compile when the run is long enough to repay it);
+    see _COMPILE_MIN_CHUNKS.
     """
     if model_name != "mbroformer":
         raise ValueError(
@@ -459,4 +579,5 @@ def load_vocal_isolation(
         device=torch_device,
         batch_size=batch_size,
         segment_mode=segment_mode,
+        compile=compile,
     )
