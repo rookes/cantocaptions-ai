@@ -91,6 +91,10 @@ class PipelineConfig:
     # different artifacts under chunked mode. (Direct load_vocal_isolation callers
     # that pass segment_mode=None instead defer to the bundled model yaml.)
     vocal_isolation_segment_mode: str = "chunked"
+    # torch.compile for chunked isolation: about 2x faster on CUDA after a one-off compile
+    # (~12 s per process, ~50 s the first time). "auto" compiles when the run is long
+    # enough to repay it, or the process already has; see vocal_isolation.py.
+    vocal_isolation_compile: str = "auto"
 
     # Ensemble & LLM correction
     ensemble_model: str = "none"
@@ -374,7 +378,7 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     ),
     "vocal_isolation": (
         "vocal_isolation_method", "vocal_isolation_batch_size", "vocal_isolation_compute_type",
-        "vocal_isolation_segment_mode",
+        "vocal_isolation_segment_mode", "vocal_isolation_compile",
     ),
     "ensemble": (
         "ensemble_model", "llm_correction", "llm_model", "llm_model_dir", "reference_subtitle",

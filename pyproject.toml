@@ -36,8 +36,10 @@ dependencies = [
 [project.optional-dependencies]
 ensemble = ["faster-whisper>=1.0.0"]
 llm = ["bitsandbytes>=0.43.0"]
-# Triton, which backs --compile (torch.compile) on CUDA. Every ASR family, Qwen3-ASR
-# included, runs on the base install.
+# Triton, which backs torch.compile on CUDA: --compile, and --vocal_isolation_compile
+# (which falls back to running uncompiled without it). Linux's CUDA torch already pulls
+# Triton in; Windows needs this extra. Every ASR family, Qwen3-ASR included, runs on the
+# base install.
 compile = [
     "triton; sys_platform == 'linux'",
     "triton-windows<3.7; sys_platform == 'win32'",
