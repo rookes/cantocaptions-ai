@@ -276,7 +276,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                     if progress_callback is not None:
                         progress_callback.advance(1)
                     continue
-                offsets = list(range(0, total_length, step))
+                offsets = self._chunk_offsets(total_length, padded)
                 seg_state[key] = {
                     'mixture': mixture,
                     'total_length': total_length,
@@ -365,13 +365,30 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         sizing (which always uses _prepare_mixture's real, exact total_length).
         """
         approx_len = round(len(seg['audio']) * self.model_sample_rate / SAMPLE_RATE)
-        if approx_len > 2 * self._border and self._border > 0:
+        padded = approx_len > 2 * self._border and self._border > 0
+        if padded:
             approx_len += 2 * self._border
         if approx_len <= 0:
             return 0
         if self._mode == "whole" and approx_len <= self._whole_max:
             return 1
-        return len(range(0, approx_len, self._step))
+        return len(self._chunk_offsets(approx_len, padded))
+
+    def _chunk_offsets(self, total_length: int, padded: bool) -> List[int]:
+        """Where the chunks of a (padded) segment start: every step, skipping any chunk
+        that would hold border padding only.
+
+        The grid always ends with one such chunk. The border is chunk_size - step, so the
+        real audio ends a border before total_length and the last grid point at or past
+        that end sees nothing but reflected padding. That chunk's output lands in the
+        border, which _finalize_segment cuts off: skipping it changes no output sample
+        (the chunk before it already reaches past total_length, so it keeps its own
+        no-fade-out end), and saves one chunk per segment, ~13% of them on the eval
+        episodes.
+        """
+        lo, hi = (self._border, total_length - self._border) if padded else (0, total_length)
+        return [off for off in range(0, total_length, self._step)
+                if off < hi and off + self._C > lo]
 
     def _shape_key(self, batch: int):
         params = getattr(self.model, "parameters", None)

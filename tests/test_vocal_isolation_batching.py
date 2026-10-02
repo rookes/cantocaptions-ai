@@ -235,6 +235,58 @@ class TestWholeSegmentMode(unittest.TestCase):
         self.assertGreater(model.calls, 1)
 
 
+class TestChunkGrid(unittest.TestCase):
+    """The chunk grid skips chunks that would hold only border padding."""
+
+    def _proc(self, model=None):
+        return MbRoformerProcessor(
+            model=model or _FakeMbModel(), config=_no_resample_config(chunk_size=64),
+            device=torch.device("cpu"), batch_size=3,
+        )
+
+    def test_drops_exactly_the_padding_only_chunk(self):
+        proc = self._proc()  # chunk 64, step 32, border 32
+        for audio_len in (65, 100, 256, 257):
+            with self.subTest(audio_len=audio_len):
+                total = audio_len + 64
+                grid = list(range(0, total, 32))
+                offsets = proc._chunk_offsets(total, padded=True)
+                self.assertEqual(offsets, grid[:-1])
+                self.assertGreaterEqual(offsets[-1] + 64, total - 32)  # the audio's end is covered
+
+    def test_unpadded_segments_keep_every_chunk(self):
+        self.assertEqual(self._proc()._chunk_offsets(60, padded=False), [0, 32])
+
+    def test_output_matches_running_every_grid_chunk(self):
+        def run(skip):
+            proc = self._proc(_ScaleModel())
+            if not skip:
+                proc._chunk_offsets = lambda total, padded: list(range(0, total, proc._step))
+            return proc.run(TestCompiledChunks._noisy_items(2), debug_dir=None, load_debug_dir=None)
+        for a, b in zip(run(False), run(True)):
+            for sa, sb in zip(a["vad_segments"], b["vad_segments"]):
+                np.testing.assert_array_equal(sa["audio"], sb["audio"])
+
+    def test_progress_estimate_counts_the_chunks_run(self):
+        proc = self._proc()
+        items = TestCompiledChunks._noisy_items(1)
+        estimate = sum(proc._estimate_num_offsets(s) for s in items[0]["vad_segments"])
+        seen = []
+        proc._separate_chunks = lambda b: (seen.append(b.shape[0]), b)[1]
+        proc.run(items, debug_dir=None, load_debug_dir=None)
+        self.assertEqual(sum(seen), estimate)
+
+
+class _ScaleModel:
+    """Not an identity, so a chunk's position in the overlap-add actually matters."""
+
+    def eval(self):
+        pass
+
+    def __call__(self, batch_t):
+        return batch_t * 0.5 + 0.25 * batch_t.flip(-1)
+
+
 class _FakeCompiled:
     """Stands in for torch.compile's output: records the batch sizes it is fed, and can
     raise once to act out a failed compile or an OOM."""
