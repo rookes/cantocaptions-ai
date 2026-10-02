@@ -15,7 +15,6 @@ trained on.
 import argparse
 import json
 import os
-import re
 import wave
 from collections import defaultdict
 
@@ -44,16 +43,11 @@ def _ts(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-# Parenthesised text in the dataset's subtitles is never speech: glosses (DeeDee(弟弟)),
-# pronunciations (扤(at1)) and translations of English lines. Scoring against it counts the
-# model wrong for not transcribing what nobody said. Romanisation standing in for a syllable
-# with no character (靚doi1喎) is spoken, and stays.
-_ANNOTATION = re.compile(r"\s*[(（][^()（）]*[)）]")
-
-
-def spoken(text):
-    """A reference cue's text without its annotations."""
-    return _ANNOTATION.sub("", text).strip()
+# Test-split shows whose subtitles are not a transcript of what is said, so a model can't be
+# scored against them. Echoes of the Rainbow's carry English lines with Chinese translations,
+# glosses and pronunciations in brackets, romanised syllables, and spelling the dataset's
+# standardization report rates nonstandard (0.23).
+NOT_VERBATIM = ["echoes-of-the-rainbow-2010"]
 
 
 def build_show(data_dir, show, max_seconds, gap):
@@ -79,7 +73,7 @@ def build_show(data_dir, show, max_seconds, gap):
                     continue
                 start = t + max(cue["start"] - seg["start"], 0.0)
                 end = t + min(cue["end"] - seg["start"], len(pcm) / SR)
-                cues.append((start, end, spoken(cue["text"])))
+                cues.append((start, end, cue["text"]))
             pieces += [pcm, silence]
             t += len(pcm) / SR + gap
             if max_seconds and t >= max_seconds:
@@ -93,12 +87,14 @@ def main():
     ap.add_argument("--split", default="test")
     ap.add_argument("--minutes-per-show", type=float, default=10.0, help="0 = every clip")
     ap.add_argument("--gap", type=float, default=1.0, help="seconds of silence between clips")
+    ap.add_argument("--exclude", nargs="*", default=NOT_VERBATIM, metavar="SHOW",
+                    help="shows to leave out (default: those whose subtitles aren't verbatim)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     with open(os.path.join(args.dataset, "splits.json"), encoding="utf-8") as f:
         splits = json.load(f)
-    shows = sorted(s for s, v in splits.items() if v["split"] == args.split)
+    shows = sorted(s for s, v in splits.items() if v["split"] == args.split and s not in args.exclude)
     os.makedirs(os.path.join(args.out, "gt"), exist_ok=True)
     manifest = defaultdict(dict)
     for show in shows:
