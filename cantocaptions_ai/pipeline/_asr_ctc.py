@@ -7,12 +7,6 @@ only ASR there is. The forward pass is the alignment code's own
 length; this backend takes the per-frame argmax and lets the processor collapse repeats,
 drop blanks and turn the word delimiter into a space.
 
-When the same model also aligns the transcript (a CTC model is usually its own language's
-aligner), the encoder output computed here is exactly what alignment would compute again:
-``share_emissions`` makes this stage compute it alignment's way (the align profile's audio
-primer, its minimum segment length) and hand each file's output on as an EmissionTimeline,
-which the alignment stage then reads instead of running the model a second time.
-
 CTC output carries no punctuation, and punctuation is where alignment cuts a chunk into
 clauses and cue assembly finds its boundaries: left bare, every VAD chunk (up to 28 s)
 becomes one cue. The greedy path already says where the speaker paused, though -- a long
@@ -84,72 +78,22 @@ class CtcAsr(BatchedAsrStage):
         delimiter = getattr(tokenizer, "word_delimiter_token_id", None)
         if delimiter is not None:
             self._silent_ids.add(delimiter)
-        # Set by share_emissions: the align profile, and each segment's output by its audio.
-        self._shared_profile = None
-        self._kept: dict = {}
-
-    def share_emissions(self, align_profile) -> bool:
-        """Compute emissions the way alignment does, and pass them on to it (see the module
-        docstring). Called by the orchestrator when the align model is this model."""
-        self._shared_profile = align_profile
-        return True
-
-    def run(self, items, **kwargs):
-        if self._shared_profile is None:
-            return super().run(items, **kwargs)
-        from cantocaptions_ai.pipeline.align_backends import ALIGN_BACKENDS
-        from cantocaptions_ai.pipeline.alignment import EmissionTimeline
-
-        self._kept = {}
-        try:
-            out = super().run(items, **kwargs)
-            rate = ALIGN_BACKENDS["huggingface"].frame_rate(self.model, self.processor,
-                                                           self.model.device)
-            shared = 0
-            for item in out:
-                segs = item.get("vad_segments") or []
-                # Only a file transcribed in this run: one read from a checkpoint has no
-                # emissions here, and alignment computes them itself as before.
-                if not segs or not all(id(seg["audio"]) in self._kept for seg in segs):
-                    continue
-                computed = [self._kept.pop(id(seg["audio"])) for seg in segs]
-                item["emission_timeline"] = EmissionTimeline.from_computed(
-                    segs, computed, frame_rate=rate)
-                shared += 1
-            if shared:
-                logger.info("Passing this model's emissions for %d file(s) on to alignment",
-                            shared)
-            return out
-        finally:
-            self._kept = {}
 
     def _infer_batch(self, wavs: List, language: str, contexts=None) -> List[str]:
         from cantocaptions_ai.pipeline.align_backends import ALIGN_BACKENDS
-        from cantocaptions_ai.pipeline.alignment import MIN_ALIGN_SAMPLES, EmissionTimeline
+        from cantocaptions_ai.pipeline.alignment import MIN_ALIGN_SAMPLES
 
-        profile = self._shared_profile
-        min_samples = profile.min_samples if profile is not None else MIN_ALIGN_SAMPLES
         # Below one feature frame the extractor fails outright, and there is nothing to hear.
-        usable = [i for i, w in enumerate(wavs) if len(w) >= min_samples]
+        usable = [i for i, w in enumerate(wavs) if len(w) >= MIN_ALIGN_SAMPLES]
         segments = [{"start": 0.0, "end": len(wavs[i]) / SAMPLE_RATE, "audio": wavs[i]}
                     for i in usable]
         emissions = ALIGN_BACKENDS["huggingface"].emissions(
             segments, self.model, self.processor, self.model.device,
             batch_size=max(len(segments), 1), vram_checks=self.vram_checks,
-            # Alignment's own primer when this output goes on to it, so it is the output
-            # alignment would have computed.
-            primer=profile.primer if profile is not None else None,
         ) if segments else []
         texts = [""] * len(wavs)
         for i, (emission, rate) in zip(usable, emissions):
             texts[i] = self._decode(emission.argmax(dim=-1).tolist(), rate)
-            if profile is not None:
-                self._kept[id(wavs[i])] = (emission.to(EmissionTimeline.dtype), rate)
-        if profile is not None:
-            # A segment too short to encode gets the empty emission alignment gives it.
-            empty = torch.zeros((0, self.model.config.vocab_size), dtype=EmissionTimeline.dtype)
-            for i in set(range(len(wavs))) - set(usable):
-                self._kept[id(wavs[i])] = (empty, 0.0)
         return texts
 
     def _decode(self, ids: List[int], frame_rate: float) -> str:

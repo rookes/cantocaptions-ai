@@ -63,6 +63,12 @@ class TailPrimer:
     before the trellis runs either way, and reversed and forward tails were measured to
     agree on 12 of 14 segments (the two exceptions differing by one frame and by 0.85 s on
     a 3.3 s segment).
+
+    Primed output is for forced alignment only; don't decode text from it. At the real onset
+    the first character is often too weak to win the argmax (log-probability -1 to -3 where
+    it wins at frame 0 unprimed), so a greedy decode drops it, and a one-word segment can
+    decode to nothing. Sharing one primed pass between CTC transcription and alignment was
+    tried and reverted for this reason: it lost 6 of 701 matched cues on the eval episodes.
     """
 
     seconds: float = 1.0
