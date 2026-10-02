@@ -237,3 +237,28 @@ def test_a_registered_packs_default_align_model_reaches_library_callers(fake_bun
 def test_a_language_with_no_default_align_model_still_says_so():
     with pytest.raises(ValueError, match="No default align-model for language: sw"):
         alignment.load_align_model("sw", "cpu", vram_checks=False)
+
+
+def test_a_profile_can_keep_the_input_raw(tmp_path, monkeypatch):
+    """The Hugging Face releases of the old torchaudio defaults are fed raw audio, as the
+    bundles were (align_profiles._RAW_INPUT): same weights, so then the same output."""
+    from cantocaptions_ai.pipeline import align_profiles
+
+    checkpoint = _hf_checkpoint(tmp_path)
+    monkeypatch.setitem(align_profiles.ALIGN_PROFILES, checkpoint,
+                        align_profiles.AlignProfile(normalize_input=False))
+    _, metadata = alignment.load_align_model("en", "cpu", model_name=checkpoint,
+                                             model_cache_only=True, vram_checks=False,
+                                             char_substitution="off")
+    assert metadata["processor"].feature_extractor.do_normalize is False
+
+
+def test_the_old_torchaudio_defaults_now_name_their_hugging_face_releases():
+    from cantocaptions_ai.languages.align_defaults import default_align_model
+    from cantocaptions_ai.pipeline.align_profiles import get_align_profile
+
+    for lang in ("en", "fr", "de", "it"):
+        model = default_align_model(lang)
+        assert model.startswith("facebook/wav2vec2-base"), lang
+        assert get_align_profile(model).normalize_input is False, lang
+    assert default_align_model("es") == "VOXPOPULI_ASR_BASE_10K_ES"

@@ -7,8 +7,9 @@ the backend's job, and it is the only part that differs between families:
 * ``huggingface`` -- any Hugging Face CTC checkpoint (wav2vec2, wav2vec2-BERT, HuBERT,
   WavLM, ...), through the Auto classes and the model's own processor. Batched, and the
   only family that takes an align profile's audio primer.
-* ``torchaudio`` -- a torchaudio pipeline bundle by name (``WAV2VEC2_ASR_BASE_960H``, the
-  VoxPopuli models): raw audio in, one segment at a time.
+* ``torchaudio`` -- a torchaudio pipeline bundle by name (``VOXPOPULI_ASR_BASE_10K_ES``,
+  ``WAV2VEC2_ASR_BASE_960H``): raw audio in, one segment at a time. Only Spanish still
+  defaults to one; see languages/align_defaults.py.
 
 The names are the values ``load_align_model`` has always written to ``metadata["type"]``,
 which callers outside this package read, so they are kept. ``align_backend_for`` decides a

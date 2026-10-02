@@ -105,9 +105,20 @@ class AlignProfile:
     # substitution reads Cantonese (Jyutping) pronunciations, so it is only right for a
     # Cantonese model's vocabulary; everything else defaults to no substitution.
     char_substitution: str = "off"
+    # Whether the model's input is normalised to zero mean and unit variance before the
+    # encoder sees it. None leaves the checkpoint's own processor to decide. Set False for
+    # the Hugging Face copies of models torchaudio ships as pipeline bundles: torchaudio
+    # feeds those the raw waveform, as they were trained, while the Hugging Face processor
+    # normalises -- the one difference between the two (same weights, bit-identical
+    # output given the same input).
+    normalize_input: Optional[bool] = None
 
 
 DEFAULT_ALIGN_PROFILE = AlignProfile()
+
+# The Hugging Face releases of the torchaudio bundles that used to be these languages'
+# defaults (languages/align_defaults.py), fed the same raw waveform the bundles were.
+_RAW_INPUT = AlignProfile(normalize_input=False)
 
 ALIGN_PROFILES: Dict[str, AlignProfile] = {
     "alvanlii/wav2vec2-BERT-cantonese": AlignProfile(
@@ -115,6 +126,10 @@ ALIGN_PROFILES: Dict[str, AlignProfile] = {
         substitutions="wav2vec2-bert-cantonese.toml",
         char_substitution="homophone",
     ),
+    "facebook/wav2vec2-base-960h": _RAW_INPUT,
+    "facebook/wav2vec2-base-10k-voxpopuli-ft-fr": _RAW_INPUT,
+    "facebook/wav2vec2-base-10k-voxpopuli-ft-de": _RAW_INPUT,
+    "facebook/wav2vec2-base-10k-voxpopuli-ft-it": _RAW_INPUT,
 }
 
 

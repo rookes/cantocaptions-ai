@@ -35,7 +35,7 @@ def test_an_unregistered_language_gets_a_raw_generic_pack():
     en = get_language_pack("en")
     assert "en" not in LANGUAGE_PACKS
     assert (en.script, en.punctuation) == (SPACED_SCRIPT, LATIN_PUNCTUATION)
-    assert en.default_align_model == "WAV2VEC2_ASR_BASE_960H"
+    assert en.default_align_model == "facebook/wav2vec2-base-960h"
     assert en.default_model is None and en.cleaning is None and not en.fully_supported
     assert generic_pack("ja").script == CJK_SCRIPT
     assert generic_pack("sw").default_align_model is None

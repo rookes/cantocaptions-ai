@@ -7,17 +7,25 @@ also listed here for callers that read the table directly).
 """
 from typing import Optional
 
-# torchaudio pipeline bundles, by name.
+# torchaudio pipeline bundles, by name. en, fr, de and it used to be here too; they now use
+# the Hugging Face releases of the same models (below), which run batched and take an align
+# profile's primer. Proven the same: identical weights tensor for tensor, and bit-identical
+# output given the same input (their profiles keep the bundles' raw-waveform input).
+#
+# Spanish stays: its Hugging Face release labels its last three letters one output row away
+# from the bundle -- the bundle's `k`, `w` and `ü` weights sit under `w`, `ü` and `1` there --
+# and the weights cannot say which is right, so switching would quietly change how those
+# letters align.
 DEFAULT_ALIGN_MODELS_TORCH = {
-    "en": "WAV2VEC2_ASR_BASE_960H",
-    "fr": "VOXPOPULI_ASR_BASE_10K_FR",
-    "de": "VOXPOPULI_ASR_BASE_10K_DE",
     "es": "VOXPOPULI_ASR_BASE_10K_ES",
-    "it": "VOXPOPULI_ASR_BASE_10K_IT",
 }
 
 # Hugging Face CTC checkpoints.
 DEFAULT_ALIGN_MODELS_HF = {
+    "en": "facebook/wav2vec2-base-960h",
+    "fr": "facebook/wav2vec2-base-10k-voxpopuli-ft-fr",
+    "de": "facebook/wav2vec2-base-10k-voxpopuli-ft-de",
+    "it": "facebook/wav2vec2-base-10k-voxpopuli-ft-it",
     "ja": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese",
     "zh": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
     "nl": "jonatasgrosman/wav2vec2-large-xlsr-53-dutch",
