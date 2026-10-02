@@ -54,7 +54,6 @@ def build_parser() -> argparse.ArgumentParser:
     formatter_class = functools.partial(ConfigAwareHelpFormatter, defaults=PipelineConfig.defaults())
     parser = argparse.ArgumentParser(formatter_class=formatter_class)
     parser.add_argument("audio", nargs="*", type=str, help="audio file(s) to transcribe")
-    parser.add_argument("--language", type=str, default=argparse.SUPPRESS, choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio (required; only yue/Cantonese is fully supported)")
     parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {importlib.metadata.version('cantocaptions-ai')}", help="Show cantocaptions-ai version information and exit")
     parser.add_argument("--python-version", "-P", action="version", version=f"Python {platform.python_version()} ({platform.python_implementation()})", help="Show python version information and exit")
 
@@ -72,10 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     transcript_grp.add_argument("--realign_min_score", type=float, default=argparse.SUPPRESS, help="mean CTC path score below which a placed line is logged as weakly supported; purely diagnostic, but a run of them means the transcript and the audio have diverged")
 
     config_grp = parser.add_argument_group("config file")
-    config_grp.add_argument("--cfg", type=str, default=argparse.SUPPRESS, metavar="NAME", help="load config/NAME.cfg instead of the auto-created config/default.cfg (see config/cpu.cfg for a commented example); its values act as a layer beneath stage-preset and explicit CLI flags")
+    config_grp.add_argument("--cfg", type=str, default=argparse.SUPPRESS, metavar="NAME", help="load the NAME preset instead of default.cfg: NAME.cfg from your config directory, else the one shipped with the package (cpu, fast_test). Its values act as a layer beneath user.cfg, the stage presets and explicit flags")
 
     model_grp = parser.add_argument_group("model")
-    model_grp.add_argument("--model", default=argparse.SUPPRESS, choices=list(MODEL_PROFILES.keys()), help="name of the ASR model to use (see pipeline/model_profiles.py). Unset, the language's own model is used: cantocaptions-cantonese-ASR for yue; other languages must name one")
+    model_grp.add_argument("--language", type=str, default=argparse.SUPPRESS, choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio (required; only yue/Cantonese is fully supported)")
+    model_grp.add_argument("--model", default=argparse.SUPPRESS, metavar="MODEL", help=f"the ASR model: a registered name ({', '.join(MODEL_PROFILES)}), or any Hugging Face hub id or local checkpoint path of a supported family (Qwen3-ASR, Whisper, or a wav2vec2-family CTC model). Unset, the language's own model is used: cantocaptions-cantonese-ASR for yue; other languages must name one")
     model_grp.add_argument("--model_cache_only", type=str2bool, default=argparse.SUPPRESS, help="If True, will not attempt to download models, instead using cached models from --model_dir")
     model_grp.add_argument("--model_dir", type=str, default=argparse.SUPPRESS, help="the path to save/load model files; if unset, defers to huggingface_hub's own cache resolution (~/.cache/huggingface/hub, or $HF_HOME/$XDG_CACHE_HOME if set)")
 
@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     audio_grp.add_argument("--no_audio_normalize", dest="audio_normalize", action="store_false", default=argparse.SUPPRESS, help="do not level the file before processing. Levelling is on by default because the training corpus is cut that way; turn it off only to reproduce an older run, since an unlevelled file is a different input distribution than the model was trained on.")
 
     vad_grp = parser.add_argument_group("vad")
-    vad_grp.add_argument("--vad_method", type=str, default=argparse.SUPPRESS, choices=list(VAD_METHODS), help="VAD model: pyannote (segmentation-3.0; best, and fast on a GPU) or silero (Silero VAD v6; CPU only, lighter on a CPU-only machine). The thresholds are calibrated per model: see config/cpu.cfg for silero's")
+    vad_grp.add_argument("--vad_method", type=str, default=argparse.SUPPRESS, choices=list(VAD_METHODS), help="VAD model: pyannote (segmentation-3.0; best, and fast on a GPU) or silero (Silero VAD v6; CPU only, lighter on a CPU-only machine). The thresholds are calibrated per model: see the cpu preset (--cfg cpu) for silero's")
     vad_grp.add_argument("--vad_onset", type=float, default=argparse.SUPPRESS, help="Onset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected")
     vad_grp.add_argument("--vad_offset", type=float, default=argparse.SUPPRESS, help="Offset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected.")
     vad_grp.add_argument("--vad_pad_onset", type=float, default=argparse.SUPPRESS, help="seconds of audio to keep before each detected speech region, so word onsets are not clipped at the threshold crossing")
@@ -148,21 +148,24 @@ def build_parser() -> argparse.ArgumentParser:
     align_grp.add_argument("--interpolate_method", default=argparse.SUPPRESS, choices=["nearest", "linear", "ignore"], help="For word .srt, method to assign timestamps to non-aligned words, or merge them into neighbouring.")
     align_grp.add_argument("--no_align", action='store_true', default=argparse.SUPPRESS, help="Do not perform phoneme alignment")
     align_grp.add_argument("--return_char_alignments", action='store_true', default=argparse.SUPPRESS, help="Return character-level alignments in the output json file")
-    align_grp.add_argument("--align_padding", type=float, default=argparse.SUPPRESS, help="seconds of gap left between consecutive subtitles where alignment would otherwise make them touch or overlap")
-    align_grp.add_argument("--align_release", type=float, default=argparse.SUPPRESS, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
-    align_grp.add_argument("--align_merge_distance", type=float, default=argparse.SUPPRESS, help="The maximum distance between utterances that allows them to be merged.")
-    align_grp.add_argument("--min_cue_duration", type=float, default=argparse.SUPPRESS, help="subtitles shorter than this (seconds) are merged into a neighbouring cue, dropped if they are pure interjection noise, or held longer; 0 disables all three")
-    align_grp.add_argument("--merge_gap", type=float, default=argparse.SUPPRESS, help="the maximum silence (seconds) a too-short subtitle may be merged across; doubled for the discourse markers listed in the ASR model's profile")
     align_grp.add_argument("--align_batch_size", default=argparse.SUPPRESS, type=int, help="number of VAD segments the alignment model processes per batch")
     align_grp.add_argument("--align_compute_type", default=argparse.SUPPRESS, type=str, choices=["float32", "float16"], help="compute type (weight dtype) for the alignment model; float16 lowers VRAM usage but may reduce forced-alignment accuracy (falls back to float32 off CUDA)")
-    align_grp.add_argument("--align_char_substitution", default=argparse.SUPPRESS, type=str, choices=["off", "variant", "homophone", "near"], help="substitute an in-vocabulary character when the align model has no token for one in the transcript, so it can be timed at all: 'variant' folds Simplified/variant forms, 'homophone' also accepts the same Jyutping reading, 'near' also accepts the same syllable on a different tone. Unset (None), the align model's profile decides: homophone for the Cantonese model, off for others, since the homophone tiers read Cantonese pronunciations. The subtitle text is unchanged; only the token used for alignment differs")
+    align_grp.add_argument("--align_char_substitution", default=argparse.SUPPRESS, type=str, choices=["off", "variant", "homophone", "near"], help="substitute an in-vocabulary character when the align model has no token for one in the transcript, so it can be timed at all: 'variant' folds Simplified/variant forms, 'homophone' also accepts the same reading, 'near' also accepts the same syllable on a different tone. The readings are the language pack's (Jyutping for Cantonese); a language without them gets only the align model's substitution table. Unset (None), the align model's profile decides: homophone for the Cantonese model, off for others. The subtitle text is unchanged; only the token used for alignment differs")
     align_grp.add_argument("--align_substitutions", default=argparse.SUPPRESS, type=str, help="TOML file with a [substitutions] table of hand-picked character substitutions, which beat every automatic choice (an empty value leaves that character alone)")
     align_grp.add_argument("--align_split_gap", type=optional_float, default=argparse.SUPPRESS, metavar="SECONDS", help="break a subtitle in two wherever alignment left a silence of at least this long between two of its own adjacent characters, so a cue holding two utterances becomes one cue each (1.5 is a sensible starting point). Unset defers to the align model's profile, which never splits; 0 forces it off. Ignored under --realign, where the transcript's line breaks are the cue boundaries")
     align_grp.add_argument("--align", "-a", choices=["fast", "quality"], default=argparse.SUPPRESS, help="shorthand for --align_compute_type (fast=float16, quality=float32). Does NOT affect --align_batch_size (no benchmarked safe bump exists for the 'fast' tier — see scripts/bench_alignment_batching.py). The granular --align_compute_type flag always wins if both are given.")
 
+    cues_grp = parser.add_argument_group("cue timing")
+    cues_grp.add_argument("--align_padding", type=float, default=argparse.SUPPRESS, help="seconds of gap left between consecutive subtitles where alignment would otherwise make them touch or overlap")
+    cues_grp.add_argument("--align_release", type=float, default=argparse.SUPPRESS, help="When aligning the end of an utterance, add this duration to the end as additional release time.")
+    cues_grp.add_argument("--align_merge_distance", type=float, default=argparse.SUPPRESS, help="The maximum distance between utterances that allows them to be merged.")
+    cues_grp.add_argument("--min_cue_duration", type=float, default=argparse.SUPPRESS, help="subtitles shorter than this (seconds) are merged into a neighbouring cue, dropped if they are pure interjection noise, or held longer; 0 disables all three")
+    cues_grp.add_argument("--max_cue_duration", type=float, default=argparse.SUPPRESS, help="longest a subtitle may stay on screen (seconds): neighbours are not joined past it, and a longer cue -- typically a clause the ASR never punctuated -- is cut at its longest internal pause, preferring punctuation and the middle. 0 turns the cap off")
+    cues_grp.add_argument("--merge_gap", type=float, default=argparse.SUPPRESS, help="the maximum silence (seconds) a too-short subtitle may be merged across; doubled for the discourse markers listed in the ASR model's profile")
+
     subtitle_grp = parser.add_argument_group("subtitle formatting")
-    subtitle_grp.add_argument("--max_line_width", type=optional_int, default=argparse.SUPPRESS, help="(not possible with --no_align) the maximum number of characters in a line before text cleaning breaks the line")
-    subtitle_grp.add_argument("--max_line_count", type=optional_int, default=argparse.SUPPRESS, help="(not possible with --no_align) the maximum number of lines in a segment; text cleaning only breaks lines when this is 2 or more")
+    subtitle_grp.add_argument("--max_line_width", type=optional_int, default=argparse.SUPPRESS, help="the maximum number of characters in a line before it is broken. Unset, the language's own width (18 for Chinese, 42 for space-separated scripts); 0 never breaks a line")
+    subtitle_grp.add_argument("--max_line_count", type=optional_int, default=argparse.SUPPRESS, help="the maximum number of lines in a subtitle; lines are only broken when this is 2 or more")
 
     clean_grp = parser.add_argument_group("text cleaning")
     clean_grp.add_argument("--no_clean_text", action="store_true", default=argparse.SUPPRESS, help="disable Cantonese subtitle text cleaning (punctuation, HK conventions, particle fixes, interjection removal, line breaking)")

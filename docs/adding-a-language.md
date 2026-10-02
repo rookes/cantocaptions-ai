@@ -31,14 +31,19 @@ EN = LanguagePack(
     code="en",
     script=SPACED_SCRIPT,          # words joined with spaces, 42-char lines, word-wrapped
     punctuation=LATIN_PUNCTUATION, # sentence splits at . ? ! ; and a comma lets cues join
-    default_model="Qwen3-ASR",     # any MODEL_PROFILES key, or a hub id
+    default_model="whisper-large-v3",  # any MODEL_PROFILES key, or a hub id / path
     default_align_model="WAV2VEC2_ASR_BASE_960H",
 )
 ```
 
-Register it next to yue in `languages/__init__.py` (`_register_builtin_packs`), or from your own code
-with `register_language_pack(EN)`. With only this, `--language en` needs no `--model`, but still needs
+Register it next to yue in `languages/__init__.py` (`_register_builtin_packs`), from your own code
+with `register_language_pack(EN)`, or from a package of its own (see "Shipping a pack as its own package"). With only this, `--language en` needs no `--model`, but still needs
 `--no_clean_text`: `fully_supported` means a default model **and** cleaning rules.
+
+The model can be any Qwen3-ASR, Whisper or wav2vec2-family CTC checkpoint: the backend is read from
+its `config.json` (`pipeline/asr.py`, `backend_for`). A family with no backend yet needs a
+`BatchedAsrStage` subclass (one `_infer_batch` method; see `pipeline/_asr_whisper.py`) registered in
+`ASR_BACKENDS`.
 
 If the ASR model is trained for particular languages only, list them on its `ModelProfile`
 (`pipeline/model_profiles.py`, `languages=frozenset({...})`). `validate_config` then refuses it for any
@@ -55,7 +60,10 @@ other language.
 | `track_selector` | `streams -> index`, when the audio-track tags need more than a language-code match (yue prefers an explicit Cantonese track, then any Chinese one). |
 | `correction_prompts` | `CorrectionPrompts` for `--llm_correction`. Without it, the option is refused for the language. |
 | `ensemble_model` | `(hub repo, CTranslate2 subfolder)` of a faster-whisper second opinion for `--ensemble_model`. |
+| `char_readings` | A factory returning a `CharReadings` (`languages/base.py`): each character's reading, the reading without its tone, a variant character's standard form, and corpus frequencies. Alignment uses it to give a character the align model has no token for the token of a variant or homophone it does have (`--align_char_substitution`). Without it, only the align model's own substitution table applies. Cantonese's is `languages/yue/readings.py`. Make it a factory that imports lazily, so reading the registry stays cheap. |
 
+The align model can be any Hugging Face CTC checkpoint (wav2vec2, wav2vec2-BERT, HuBERT, WavLM, ...) or a
+torchaudio pipeline bundle name; `pipeline/align_backends.py` tells them apart from the model itself.
 Align-model behaviour (an audio primer, hand-picked substitutions, the character-substitution level) is
 per *align model*, not per language: add an `AlignProfile` in `pipeline/align_profiles.py`.
 
@@ -90,6 +98,28 @@ comment = "optional"
 may name (yue's are numerals, question particles, acronyms and trimming). It is called only when a
 cleaner is built, so heavy NLP imports stay out of the registry. `noise_tokens` are whole cues dropped as
 pure interjection. `--clean_rules_dir` lets a user swap in their own directory.
+
+## Shipping a pack as its own package
+
+A pack does not have to live in this repository. Any installed distribution can register one through
+the `cantocaptions_ai.languages` entry-point group; the registry picks it up the first time it is read,
+with no import or registration call needed:
+
+```toml
+# pyproject.toml of your package
+[project]
+name = "cantocaptions-lang-en"
+dependencies = ["cantocaptions-ai"]
+
+[project.entry-points."cantocaptions_ai.languages"]
+en = "cantocaptions_lang_en:EN"     # a LanguagePack, or a zero-argument function returning one
+```
+
+After `pip install cantocaptions-lang-en`, `--language en` uses it. Keep the module that defines the pack
+light, since importing it is part of reading the registry: no torch, and heavy data (pronunciation tables,
+OpenCC) behind factories, as `char_readings` and `builtin_steps` already are. A pack that fails to load is
+skipped with a warning naming its distribution. One with the same code as a built-in pack replaces it, and
+a pack registered in code with `register_language_pack` wins over both.
 
 ## Testing a pack
 

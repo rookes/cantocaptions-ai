@@ -5,7 +5,7 @@ probabilities (one column). Everything after that -- hysteresis thresholds, padd
 gap bridging, the min-cut that caps a region at ``chunk_size`` -- lives here and is
 shared, so ``vad_onset``/``vad_offset``/``vad_pad_*`` mean the same operation whichever
 model produced the curve. Only the curve's *calibration* differs between models, which is
-why each backend needs its own tuned thresholds (silero's are in config/cpu.cfg).
+why each backend needs its own tuned thresholds (silero's are in presets/cpu.cfg).
 """
 import bisect
 import math

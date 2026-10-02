@@ -179,6 +179,12 @@ class ProgressSink(Protocol):
     def set_total(self, total: int, unit: str = "it") -> None: ...
     def advance(self, n: int = 1) -> None: ...
 
+    # Optional, and not called by StageTimer: if a sink has it, _execute_pipeline calls it
+    # once before the first stage with the run's plan -- a list of {"key", "label",
+    # "timed", "cached"} dicts, one per stage in order (see pipeline.stages.plan_entries).
+    # stage_start's name is the matching entry's label.
+    # def plan(self, stages: list) -> None: ...
+
 
 class ProgressReporter:
     """Lightweight facade handed to pipeline stages so they can drive a stage's

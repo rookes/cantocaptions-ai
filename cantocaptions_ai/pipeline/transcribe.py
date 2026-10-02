@@ -7,11 +7,10 @@ import numpy as np
 import torch
 
 from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE
-from cantocaptions_ai.utils.schema import AlignedTranscriptionResult, ProcessingItem, ProgressCallback, VadItem, item_name
+from cantocaptions_ai.utils.schema import ProcessingItem, item_name
 from typing import Callable, Dict, List, Optional
 from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer, writer_args as build_writer_args
-from cantocaptions_ai.utils.log_utils import ProgressSink, StageTimer, TranscriptionSummary, get_logger
-from cantocaptions_ai.utils.model_utils import model_scope, flush_vram, vram_stats, load_with_offline_fallback
+from cantocaptions_ai.utils.log_utils import ProgressSink, TranscriptionSummary, get_logger
 from cantocaptions_ai.text_profiles import (
     DEFAULT_PUNCTUATION,
     DEFAULT_SCRIPT,
@@ -20,438 +19,27 @@ from cantocaptions_ai.text_profiles import (
 from cantocaptions_ai.pipeline.reference_context import CONTEXT_TEMPLATES
 from cantocaptions_ai.pipeline.segmentation import assemble_cues
 from cantocaptions_ai.utils.debug import (
-    _debug_stage_exists,
     write_precleaning_debug,
-    write_speaker_assignment_debug,
 )
-from cantocaptions_ai.errors import ConfigError
-from cantocaptions_ai.pipeline.vad import VadProcessor
 
 logger = get_logger(__name__)
 
-_VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.ts', '.m2ts'}
-
-
-def _select_audio_track(path: str, language: Optional[str] = "yue",
-                        override: Optional[int] = None) -> int:
-    """Return the 0-based audio stream index to use for *path*.
-
-    ``override`` (--audio_track) wins outright. Otherwise video files are probed with
-    ffprobe and the stream most likely to carry *language* is chosen (see
-    utils.audio.select_track); audio-only files, or a probe that finds nothing, get 0
-    (ffmpeg's default).
-    """
-    if override is not None:
-        return override
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in _VIDEO_EXTENSIONS:
-        return 0
-    from cantocaptions_ai.languages import get_language_pack
-    from cantocaptions_ai.utils.audio import probe_audio_tracks
-    streams = probe_audio_tracks(path)
-    if not streams:
-        logger.warning("No audio streams found via ffprobe for '%s'; using default track", path)
-        return 0
-    track = get_language_pack(language).choose_track(streams)
-    if track != 0:
-        logger.info("Selected audio track index %d (%s) for '%s'", track, language, path)
-    return track
-
-
-def _substitution_overrides(cfg):
-    """Hand-curated character substitutions for the align model, or None."""
-    if not getattr(cfg, "align_substitutions", None):
-        return None
-    from cantocaptions_ai.pipeline.align_vocab import load_substitution_overrides
-    return load_substitution_overrides(cfg.align_substitutions)
-
-
-def _run_alignment(
-    items: List[ProcessingItem],
-    align_model,
-    align_metadata,
-    device: str,
-    align_padding: float,
-    align_release: float,
-    interpolate_method: str,
-    return_char_alignments: bool,
-    print_progress: bool,
-    batch_size: int,
-    progress_callback: ProgressCallback = None,
-    vram_checks: bool = True,
-    spotchecks=None,
-    punctuation=DEFAULT_PUNCTUATION,
-    split_gap: Optional[float] = None,
-    script=None,
-) -> List[ProcessingItem]:
-    from cantocaptions_ai.pipeline.alignment import align
-    if progress_callback is not None:
-        progress_callback.set_total(sum(len(it['result']['segments']) for it in items), unit="seg")
-    aligned_items = []
-    for item in items:
-        result = item['result']
-        # Popped, not read: the file's emissions are ~0.5 GB an hour of audio, and the caller's
-        # list still holds this item, so leaving the timeline on it would keep every file's
-        # alive through the rest of the batch and every later stage.
-        timeline = item.pop('emission_timeline', None)
-        if align_model is not None and len(result["segments"]) > 0:
-            logger.info("Performing alignment...")
-            aligned_result: AlignedTranscriptionResult = align(
-                result["segments"],
-                align_model,
-                align_metadata,
-                item['vad_segments'],
-                device,
-                align_padding=align_padding,
-                align_release=align_release,
-                interpolate_method=interpolate_method,
-                return_char_alignments=return_char_alignments,
-                print_progress=print_progress,
-                batch_size=batch_size,
-                progress_callback=progress_callback,
-                vram_checks=vram_checks,
-                spotchecks=spotchecks,
-                punctuation=punctuation,
-                timeline=timeline,
-                split_gap=split_gap, script=script,
-            )
-            aligned_result['language'] = result['language']
-        else:
-            aligned_result = result
-        # Keep the rest of the carrier (notably audio_track, chosen by _select_audio_track):
-        # diarization loads the audio again downstream and must not fall back to track 0.
-        aligned_items.append({**item, 'result': aligned_result})
-    return aligned_items
-
-
-def _extract_timestamps(items: list) -> List[ProcessingItem]:
-    """Segment timings without alignment (used when no_align=True).
-
-    Uses the ASR's per-character timestamps where a backend provides them, and otherwise
-    the segment's own span -- the VAD chunk it was decoded from. Neither Qwen backend emits
-    ``time_stamps``, so the fallback is the normal path; requiring them made --no_align
-    fail with a KeyError on every run.
-    """
-    extracted_items = []
-    for item in items:
-        result = item['result']
-        segments = []
-        for segment in result['segments']:
-            stamps = segment.get('time_stamps')
-            s_start = stamps[0]['start'] if stamps else segment['start']
-            s_end = stamps[-1]['end'] if stamps else segment['end']
-            # Cue assembly merges on `words`; an unaligned segment simply has none.
-            segments.append({'words': [], **segment, 'start': s_start, 'end': s_end})
-        # Preserve the rest of the carrier (audio_track, vad_segments): diarization
-        # needs both, and --no_align routes through here instead of _run_alignment.
-        extracted_items.append({**item, 'result': {**result, 'segments': segments}})
-    return extracted_items
-
-
-def _run_diarization(
-    items: List[ProcessingItem],
-    cfg,
-    summary: TranscriptionSummary,
-    progress: Optional[ProgressSink],
-    need_diarize: bool,
-) -> List[ProcessingItem]:
-    """Stage 5: attach ``diarization`` to every item, from the model or the debug cache.
-
-    Held in its own helper so the stage's load/run/free cycle reads as one unit and
-    ``_execute_pipeline`` stays an outline of the pipeline rather than an implementation.
-    """
-    from cantocaptions_ai.pipeline.diarize import load_diarization, load_diarization_cache
-
-    if not need_diarize:
-        return load_diarization_cache(items, cfg.load_debug_dir)
-
-    if cfg.hf_token is None:
-        logger.info(
-            "No --hf_token provided; %s is a gated model, so its terms must already be "
-            "accepted and a token cached (huggingface-cli login) or this load will fail.",
-            cfg.diarize_model,
-        )
-    with StageTimer("Diarization", summary, progress=progress) as stage:
-        diarizer = load_with_offline_fallback(
-            load_diarization,
-            device=cfg.device,
-            device_index=cfg.device_index,
-            model_name=cfg.diarize_model,
-            token=cfg.hf_token,
-            model_dir=cfg.model_dir,
-            scope=cfg.diarize_scope,
-            min_speakers=cfg.min_speakers,
-            max_speakers=cfg.max_speakers,
-            return_embeddings=cfg.speaker_embeddings,
-            batch_size=cfg.diarize_batch_size,
-            vram_checks=cfg.vram_checks,
-            vram_headroom_mb=cfg.vram_headroom_mb,
-        )
-        stage.mark_inference_start()
-        items = diarizer.run(
-            items,
-            debug_dir=cfg.debug_dir,
-            load_debug_dir=cfg.load_debug_dir,
-            progress_callback=stage.reporter,
-        )
-    del diarizer
-    flush_vram()
-    return items
-
-
-def _assign_speakers(
-    items: List[ProcessingItem],
-    cfg,
-    debug_dir: Optional[str] = None,
-) -> List[ProcessingItem]:
-    """Label each aligned subsegment with a speaker, where diarization is confident enough.
-
-    Runs outside the diarization StageTimer: it is pure arithmetic over already-computed
-    turns, and it deliberately re-runs on a --load_debug_dir replay so threshold changes
-    take effect without re-diarizing.
-    """
-    from cantocaptions_ai.pipeline.speaker_assign import (
-        SpeakerAssignmentConfig,
-        assign_speakers,
-        format_stats,
-    )
-
-    config = SpeakerAssignmentConfig(
-        min_dominant_share=cfg.speaker_confidence,
-        conflict_share=cfg.speaker_conflict_share,
-        flag_conflicts=cfg.flag_speaker_conflicts,
-    )
-    for item in items:
-        diarization = item.get('diarization')
-        if diarization is None:
-            continue
-        segments = item['result']["segments"]
-        stats = assign_speakers(segments, diarization["turns"], config)
-        logger.info(f"Speaker assignment: {format_stats(stats)}")
-        if debug_dir is not None:
-            write_speaker_assignment_debug(item_name(item), segments, debug_dir)
-    return items
-
-
-def _load_realign_checkpoint(item: dict, realign_path: str, load_debug_dir: Optional[str]):
-    """Cached line placements for *item*, or None if absent or made under other settings."""
-    from cantocaptions_ai.utils.checkpoints import checkpoint_is_current
-    from cantocaptions_ai.utils.debug import load_realign_debug
-
-    if not load_debug_dir:
-        return None
-    name = item_name(item)
-    settings = (item.get("checkpoints") or {}).get("realign")
-    if not checkpoint_is_current(load_debug_dir, name, "realign", settings):
-        return None
-    return load_realign_debug(name, realign_path, load_debug_dir)
-
-
-def _write_realign_checkpoint(item: dict, realign_path: str, timings, lines, debug_dir) -> None:
-    from cantocaptions_ai.utils.checkpoints import write_checkpoint_meta
-    from cantocaptions_ai.utils.debug import write_realign_debug
-
-    if debug_dir is None:
-        return
-    name = item_name(item)
-    write_realign_debug(name, realign_path, timings, lines, debug_dir)
-    settings = (item.get("checkpoints") or {}).get("realign")
-    if settings is not None:
-        write_checkpoint_meta(debug_dir, name, "realign", settings)
-
-
-def _run_realign(
-    items: List[VadItem],
-    realign_path: str,
-    align_model,
-    align_metadata,
-    device: str,
-    *,
-    chunk_size: float,
-    window_seconds: float,
-    commit_margin: float,
-    min_score: float,
-    mode: str = "transcript",
-    cut_policy: str = "drop",
-    max_scale: float = 0.25,
-    adjust_tolerance: float = 2.0,
-    align_padding: float = 0.04,
-    sync_anchor_density: float = 3.0,
-    normalize: bool = True,
-    batch_size: int = 4,
-    vram_checks: bool = True,
-    debug_dir: Optional[str] = None,
-    load_debug_dir: Optional[str] = None,
-    punctuation=None,
-) -> List[ProcessingItem]:
-    """Put a transcript on the timeline and build the next stage's input from it.
-
-    In ``transcript`` and ``adjust`` modes, returns items whose ``vad_segments`` have been
-    *replaced* by chunks re-cut onto the gaps between placed lines, and whose ``result`` holds
-    one segment per chunk carrying that chunk's lines and their cue_spans. Dropping the coarse
-    chunks here also frees their audio, which for a feature-length file is a few hundred MB.
-
-    In ``sync`` mode the cues are already finished -- the transform placed them and nothing
-    downstream is allowed to move them -- so the item carries them directly and is marked
-    ``realign_sync`` so the caller skips alignment entirely.
-    """
-    from cantocaptions_ai.pipeline.align_profiles import DEFAULT_ALIGN_PROFILE
-    from cantocaptions_ai.pipeline.alignment import compute_vad_emissions
-    from cantocaptions_ai.pipeline.realign import (
-        EmissionTimeline, assign_lines, assign_lines_adjust, assign_lines_sync,
-        build_align_input, load_transcript_lines, segments_from_timings, warn_low_confidence,
-    )
-    from cantocaptions_ai.utils.debug import write_realign_transform
-
-    timed = mode in ("sync", "adjust")
-    lines = load_transcript_lines(realign_path, keep_timings=timed, normalize=normalize)
-    # The language's realign punctuation (realign.realign_punctuation); the searches
-    # default to the CJK one when none is given.
-    punct = {"punctuation": punctuation} if punctuation is not None else {}
-    if not normalize:
-        logger.info(
-            "realign: punctuation normalization is off, so the text reaches the subtitle "
-            "exactly as written. Halfwidth marks are not in the align vocabulary and will be "
-            "dropped, so the pauses they stand for go unmodelled."
-        )
-    logger.info(f"Loaded {len(lines)} transcript line(s) from: {realign_path}")
-    if not lines:
-        raise ConfigError(f"realign transcript is empty: {realign_path}")
-    if len(items) > 1:
-        logger.warning(
-            "One transcript is being realigned against %d audio files; --realign takes a "
-            "transcript of a single recording.", len(items),
-        )
-
-    # Give the dictionary a token for the transcript's unknown characters *before* the
-    # coarse search reads it, not after: a line whose every character is invisible to the
-    # trellis can only be placed from its neighbours. Alignment runs the same call later and
-    # finds nothing left to do, which is what keeps the two passes agreeing.
-    repair = align_metadata.get("vocab_repair")
-    if repair is not None:
-        repair.augment(line.text for line in lines)
-
-    profile = align_metadata.get("profile") or DEFAULT_ALIGN_PROFILE
-    result_items: List[ProcessingItem] = []
-    for item in items:
-        vad_segments = item["vad_segments"]
-
-        def compute(segments, _model=align_model):
-            return compute_vad_emissions(
-                segments, _model, align_metadata["type"], align_metadata["processor"], device,
-                batch_size, vram_checks=vram_checks, primer=profile.primer,
-                min_samples=profile.min_samples, dtype=EmissionTimeline.dtype,
-            )
-
-        # One timeline for the whole file, built here and handed to the alignment stage
-        # below: the placements and the final alignment read the same emissions, so the
-        # encoder runs once over the file instead of once per pass.
-        # TODO: run realign and alignment per file. Every file's timeline is built here before
-        # any is aligned, so a batch peaks at the sum of them (~0.5 GB an hour of audio each);
-        # _run_alignment frees each one only after the whole batch has been realigned.
-        timeline = EmissionTimeline(
-            vad_segments, compute, frame_rate=align_metadata.get("frame_rate"))
-
-        common = dict(
-            window_seconds=window_seconds, commit_margin=commit_margin,
-            max_scale_dev=max_scale, cut_policy=cut_policy, **punct,
-        )
-        dropped: frozenset = frozenset()
-        transform = None
-        if mode == "sync":
-            timings, dropped, transform, report = assign_lines_sync(
-                lines, vad_segments, timeline,
-                align_metadata["dictionary"], align_metadata["language"],
-                align_padding=align_padding, target_anchors_per_minute=sync_anchor_density,
-                **common,
-            )
-        elif mode == "adjust":
-            timings, dropped, transform, report = assign_lines_adjust(
-                lines, vad_segments, timeline,
-                align_metadata["dictionary"], align_metadata["language"],
-                tolerance=adjust_tolerance, **common,
-            )
-        else:
-            # The checkpoint holds coarse placements indexed by line number, so it is only
-            # reusable for the mode that produced it. sync and adjust re-fit instead, which
-            # is cheap next to the encoder pass they both still need.
-            timings = _load_realign_checkpoint(item, realign_path, load_debug_dir)
-            if timings is None:
-                timings = assign_lines(
-                    lines, vad_segments, timeline,
-                    align_metadata["dictionary"], align_metadata["language"],
-                    window_seconds=window_seconds, commit_margin=commit_margin, **punct,
-                )
-                _write_realign_checkpoint(item, realign_path, timings, lines, debug_dir)
-
-        warn_low_confidence(timings, lines, min_score)
-        if transform is not None and debug_dir is not None:
-            write_realign_transform(
-                item_name(item), realign_path, mode, lines, timings, transform, report,
-                dropped, debug_dir,
-            )
-
-        if mode == "sync":
-            # Nothing downstream may re-time these: the whole contract of sync is that the
-            # subtitle's own proportions survive, and forced alignment would undo that.
-            segments = segments_from_timings(lines, timings, dropped)
-            result = {"segments": segments, "language": align_metadata["language"]}
-            result_items.append({**item, "result": result, "realign_sync": True})
-            continue
-
-        kept = [line for line in lines if line.index not in dropped]
-        kept_timings = [t for t in timings if t.index not in dropped]
-        chunks, transcript = build_align_input(
-            kept, kept_timings, vad_segments, chunk_size,
-        )
-        result = {"segments": transcript, "language": align_metadata["language"]}
-        result_items.append({
-            **item, "vad_segments": chunks, "result": result,
-            "emission_timeline": timeline,
-        })
-    return result_items
-
-
-def _run_realign_asr(
-    items: List[ProcessingItem],
-    realign_path: str,
-    *,
-    chunk_size: float,
-    normalize: bool = True,
-    debug_dir: Optional[str] = None,
-    load_debug_dir: Optional[str] = None,
-    punctuation=None,
-) -> List[ProcessingItem]:
-    """Time an untimed transcript against the ASR hypothesis (--realign_anchor asr).
-
-    Same output shape as _run_realign, so stage 4 alignment onwards is identical; only the
-    way each line's approximate position was found differs.
-    """
-    from cantocaptions_ai.pipeline.realign import (
-        assign_lines_via_asr, build_align_input, load_transcript_lines,
-    )
-
-    lines = load_transcript_lines(realign_path, normalize=normalize)
-    logger.info(f"Loaded {len(lines)} transcript line(s) from: {realign_path}")
-    if not lines:
-        raise ConfigError(f"realign transcript is empty: {realign_path}")
-
-    out: List[ProcessingItem] = []
-    for item in items:
-        timings = _load_realign_checkpoint(item, realign_path, load_debug_dir)
-        if timings is None:
-            timings = assign_lines_via_asr(
-                lines, item["result"]["segments"], vad_segments=item["vad_segments"],
-                **({"punctuation": punctuation} if punctuation is not None else {}),
-            )
-            _write_realign_checkpoint(item, realign_path, timings, lines, debug_dir)
-        chunks, transcript = build_align_input(
-            lines, timings, item["vad_segments"], chunk_size,
-        )
-        result = {**item["result"], "segments": transcript}
-        out.append({**item, "vad_segments": chunks, "result": result})
-    return out
-
+# The stages' helpers live in pipeline/stages.py; re-exported here, where callers (the worker
+# imports _select_audio_track, the tests several more) have always found them.
+from cantocaptions_ai.pipeline.stages import (  # noqa: E402,F401
+    _VIDEO_EXTENSIONS,
+    _assign_speakers,
+    _extract_timestamps,
+    _load_realign_checkpoint,
+    _pre_align_clean,
+    _run_alignment,
+    _run_diarization,
+    _run_realign,
+    _run_realign_asr,
+    _select_audio_track,
+    _substitution_overrides,
+    _write_realign_checkpoint,
+)
 
 def _offset_result_times(result: dict, offset: float) -> None:
     """Shift every timestamp in *result* forward by *offset* seconds, in place.
@@ -476,29 +64,6 @@ def _offset_result_times(result: dict, offset: float) -> None:
                 token[key] += offset
 
 
-def _pre_align_clean(items: List[ProcessingItem], cleaner) -> List[ProcessingItem]:
-    """Apply the cleaning manifest's ``pre_align`` steps to each ASR segment's text.
-
-    Runs after the ASR (and any correction) cache loads rather than inside the ASR
-    backend, so a --load_debug_dir replay picks up rule edits without re-running ASR.
-    Punctuation added here is what alignment splits sentences on, so a clause comma
-    such as 嘅話， can end one cue and start the next instead of trailing on a line.
-    """
-    changed = 0
-    for item in items:
-        segments = []
-        for seg in item['result']['segments']:
-            text = cleaner.pre_align(seg['text'])
-            if text != seg['text']:
-                changed += 1
-                seg = {**seg, 'text': text}
-            segments.append(seg)
-        item['result']['segments'] = segments
-    if changed:
-        logger.info("Pre-alignment cleaning: updated %d segment(s)", changed)
-    return items
-
-
 def _merge_and_write(
     items: List[ProcessingItem],
     writer,
@@ -517,6 +82,7 @@ def _merge_and_write(
     max_line_width: Optional[int] = None,
     max_line_count: Optional[int] = None,
     merge: bool = True,
+    max_cue_duration: float = 0.0,
     order_cues: bool = False,
     *,
     collect: bool = False,
@@ -568,6 +134,7 @@ def _merge_and_write(
             is_noise=is_noise,
             script=script,
             merge=merge,
+            max_cue_duration=max_cue_duration,
         )
 
         if order_cues and debug_dir is not None:
@@ -694,6 +261,11 @@ def validate_config(cfg) -> None:
     # threshold would otherwise only surface after ASR and alignment have already run.
     if not 0 < cfg.speaker_confidence <= 1:
         raise ConfigError(f"speaker_confidence must be in (0, 1], got {cfg.speaker_confidence}")
+    if cfg.max_cue_duration and cfg.max_cue_duration < 2 * cfg.min_cue_duration:
+        raise ConfigError(
+            f"max_cue_duration must be 0 (no cap) or at least twice min_cue_duration "
+            f"({cfg.min_cue_duration}), got {cfg.max_cue_duration}"
+        )
     if not 0 < cfg.speaker_conflict_share <= 1:
         raise ConfigError(
             f"speaker_conflict_share must be in (0, 1], got {cfg.speaker_conflict_share}"
@@ -708,6 +280,17 @@ def validate_config(cfg) -> None:
         warnings.warn("reference_correction_semantic has no effect without reference_subtitle")
     if cfg.asr_context and not cfg.reference_subtitle:
         raise ConfigError("asr_context requires reference_subtitle")
+    if cfg.asr_context:
+        # Context biasing is a prompt feature of the model family; only some backends have
+        # one. Checked only when asked for, so a plain run never reads a model config here.
+        from cantocaptions_ai.pipeline.asr import backend_for
+        backend = backend_for(cfg.model, cfg.language, cache_dir=cfg.model_dir,
+                              local_files_only=cfg.model_cache_only)
+        if not backend.supports_context:
+            raise ConfigError(
+                f"asr_context is not supported by the {backend.name} ASR backend "
+                "(only qwen3-asr models take a context prompt)"
+            )
     if cfg.asr_context and cfg.asr_context_template not in CONTEXT_TEMPLATES:
         raise ConfigError(
             f"asr_context_template must be one of {sorted(CONTEXT_TEMPLATES)}, "
@@ -816,12 +399,15 @@ def validate_config(cfg) -> None:
             raise ConfigError(f"Unsupported language: {cfg.language}")
     _validate_language_support(cfg)
 
-    if cfg.no_align:
-        for option in ("max_line_count", "max_line_width"):
-            if getattr(cfg, option):
-                raise ConfigError(f"{option} not possible with no_align")
-    if cfg.max_line_count and not cfg.max_line_width:
-        warnings.warn("max_line_count has no effect without max_line_width")
+    # Settings left unset that the language decides (config.LANGUAGE_DEFAULTED). Line
+    # breaking is a text step (cleaning/layout.py), so it applies under --no_align too; the
+    # old rule refusing line limits there dated from writers that split on word timings.
+    from cantocaptions_ai.languages import get_language_pack
+    from cantocaptions_ai.pipeline.config import LANGUAGE_DEFAULTED
+    profile = get_language_pack(cfg.language).resolve(cfg.model)
+    for option, from_profile in LANGUAGE_DEFAULTED.items():
+        if getattr(cfg, option) is None:
+            setattr(cfg, option, from_profile(profile))
 
 
 def _prepare_clips(audio_paths: List[str], cfg):
@@ -907,8 +493,13 @@ def _execute_pipeline(
     display_paths: Optional[dict] = None,
     vad_model=None,
     names: Optional[Dict[str, str]] = None,
+    stages: Optional[Callable] = None,
 ) -> List[ProcessingItem]:
     """Run all pipeline stages for *audio_paths* under *cfg*.
+
+    The stages are ``pipeline.stages.build_stages``'s list for this config, run in order,
+    then cue assembly and writing. ``stages``, a ``(ctx, default_stages) -> stages`` callable,
+    lets a caller insert, replace or drop a stage without editing this function.
 
     Assumes *cfg* has already passed :func:`validate_config`, and that any audio clip
     has already been applied (paths point at clipped temp files; see
@@ -938,15 +529,8 @@ def _execute_pipeline(
 
     # The settings each stage's debug checkpoint must have been made with to be replayed;
     # carried on every item so the stages can check what they read (utils/checkpoints.py).
-    from cantocaptions_ai.utils.checkpoints import checkpoint_is_current, checkpoint_settings
+    from cantocaptions_ai.utils.checkpoints import checkpoint_settings
     checkpoints = checkpoint_settings(cfg)
-
-    def _cached(path: str, stage: str) -> bool:
-        name = name_of[path]
-        return (
-            _debug_stage_exists(name, stage, cfg.load_debug_dir)
-            and checkpoint_is_current(cfg.load_debug_dir, name, stage, checkpoints[stage])
-        )
 
     align_language = cfg.language
 
@@ -1003,7 +587,7 @@ def _execute_pipeline(
         spec = pack.cleaning  # validate_config guarantees one when cleaning is on
         cleaner = SubtitleCleaner(
             rules_dir=cfg.clean_rules_dir or spec.rules_dir,
-            line_max_length=cfg.max_line_width or 21,
+            line_max_length=cfg.max_line_width,
             max_line_count=cfg.max_line_count,
             # How much cleaning the text needs depends on how the model writes it, so the
             # step manifest comes from the model's conventions like every other output one.
@@ -1033,56 +617,10 @@ def _execute_pipeline(
                 ", ".join(name_of[ap] for ap in missing),
             )
 
+    realign_punct = None
     if cfg.realign:
-        from cantocaptions_ai.pipeline.realign import (
-            enforce_cue_order, ensure_visible_cues, realign_punctuation, strip_sentinels,
-            tighten_cue_spans, warn_on_implausible_cues,
-        )
+        from cantocaptions_ai.pipeline.realign import realign_punctuation
         realign_punct = realign_punctuation(profile.punctuation, profile.script)
-    realign_acoustic = bool(cfg.realign) and cfg.realign_anchor == "acoustic"
-    need_asr = not realign_acoustic and (
-        not cfg.load_debug_dir or any(
-            not _cached(ap, "transcription") for ap in audio_paths
-        )
-    )
-    vocal_isolation_active = (
-        bool(cfg.vocal_isolation_method) and cfg.vocal_isolation_method.lower() != "none"
-    )
-    # A cached vocal isolation checkpoint makes that file's VAD stage entirely dead
-    # weight: the isolation manifest carries the same segment boundaries, its WAVs
-    # carry the audio ASR actually consumes, and stage 2 replaces vad_segments
-    # wholesale — so reading the VAD WAVs back would only be thrown away.
-    isolation_cached = [
-        vocal_isolation_active
-        and bool(cfg.load_debug_dir)
-        and _cached(ap, "vocal_isolation")
-        for ap in audio_paths
-    ]
-    vad_indices = [i for i, cached in enumerate(isolation_cached) if not cached]
-    need_vad = any(
-        not cfg.load_debug_dir
-        or not _cached(audio_paths[i], "vad")
-        for i in vad_indices
-    )
-    need_vocal_isolation = vocal_isolation_active and not all(isolation_cached)
-    need_ensemble = (
-        cfg.ensemble_model != "none"
-        and (not cfg.load_debug_dir or any(
-            not _cached(ap, "ensemble") for ap in audio_paths
-        ))
-    )
-    need_llm = (
-        cfg.llm_correction
-        and (not cfg.load_debug_dir or any(
-            not _cached(ap, "llm_correction") for ap in audio_paths
-        ))
-    )
-    need_diarize = (
-        cfg.diarize
-        and (not cfg.load_debug_dir or any(
-            not _cached(ap, "diarization") for ap in audio_paths
-        ))
-    )
 
     summary = TranscriptionSummary(enabled=cfg.print_progress)
     process_start = time.perf_counter()
@@ -1109,382 +647,29 @@ def _execute_pipeline(
                 "files; the cues can only be correct for one of them"
             )
 
-    # Stage 1: VAD
-    # Files covered by a cached vocal isolation checkpoint are held back entirely
-    # (see isolation_cached above); they enter stage 2 as bare carriers and get their
-    # vad_segments from the isolation cache.
+    from cantocaptions_ai.pipeline.stages import (
+        RunContext, build_stages, describe_plan, plan_entries, run_stages,
+    )
+    ctx = RunContext(
+        cfg=cfg, audio_paths=list(audio_paths), name_of=name_of, checkpoints=checkpoints,
+        pack=pack, profile=profile, align_model_name=align_model_name, summary=summary,
+        progress=progress, display_paths=display_paths, vad_model=vad_model,
+        qwen_threads=qwen_threads, reference_cues=reference_cues, realign_mode=realign_mode,
+        realign_punct=realign_punct, cleaner=cleaner, layout=layout,
+    )
+    stage_list = build_stages(ctx)
+    if stages is not None:
+        stage_list = list(stages(ctx, stage_list))
+    logger.info("Pipeline: %s", describe_plan(ctx, stage_list))
+    # A sink that wants the whole plan up front (a UI's stage list) says so with plan().
+    send_plan = getattr(progress, "plan", None)
+    if callable(send_plan):
+        send_plan(plan_entries(ctx, stage_list))
+
     items: List[dict] = [
         {'audio_path': p, 'name': name_of[p], 'checkpoints': checkpoints} for p in audio_paths
     ]
-    if len(vad_indices) < len(audio_paths):
-        logger.info(
-            "Skipping VAD for %d of %d file(s) already covered by cached vocal isolation",
-            len(audio_paths) - len(vad_indices), len(audio_paths),
-        )
-    if vad_indices:
-        with StageTimer("VAD", summary, progress=progress) as stage:
-            vad_items = [
-                {
-                    'audio_path': audio_paths[i],
-                    'name': name_of[audio_paths[i]],
-                    'checkpoints': checkpoints,
-                    # A clip's temp WAV holds only the track already chosen for it.
-                    'audio_track': _select_audio_track(
-                        audio_paths[i], cfg.language,
-                        None if audio_paths[i] in (display_paths or {}) else cfg.audio_track,
-                    ),
-                    'audio_downmix': cfg.audio_downmix,
-                    'audio_normalize': cfg.audio_normalize,
-                }
-                for i in vad_indices
-            ]
-            if need_vad:
-                from cantocaptions_ai.pipeline.vad import load_vad
-                # A caller (e.g. PipelineService in resident mode) may pass a preloaded
-                # VAD model to reuse across jobs — load_vad reuses it and ignores
-                # vad_method. It stays alive via the caller's reference after the
-                # processor wrapper is dropped below, skipping the ~20-30s reload.
-                vad_processor = load_vad(
-                    vad_method=cfg.vad_method,
-                    device=cfg.device,
-                    device_index=cfg.device_index,
-                    vad_onset=cfg.vad_onset,
-                    vad_offset=cfg.vad_offset,
-                    vad_pad_onset=cfg.vad_pad_onset,
-                    vad_pad_offset=cfg.vad_pad_offset,
-                    vad_min_duration_off=cfg.vad_min_duration_off,
-                    chunk_size=cfg.chunk_size,
-                    vad_model=vad_model,
-                    use_auth_token=cfg.hf_token,
-                    reference_cues=(
-                        reference_cues
-                        if cfg.asr_context and cfg.asr_context_vad_expand
-                        else None
-                    ),
-                    reference_padding=cfg.asr_context_padding,
-                    # --realign holds a transcript line for every utterance, including ones
-                    # VAD scores below threshold, so segmentation may only choose cut points
-                    # -- it may not decide what to keep. See Vad.cover_chunks. This applies
-                    # under both anchors: the 'asr' anchor pays for transcribing the whole
-                    # file rather than just its speech, but in exchange the chunks it hands
-                    # to alignment cover the audio with no gaps (and carry vocal isolation
-                    # throughout), which is what the final chunk re-cut assumes.
-                    cover_all=bool(cfg.realign),
-                )
-                stage.mark_inference_start()
-                vad_out = vad_processor.run(vad_items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
-                del vad_processor
-            else:
-                vad_out = VadProcessor.load_cache(vad_items, cfg.load_debug_dir)
-        for i, out in zip(vad_indices, vad_out):
-            items[i] = out
-        flush_vram()
-
-    # Stage 2: Vocal Isolation (conditional)
-    if need_vocal_isolation:
-        with StageTimer("Vocal isolation", summary, progress=progress) as stage:
-            from cantocaptions_ai.pipeline.vocal_isolation import load_vocal_isolation
-            vocal_isolation_processor = load_with_offline_fallback(
-                load_vocal_isolation,
-                model_name=cfg.vocal_isolation_method,
-                device=cfg.device,
-                device_index=cfg.device_index,
-                batch_size=cfg.vocal_isolation_batch_size,
-                compute_type=cfg.vocal_isolation_compute_type,
-                vram_checks=cfg.vram_checks,
-                model_dir=cfg.model_dir,
-                local_files_only=cfg.model_cache_only,
-                segment_mode=cfg.vocal_isolation_segment_mode,
-            )
-            stage.mark_inference_start()
-            items = vocal_isolation_processor.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
-            del vocal_isolation_processor
-    elif vocal_isolation_active and cfg.load_debug_dir:
-        # All files' isolated audio is cached: load it so downstream ASR sees the
-        # isolated (not raw) audio even if ASR itself is being recomputed.
-        from cantocaptions_ai.pipeline.vocal_isolation import MbRoformerProcessor
-        items = MbRoformerProcessor.load_cache(items, cfg.load_debug_dir)
-
-    flush_vram()
-
-    if realign_acoustic:
-        # Realign, acoustic anchor: the transcript is known and complete, only its timings
-        # are missing. The alignment model does both jobs -- a coarse sliding search for
-        # where each line sits, then forced alignment for the timings within a line. The
-        # 'asr' anchor takes the ordinary ASR path below and rejoins at stage 4.
-        with StageTimer("Transcript realignment", summary, progress=progress) as stage:
-            from cantocaptions_ai.pipeline.alignment import load_align_model
-            align_model, align_metadata = load_with_offline_fallback(
-                load_align_model,
-                align_language, cfg.device, cfg.device_index,
-                model_name=align_model_name, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
-                compute_type=cfg.align_compute_type,
-                vram_checks=cfg.vram_checks,
-                char_substitution=cfg.align_char_substitution,
-                substitution_overrides=_substitution_overrides(cfg),
-            )
-            stage.mark_inference_start()
-            items = _run_realign(
-                items, cfg.realign, align_model, align_metadata, cfg.device,
-                chunk_size=cfg.chunk_size,
-                window_seconds=cfg.realign_window,
-                commit_margin=cfg.realign_commit_margin,
-                min_score=cfg.realign_min_score,
-                mode=realign_mode,
-                cut_policy=cfg.realign_cut_policy,
-                max_scale=cfg.realign_max_scale,
-                adjust_tolerance=cfg.realign_adjust_tolerance,
-                align_padding=cfg.align_padding,
-                sync_anchor_density=cfg.realign_sync_anchor_density,
-                normalize=cfg.realign_normalize,
-                batch_size=cfg.align_batch_size,
-                vram_checks=cfg.vram_checks,
-                debug_dir=cfg.debug_dir,
-                load_debug_dir=cfg.load_debug_dir,
-                punctuation=realign_punct,
-            )
-            # Mode sync's cues are finished: the transform placed them, and the guarantee it
-            # makes -- that the subtitle's own proportions survive exactly -- is only true if
-            # nothing re-times them afterwards. So alignment and its fixups are skipped
-            # rather than run and then overridden.
-            pending = [item for item in items if not item.get("realign_sync")]
-            if pending:
-                aligned = _run_alignment(
-                    pending, align_model, align_metadata, cfg.device,
-                    cfg.align_padding, cfg.align_release, cfg.interpolate_method,
-                    cfg.return_char_alignments, cfg.print_progress, cfg.align_batch_size,
-                    progress_callback=stage.reporter,
-                    vram_checks=cfg.vram_checks,
-                    spotchecks=profile.spotchecks,
-                    # 0, not cfg.align_split_gap: under --realign the transcript's line
-                    # breaks are the cue boundaries and a cue is one whole line by contract,
-                    # so nothing here may break one in two -- not even an align profile that
-                    # asked for it on the ASR path.
-                    split_gap=0,
-                    script=profile.script,
-                    # Not profile.punctuation: realign needs the space, the newline and the
-                    # line sentinel to be pause tokens, and declares its cue boundaries
-                    # through cue_spans rather than letting punctuation derive them.
-                    punctuation=realign_punct,
-                )
-                by_path = {item["audio_path"]: item for item in aligned}
-                items = [by_path.get(item["audio_path"], item) for item in items]
-            for item in items:
-                if item.get("realign_sync"):
-                    # No words and no sentinels to tidy; only the two validity guarantees.
-                    ensure_visible_cues(item["result"]["segments"])
-                    continue
-                segments = item["result"]["segments"]
-                tighten_cue_spans(segments)
-                ensure_visible_cues(segments)
-                strip_sentinels(segments)
-        del align_model, align_metadata
-        flush_vram()
-    else:
-        # Attach ASR context here rather than at VAD time: both the VAD and vocal
-        # isolation debug round-trips rebuild segment dicts from scratch and would drop
-        # the key, and this point is downstream of both cache loads. Contexts are cheap
-        # and always re-derived, so --asr_context_template edits take effect on replay.
-        if cfg.asr_context and reference_cues:
-            from cantocaptions_ai.pipeline.reference_context import build_segment_contexts
-            for item in items:
-                spans = None
-                if cfg.asr_context_scope == "expanded":
-                    # Provenance recorded at VAD time and carried through the debug
-                    # manifests; absent means this segment is entirely VAD's own find.
-                    spans = [
-                        sp for seg in item['vad_segments'] for sp in seg.get('expanded', ())
-                    ]
-                contexts = build_segment_contexts(
-                    item['vad_segments'],
-                    reference_cues,
-                    neighbours=cfg.asr_context_neighbours,
-                    template=cfg.asr_context_template,
-                    max_chars=cfg.asr_context_max_chars,
-                    restrict_to_spans=spans,
-                )
-                item['vad_segments'] = [
-                    {**seg, 'context': ctx}
-                    for seg, ctx in zip(item['vad_segments'], contexts)
-                ]
-                if cfg.asr_context_scope == "expanded" and cfg.asr_context_template != "none":
-                    logger.info(
-                        "ASR context: scope 'expanded' -- %d of %d segment(s) carry a "
-                        "context over reference-recovered audio; the rest decode bare",
-                        sum(1 for c in contexts if c), len(contexts),
-                    )
-                elif cfg.asr_context_template == "none":
-                    logger.info(
-                        "ASR context: template 'none' -- %d segment(s) decode without a "
-                        "context prompt; the reference subtitle affected the VAD "
-                        "timeline only", len(contexts),
-                    )
-                else:
-                    logger.info(
-                        "ASR context: %d of %d segment(s) biased by the reference subtitle",
-                        sum(1 for c in contexts if c), len(contexts),
-                    )
-
-        # Stage 3: Transcription
-        if need_asr:
-            from cantocaptions_ai.pipeline.asr import load_model
-            with StageTimer("Transcription", summary, progress=progress) as stage:
-                with model_scope(
-                    load_model,
-                    profile.model,
-                    normalization=profile.normalization,
-                    device=cfg.device,
-                    device_index=cfg.device_index,
-                    download_root=cfg.model_dir,
-                    compute_type=cfg.asr_compute_type,
-                    attn_implementation=cfg.attn_implementation,
-                    language=cfg.language,
-                    local_files_only=cfg.model_cache_only,
-                    threads=qwen_threads,
-                    use_auth_token=cfg.hf_token,
-                    batch_size=cfg.batch_size,
-                    compile_enabled=cfg.compile,
-                    print_progress=cfg.print_progress,
-                    verbose=cfg.verbose,
-                    vram_checks=cfg.vram_checks,
-                    vram_headroom_mb=cfg.vram_headroom_mb,
-                ) as model:
-                    stage.mark_inference_start()
-                    items = model.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
-                    # Drop this frame's reference so model_scope's exit frees the model; a
-                    # name bound by `as` outlives the block and held the ASR model on the
-                    # GPU through alignment and diarization.
-                    del model
-        else:
-            from cantocaptions_ai.pipeline.asr import QwenPipeline
-            items = QwenPipeline.load_cache(items, cfg.load_debug_dir)
-
-        # Stage 3b: Ensemble ASR (optional)
-        if cfg.ensemble_model != "none":
-            if need_ensemble:
-                from cantocaptions_ai.pipeline.ensemble import load_faster_whisper
-                with StageTimer("Ensemble ASR (faster-whisper)", summary, progress=progress) as stage:
-                    with model_scope(
-                        load_faster_whisper,
-                        device=cfg.device,
-                        device_index=cfg.device_index,
-                        model_dir=cfg.model_dir,
-                        local_files_only=cfg.model_cache_only,
-                        language=cfg.language,
-                    ) as ensemble:
-                        stage.mark_inference_start()
-                        items = ensemble.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
-                        del ensemble  # see the ASR stage
-            else:
-                from cantocaptions_ai.pipeline.ensemble import FasterWhisperEnsemble
-                items = FasterWhisperEnsemble.load_cache(items, cfg.load_debug_dir)
-
-        # Stage 3c: LLM correction (optional)
-        if cfg.llm_correction:
-            if reference_cues:
-                from cantocaptions_ai.pipeline.llm_correction import match_reference_to_segments
-                with StageTimer("Reference subtitle matching", summary, progress=progress):
-                    for item in items:
-                        item['reference_texts'] = match_reference_to_segments(
-                            item['result']['segments'], reference_cues
-                        )
-
-            if need_llm:
-                from cantocaptions_ai.pipeline.llm_correction import load_llm
-                if cfg.vram_checks:
-                    stats = vram_stats()
-                    if stats:
-                        logger.info(
-                            f"VRAM before LLM load: allocated={stats['allocated_mb']:.0f} MB, "
-                            f"reserved={stats['reserved_mb']:.0f} MB, "
-                            f"free={stats['free_mb']:.0f} MB / {stats['total_mb']:.0f} MB"
-                        )
-                with StageTimer("LLM correction", summary, progress=progress) as stage:
-                    with model_scope(
-                        load_llm,
-                        model_id=cfg.llm_model,
-                        model_dir=cfg.llm_model_dir,
-                        device=cfg.device,
-                        local_files_only=cfg.model_cache_only,
-                        semantic_mode=cfg.reference_correction_semantic,
-                        attn_implementation=cfg.attn_implementation,
-                        vram_checks=cfg.vram_checks,
-                        language=cfg.language,
-                    ) as corrector:
-                        stage.mark_inference_start()
-                        items = corrector.run(items, debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir, progress_callback=stage.reporter)
-                        del corrector  # see the ASR stage
-            else:
-                from cantocaptions_ai.pipeline.llm_correction import LLMCorrector
-                items = LLMCorrector.load_cache(items, cfg.load_debug_dir)
-
-        # The transcript replaces the ASR hypothesis here: ASR ran only to say *where* each
-        # line is, and from this point on the pipeline is identical to the acoustic anchor.
-        if cfg.realign:
-            with StageTimer("Transcript matching", summary, progress=progress):
-                items = _run_realign_asr(
-                    items, cfg.realign, chunk_size=cfg.chunk_size,
-                    normalize=cfg.realign_normalize,
-                    debug_dir=cfg.debug_dir, load_debug_dir=cfg.load_debug_dir,
-                    punctuation=realign_punct,
-                )
-
-        # Not under --realign: the transcript's cue_spans index its text, so inserting a
-        # character would shift every span after it -- and that text is the user's anyway.
-        if cleaner is not None and not cfg.realign:
-            items = _pre_align_clean(items, cleaner)
-
-        # Stage 4: Alignment
-        if not cfg.no_align:
-            with StageTimer("Alignment", summary, progress=progress) as stage:
-                from cantocaptions_ai.pipeline.alignment import load_align_model
-                align_model, align_metadata = load_with_offline_fallback(
-                    load_align_model,
-                    align_language, cfg.device, cfg.device_index,
-                    model_name=align_model_name, model_dir=cfg.model_dir, model_cache_only=cfg.model_cache_only,
-                    compute_type=cfg.align_compute_type,
-                    vram_checks=cfg.vram_checks,
-                    char_substitution=cfg.align_char_substitution,
-                    substitution_overrides=_substitution_overrides(cfg),
-                )
-                stage.mark_inference_start()
-                items = _run_alignment(
-                    items, align_model, align_metadata, cfg.device,
-                    cfg.align_padding, cfg.align_release, cfg.interpolate_method,
-                    cfg.return_char_alignments, cfg.print_progress, cfg.align_batch_size,
-                    progress_callback=stage.reporter,
-                    vram_checks=cfg.vram_checks,
-                    spotchecks=profile.spotchecks,
-                    punctuation=(
-                        realign_punct if cfg.realign else profile.punctuation
-                    ),
-                    # See the realign call site above for why this is forced off there.
-                    split_gap=0 if cfg.realign else cfg.align_split_gap,
-                    script=profile.script,
-                )
-                if cfg.realign:
-                    for item in items:
-                        segments = item["result"]["segments"]
-                        tighten_cue_spans(segments)
-                        # Order first: ensure_visible_cues reads the previous cue's end as
-                        # its floor, which is only meaningful once the cues are in order.
-                        enforce_cue_order(segments)
-                        ensure_visible_cues(segments)
-                        strip_sentinels(segments)
-                        # Last: the cue text has to be final before its span can be judged
-                        # against what that text could have been spoken in.
-                        warn_on_implausible_cues(segments)
-            del align_model, align_metadata
-            flush_vram()
-        else:
-            items = _extract_timestamps(items)
-
-    # Stage 5: Diarization. Runs after alignment so speaker turns land on the over-split
-    # subsegments that cue assembly is about to merge back together, which is what lets
-    # segmentation._same_speaker veto a merge across a speaker change.
-    if cfg.diarize:
-        items = _run_diarization(items, cfg, summary, progress, need_diarize)
-        items = _assign_speakers(items, cfg, debug_dir=cfg.debug_dir)
+    items = run_stages(ctx, stage_list, items)
 
     # Write and/or collect final results
     results = _merge_and_write(
@@ -1503,6 +688,7 @@ def _execute_pipeline(
         # are not an artifact to be undone, so the two passes that join cues are off; the
         # noise drop and the duration floor still run.
         merge=not cfg.realign,
+        max_cue_duration=cfg.max_cue_duration,
         order_cues=bool(cfg.realign),
         collect=collect, audio_start_offset=audio_start_offset, display_paths=display_paths,
     )

@@ -22,20 +22,14 @@ Cantonese. The target written Cantonese standard is the [CantoCaptions standard]
 ```bash
 git clone https://github.com/rookes/cantocaptions-ai
 cd cantocaptions-ai
-uv sync --extra transformers_qwen
+uv sync
 ```
 
-This installs all dependencies plus the recommended ASR backend into an isolated virtual
-environment and pins exact versions. Torch is pulled from the PyTorch CUDA 12.8 index on Linux and
-Windows; the CPU build is used on macOS.
-
-Note that bare `uv sync` does **not** install a working ASR backend. You need to pick one
-explicitly:
-
-```bash
-uv sync --extra transformers_qwen   # ASR via official transformers Qwen3-ASR support (recommended)
-uv sync --extra legacy              # ASR via the older qwen_asr package; mutually exclusive with transformers_qwen
-```
+This installs all dependencies into an isolated virtual environment and pins exact versions; every ASR
+family (Qwen3-ASR, Whisper, CTC) runs on it. Torch is pulled from the PyTorch CUDA 12.8 index on Linux
+and Windows; the CPU build is used on macOS. Optional extras: `compile` (triton, for `--compile`),
+`ensemble`, `llm`, `flash-attn`, or `full` for all of them. `transformers_qwen` is the old name of
+`compile` and still works.
 
 ## Basic Usage
 
@@ -54,13 +48,17 @@ process a whole folder (and `--recursive` to include its subfolders). Output mir
 tree, so `DIR/s1/ep01.mkv` and `DIR/s2/ep01.mkv` become `output/s1/ep01.srt` and `output/s2/ep01.srt`.
 
 You can configure more extensively using command-line flags (see below), but, more conveniently, you can also
-**put your own defaults in `config/user.cfg`** (not tracked by git; same format as `config/default.cfg`,
-holding only the keys you want to change). Settings are layered, each overriding the one before:
+**put your own defaults in `user.cfg`** in your config directory (`config/` in the repo, which git
+ignores; `~/.config/cantocaptions-ai/` for a pip install; or wherever `$CANTOCAPTIONS_CONFIG_DIR` points).
+It has the same format as the shipped [`default.cfg`](cantocaptions_ai/presets/default.cfg), holding only
+the keys you want to change, either in one `[pipeline]` block or grouped by section (`[vad]`, `[alignment]`,
+... the same groups as `--help`). Settings are layered, each overriding the one before:
 
 1. built-in defaults
-2. `config/default.cfg` (tracked; documents the shipped defaults), or the file picked with `--cfg NAME`
-   (for example `--cfg cpu` for `config/cpu.cfg`)
-3. `config/user.cfg`
+2. `default.cfg` (shipped with the package; documents the defaults), or the preset picked with
+   `--cfg NAME` (for example `--cfg cpu`, `--cfg fast_test`). A file of the same name in your config
+   directory takes its place
+3. `user.cfg`
 4. the `--vocal_isolation` / `--asr` / `--align` presets
 5. flags you type
 
@@ -98,6 +96,20 @@ non-standard written Cantonese, both of these models are put through extensive p
 Post-processing includes using the alignment model as a phonetic guide to check for certain variants 
 such as gam2 噉 vs. gam3 咁.
 
+`model` also takes any Hugging Face hub id or local checkpoint path, and the ASR backend follows from the
+checkpoint's own `config.json`:
+
+| Family | Examples | Notes |
+|---|---|---|
+| Qwen3-ASR | the models above | The only backend that takes `--asr_context`. |
+| Whisper | `whisper-large-v3`, `whisper-large-v3-turbo`, or any Whisper checkpoint | Forced to transcribe in `--language`. Under Cantonese it gets the same post-processing as stock Qwen3-ASR. It punctuates little, so the end of each phrase it times is written as a comma. |
+| CTC (wav2vec2 family) | `alvanlii/wav2vec2-BERT-cantonese`; wav2vec2, wav2vec2-BERT, HuBERT, WavLM checkpoints | Decoded greedily. These models write no punctuation, so each pause of 0.3 s or more is written as a comma. |
+
+Those commas are what give the pipeline somewhere to break cues; without them, each speech chunk (up to 28 s)
+would be a single cue.
+
+Only the fine-tune is tuned for Cantonese subtitles; the others are there for other languages, and for comparison.
+
 ### Speech detection (VAD)
 
 Before transcribing, the pipeline finds where the speech in the audio is and cuts it into chunks. Three 
@@ -119,8 +131,9 @@ important settings to adjust if there are issues with dropped speech:
   more speech than pyannote.
 
 Both models' scores go through the same thresholds, padding and chunking, but they are calibrated
-differently: the `vad_*` values in `config/default.cfg` are tuned for pyannote and the ones in
-`config/cpu.cfg` for silero, so copy the whole set when switching models.
+differently: the `vad_*` values in the default config are tuned for pyannote and the ones in
+the `cpu` preset (`cantocaptions_ai/presets/cpu.cfg`) for silero, so copy the whole set when switching
+models.
 
 ### Vocal isolation
 
@@ -138,7 +151,11 @@ By default, the model used is [alvanlii's wav2vec2-BERT model for Cantonese](htt
 After alignment, subtitles are split and re-merged to maintain output standards. Line segmentation can be manipulated with:
 
 * `min_cue_duration` — the shortest subtitle allowed before it is merged into a neighbour
-* `max_line_width` / `max_line_count` (default: 18 / 2) — control forced line breaks and how text is wrapped
+* `max_cue_duration` (default: 4) — the longest a subtitle may run: neighbours are not merged past it, and a
+  longer cue (usually a clause the ASR never punctuated) is cut at its longest internal pause. `0` turns it off
+* `max_line_width` / `max_line_count` (default: the language's width / 2) — control forced line breaks and how text is
+  wrapped. Unset, the width is the language's own: 18 characters for Chinese, 42 for space-separated scripts. `0` never
+  breaks a line
 
 More extensive text processing, such as OpenCC simplified -> traditional options and regex substitutions, are configurable via .toml
 files in `cantocaptions_ai/languages/yue/rules/` (point `--clean_rules_dir` at a copy to use your own).
@@ -176,7 +193,7 @@ uv run cantocaptions_ai video.mkv --hf_token hf_...
 ```
 
 You can also set the `HF_TOKEN` environment variable. Prefer either over putting the token in a
-config file; if you must, use the untracked `config/user.cfg`, never `config/default.cfg`.
+config file; if you must, use your untracked `user.cfg`, never a shipped preset.
 
 To fetch the model weights ahead of time rather than on first run:
 
@@ -250,7 +267,7 @@ known-good SRT, realigns its text, and reports how far each cue landed from wher
 Run the test suite (CPU only; no model downloads):
 
 ```bash
-uv sync --extra transformers_qwen --group dev
+uv sync --group dev
 uv run pytest
 ```
 
@@ -265,10 +282,18 @@ cantocaptions-dataset test-split clips into episodes with an exact reference SRT
 
 ### Architecture
 
-The pipeline (`cantocaptions_ai/pipeline/transcribe.py`, `_execute_pipeline`) runs a fixed sequence of
-stages over every input file: VAD → vocal isolation (optional) → ASR → ensemble / LLM correction
-(optional) → forced alignment → diarization (optional) → cue assembly and text cleaning → writers.
-Each model-backed stage is a `PipelineStage` (`utils/model_utils.py`) with its own debug checkpoint.
+The pipeline runs a list of stages over every input file: VAD → vocal isolation (optional) → ASR →
+ensemble / LLM correction (optional) → forced alignment → diarization (optional), then cue assembly, text
+cleaning and the writers. The stages are objects in `cantocaptions_ai/pipeline/stages.py`; `build_stages`
+picks the ones a config needs, and `_execute_pipeline` (`pipeline/transcribe.py`) runs them in order after
+logging the plan, e.g. `Pipeline: VAD [cached] → Transcription [compute] → Alignment`. A model stage with a
+debug checkpoint (`CachedStage`) computes, or reads every file back from `--load_debug_dir` when all of them
+have a current checkpoint. Each model itself is a `PipelineStage` (`utils/model_utils.py`).
+
+To add a stage, subclass `Stage` (`run(ctx, items) -> items`, plus `active(ctx)` if it is optional) or
+`CachedStage` (`compute` and `from_cache`, plus a `checkpoint` key in `utils/checkpoints.py`), and add it
+to `DEFAULT_STAGES` where it belongs. A caller can also pass `_execute_pipeline(..., stages=fn)`, where
+`fn(ctx, default_stages)` returns the list to run, to insert or replace one without editing the package.
 
 Everything that depends on the language is gathered into one **language pack** per language
 (`cantocaptions_ai/languages/`): how it is written (`ScriptConfig`, `PunctuationConfig` from
@@ -280,11 +305,18 @@ is `languages/yue/`; the old `cantocaptions_ai.cantonese` import paths still wor
 
 Behaviour that depends on a particular model rather than a language is looked up per model:
 
-* `pipeline/model_profiles.py` — per ASR model: where its weights are, and which languages it is trained for.
+* `pipeline/model_profiles.py` — per ASR model: where its weights are, which backend runs it, and which
+  languages it is trained for. The backends (Qwen3-ASR, Whisper, CTC) are registered in `pipeline/asr.py`
+  (`ASR_BACKENDS`); an unregistered model's backend is read from its checkpoint's `model_type`.
 * `pipeline/align_profiles.py` — per alignment model: audio primer, hand-picked character substitutions
-  and the default substitution level (Jyutping homophones only for the Cantonese model), internal-gap
+  and the default substitution level (homophones only for the Cantonese model), internal-gap
   splitting, minimum input length. The model's own processor and emission frame rate come with it from
   `load_align_model`.
+* `pipeline/align_backends.py` — how each family of alignment model is loaded and run: any Hugging Face CTC
+  checkpoint (batched), or a torchaudio pipeline bundle by name. The family is read from the model itself.
+
+Substituting a character the align model has no token for (its variant form, or a homophone) needs to know
+how the language sounds, so that comes from the language pack (`char_readings`; Jyutping for Cantonese).
 
 Text cleaning is a language-independent engine (`cantocaptions_ai/cleaning/`: a manifest of TOML regex rule
 files and coded builtin steps) that each pack supplies with rules; cue assembly, alignment, realign and line

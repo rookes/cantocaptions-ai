@@ -52,21 +52,21 @@ from cantocaptions_ai.pipeline.align_vocab import (
     substitution_notes,
 )
 
-from cantocaptions_ai.utils.log_utils import get_logger
-from cantocaptions_ai.utils.model_utils import (
-    BatchExecutor,
-    check_vram_headroom,
-    ensure_hf_model_downloaded,
-    guard_model_load,
-    resolve_torch_compute_dtype,
+# How each model family is loaded and run lives in align_backends; the helpers are
+# re-exported here, where callers (and the tests) have always found them.
+from cantocaptions_ai.pipeline.align_backends import (  # noqa: F401
+    ALIGN_BACKENDS,
+    _compute_vad_emissions_batched,
+    _input_key,
+    _passes_attention_mask,
+    _warn_alignment_vram,
+    align_backend_for,
+    get_align_backend,
 )
+from cantocaptions_ai.utils.log_utils import get_logger
+from cantocaptions_ai.utils.model_utils import resolve_torch_compute_dtype
 
 logger = get_logger(__name__)
-
-# Rough fp32 params + activation footprint for wav2vec2-BERT-cantonese; used only for
-# the preflight VRAM-headroom warning, not an exact bound.
-_ALIGN_MODEL_VRAM_ESTIMATE_MB = 1200
-_ALIGN_REMEDIATION = "pass --no_align to skip alignment, or free VRAM used by other processes/stages"
 
 # One 25 ms fbank frame at 16 kHz: the shortest audio the aligner's feature extractor turns
 # into anything. Below 400 samples it yields no frames, and below 240 it raises. The default
@@ -312,40 +312,8 @@ def _run_model_inference(
     device: str,
     lengths=None,
 ) -> torch.Tensor:
-    """Single forward pass returning log-softmax emissions."""
-    model_dtype = next(model.parameters()).dtype
-    with torch.inference_mode():
-        if model_type == "torchaudio":
-            emissions, _ = model(audio.to(device, dtype=model_dtype), lengths=lengths)
-        elif model_type == "huggingface":
-            if processor is not None:
-                features = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-                inputs = features[_input_key(processor)]
-                emissions = model(inputs.to(device, dtype=model_dtype)).logits
-            else:
-                emissions = model(audio.to(device, dtype=model_dtype)).logits
-        else:
-            raise NotImplementedError(f"Align model of type {model_type} not supported.")
-        return torch.log_softmax(emissions, dim=-1)
-
-
-def _input_key(processor) -> str:
-    """The model input a processor produces: ``input_features`` for wav2vec2-BERT (log-mel
-    fbank frames), ``input_values`` for plain wav2vec2 (normalised raw samples)."""
-    names = getattr(processor, "model_input_names", None)
-    return names[0] if names else "input_features"
-
-
-def _passes_attention_mask(processor) -> bool:
-    """Whether the model should be *given* the padding mask.
-
-    The mask is always requested -- its row sums are each segment's real length -- but the
-    HF convention is that a feature extractor with ``return_attention_mask=False`` belongs to
-    a model that must not see one (wav2vec2-base and other group-norm checkpoints, which are
-    trained on zero-padded batches and degrade when masked).
-    """
-    extractor = getattr(processor, "feature_extractor", processor)
-    return bool(getattr(extractor, "return_attention_mask", True))
+    """Single forward pass returning log-softmax emissions, by the model's backend."""
+    return get_align_backend(model_type).forward(model, processor, audio, device, lengths=lengths)
 
 
 def _get_blank_id(model_dictionary: dict) -> int:
@@ -476,205 +444,6 @@ def _find_vad_segment_idx(vad_segments: List[VadAudioSegment], t: float) -> Opti
     return None
 
 
-def _compute_vad_emissions_sequential(
-    vad_segments: List[VadAudioSegment],
-    model: torch.nn.Module,
-    model_type: str,
-    processor,
-    device: str,
-    dtype: Optional[torch.dtype] = None,
-) -> List[Tuple[torch.Tensor, float]]:
-    """Run inference on each VAD segment one at a time.
-
-    Used only for torchaudio bundles, which have no processor to batch through; every
-    Hugging Face model takes _compute_vad_emissions_batched.
-    """
-    results = []
-    for vad_seg in vad_segments:
-        seg_audio = vad_seg["audio"]
-        if not torch.is_tensor(seg_audio):
-            seg_audio = torch.from_numpy(seg_audio)
-        if len(seg_audio.shape) == 1:
-            seg_audio = seg_audio.unsqueeze(0)
-
-        emissions = _run_model_inference(model, model_type, seg_audio, processor, device)
-        emission = emissions[0].detach().to("cpu", dtype=dtype)
-        vad_duration = vad_seg["end"] - vad_seg["start"]
-        frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
-        results.append((emission, frame_rate))
-    return results
-
-
-def _warn_alignment_vram(input_features: torch.Tensor, model: torch.nn.Module, device: str) -> None:
-    """Estimate one batch's peak VRAM use from its actual (padded) shape and log it
-    against real headroom — mirrors _asr_native.py's _warn_vram, but for a
-    bidirectional CTC encoder with no KV-cache instead of autoregressive generation.
-    The caller guards on ``vram_checks`` so this (including the estimate math) is
-    skipped entirely when checks are off.
-
-    Rough proxy, not an exact bound: the padded input tensor itself, plus one
-    conformer layer's transient self-attention score matrix (batch * heads *
-    frames^2) and FFN intermediate activation (batch * frames * intermediate) —
-    the dominant terms, since inference_mode lets earlier layers' activations be
-    freed as later layers run, so peak memory tracks roughly one layer's working
-    set rather than the sum across all layers.
-    """
-    dtype_bytes = input_features.element_size()
-    batch, max_frames = input_features.shape[0], input_features.shape[1]
-    input_bytes = input_features.numel() * dtype_bytes
-    try:
-        cfg = model.config
-        attn_bytes = batch * cfg.num_attention_heads * max_frames * max_frames * dtype_bytes
-        ffn_bytes = batch * max_frames * cfg.intermediate_size * dtype_bytes
-        activation_bytes = attn_bytes + ffn_bytes
-    except AttributeError:
-        activation_bytes = 0
-    check_vram_headroom(
-        f"Alignment batch (batch_size={batch}, max_frames={max_frames})",
-        device,
-        (input_bytes + activation_bytes) / 1e6,
-        "consider reducing --align_batch_size or --chunk_size",
-    )
-
-
-def _compute_vad_emissions_batched(
-    vad_segments: List[VadAudioSegment],
-    model: torch.nn.Module,
-    processor,
-    device: str,
-    batch_size: int,
-    vram_checks: bool = True,
-    primer: Optional["AudioPrimer"] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> List[Tuple[torch.Tensor, float]]:
-    """Batch VAD segments through a Hugging Face CTC align model via BatchExecutor.
-
-    ``processor`` is the align model's own (``align_metadata["processor"]``). Its first
-    model input is what the model is fed -- fbank ``input_features`` for wav2vec2-BERT, raw
-    ``input_values`` for plain wav2vec2 -- and the padding mask is passed on only where the
-    extractor says the model expects one (see ``_passes_attention_mask``).
-
-    ``primer`` (from the align model's profile, ``None`` for a model without one) prepends
-    left context to each segment before the encoder sees it, and its frames are discarded
-    here so nothing downstream knows it existed — see ``align_profiles.TailPrimer`` for why
-    the current model needs it. The prefix length is deliberately *not* asked of the primer:
-    the encoder's own output length for the **unprimed** audio is measured and that many
-    frames are kept from the end, which is exact whatever the primer prepended and keeps a
-    future primer free to change shape. That costs one extra feature-extraction pass per
-    batch (cheap next to the forward) and is worth it — estimating the offset from duration
-    instead would be a frame out often enough to reintroduce the artifact it removes.
-
-    The processor pads each batch to its own longest segment and returns an attention_mask,
-    whose per-row sum is the segment's real length **in model-input units** (feature frames for
-    wav2vec2-BERT, samples for wav2vec2). That is not the same unit as the CTC emission: alvanlii/wav2vec2-BERT-cantonese
-    sets add_adapter=True with adapter_stride=2, so the emission runs at half the feature rate
-    (~25 fps vs ~50 fps). The mask length is therefore converted through the model's own
-    _get_feat_extract_output_lengths before it is used to trim each row's emission back to its
-    real (unpadded) length. That helper maps the model's input unit to emission frames for
-    either family: the adapter convs for wav2vec2-BERT (an identity without an adapter), the
-    conv feature encoder for wav2vec2.
-
-    Getting this wrong is silent and costly: an over-long real_len makes the slice a no-op, so
-    the segment keeps the whole batch-padded emission, _align_segment's
-    `ratio = duration / (trellis.size(0) - 1)` divides the true duration by too many frames,
-    and every timestamp in the segment compresses toward its start (seconds of drift by the
-    end). Only the longest segment in each batch escapes. Hence the assertion below.
-
-    Jobs are processed longest-segment-first (not VAD order) via BatchExecutor's
-    order_key, for two reasons: VAD segments range from sub-second to the full
-    --chunk_size (default 30s), and self-attention's O(frames^2) memory scaling
-    means one long segment sharing a batch with several short ones pads all of them
-    up to the long one's length — spiking peak VRAM well above what the batch_size
-    alone suggests. Sorting by length groups similar-duration segments together
-    instead, so no batch pads far past its own natural size. Processing longest-first
-    also matters for the CUDA caching allocator: if batches were processed
-    shortest-first, every batch that needs a new largest-yet shape would force a
-    fresh, ever-larger cudaMalloc (old smaller cached blocks can't be reused for it
-    and are never freed back to the driver mid-stage), so reserved VRAM would climb
-    monotonically over the course of the stage even though each batch's actual usage
-    stays small — until the device runs out and the driver falls back to slow memory
-    paging. Starting with the largest batch makes the allocator's one big allocation
-    happen up front, and every smaller batch after that reuses/splits the same
-    cached block.
-    """
-    results: List[Optional[Tuple[torch.Tensor, float]]] = [None] * len(vad_segments)
-    jobs = list(range(len(vad_segments)))
-
-    model_dtype = next(model.parameters()).dtype
-    input_key = _input_key(processor)
-    pass_mask = _passes_attention_mask(processor)
-
-    def _emission_lens(wavs) -> torch.Tensor:
-        features = processor(
-            wavs, sampling_rate=SAMPLE_RATE, return_tensors="pt", return_attention_mask=True,
-            padding=True,
-        )
-        # Model-input units -> emission frames (see docstring).
-        return model._get_feat_extract_output_lengths(features["attention_mask"].sum(dim=-1))
-
-    def infer_fn(batch: List[int]) -> None:
-        wavs = [vad_segments[i]["audio"] for i in batch]
-        model_inputs = [primer(w, SAMPLE_RATE) for w in wavs] if primer is not None else wavs
-        with torch.inference_mode():
-            # padding=True explicitly: the wav2vec2-BERT extractor pads by default, but the
-            # plain wav2vec2 one does not and cannot tensorise a ragged batch without it.
-            features = processor(
-                model_inputs, sampling_rate=SAMPLE_RATE, return_tensors="pt",
-                return_attention_mask=True, padding=True,
-            )
-            input_features = features[input_key].to(device, dtype=model_dtype)
-            attention_mask = features["attention_mask"].to(device) if pass_mask else None
-            if vram_checks:
-                _warn_alignment_vram(input_features, model, device)
-            emissions = torch.log_softmax(
-                model(input_features, attention_mask=attention_mask).logits, dim=-1
-            )
-            valid_lens = features["attention_mask"].sum(dim=-1)
-            emission_lens = model._get_feat_extract_output_lengths(valid_lens)
-            # How many frames the segment alone is worth; the rest of the row is primer.
-            plain_lens = _emission_lens(wavs) if primer is not None else emission_lens
-        for row, i in enumerate(batch):
-            real_len = int(emission_lens[row].item())
-            if real_len > emissions.shape[1]:
-                raise RuntimeError(
-                    f"Alignment emission trim is longer than the emission itself "
-                    f"({real_len} > {emissions.shape[1]} frames). The feature-frame -> "
-                    f"emission-frame conversion does not match this align model; timestamps "
-                    f"would silently compress. Check the model's adapter config."
-                )
-            keep = int(plain_lens[row].item())
-            if keep > real_len:
-                raise RuntimeError(
-                    f"Primed alignment emission is shorter than the unprimed segment it "
-                    f"contains ({real_len} < {keep} frames). The primer must return its "
-                    f"prefix followed by the original audio unchanged."
-                )
-            emission = emissions[row, real_len - keep:real_len, :].detach().to("cpu", dtype=dtype)
-            vad_duration = vad_segments[i]["end"] - vad_segments[i]["start"]
-            frame_rate = emission.size(0) / vad_duration if vad_duration > 0 else 0.0
-            results[i] = (emission, frame_rate)
-
-    BatchExecutor(
-        batch_size, order_key=lambda i: len(vad_segments[i]["audio"]),
-    ).run(jobs, infer_fn)
-
-    # A correct run yields the model's constant frame rate for every segment regardless of
-    # length. Spread means some emission still carries batch padding, which shows up as
-    # timestamps compressed toward the segment start -- cheap to check, and otherwise silent.
-    rates = [r[1] for r in results if r is not None and r[1] > 0]
-    if rates:
-        median_rate = sorted(rates)[len(rates) // 2]
-        spread = max(abs(rate - median_rate) for rate in rates) / median_rate
-        if spread > 0.02:
-            logger.warning(
-                "Alignment emission frame rate varies by %.1f%% across VAD segments "
-                "(median %.2f fps, range %.2f-%.2f). Timestamps in the outlying segments are "
-                "likely compressed; suspect the emission length conversion.",
-                spread * 100, median_rate, min(rates), max(rates),
-            )
-    return results
-
-
 def _compute_vad_emissions(
     vad_segments: List[VadAudioSegment],
     model: torch.nn.Module,
@@ -693,9 +462,10 @@ def _compute_vad_emissions(
     with many/long VAD segments) is visibly explained rather than looking like a
     hang — this ran with no progress feedback at all before batching was added.
 
-    ``primer`` reaches only the batched path. The sequential fallback exists for torchaudio
-    bundles, none of which carry a profile primer today; priming there would need the same
-    exact frame-length bookkeeping for no current caller, so it warns instead of half-doing it.
+    The work is the model's backend's (``align_backends``). ``primer`` reaches only a backend
+    that ``supports_primer`` -- the batched Hugging Face one. torchaudio bundles, which run one
+    segment at a time, carry no profile primer today; priming there would need the same exact
+    frame-length bookkeeping for no current caller, so it warns instead of half-doing it.
 
     ``dtype`` casts each segment's emission as it leaves the device; ``None`` keeps the
     model's own. ``EmissionTimeline`` passes its storage dtype, because the conversion has to
@@ -723,27 +493,18 @@ def _compute_vad_emissions(
         )
     segments = [vad_segments[i] for i in usable]
 
-    if not segments:
-        computed = []
-    elif model_type == "huggingface":
-        if processor is None:
-            raise ValueError(
-                "A Hugging Face align model needs its processor; pass align_metadata['processor']"
-            )
-        computed = _compute_vad_emissions_batched(
-            segments, model, processor, device, batch_size,
-            vram_checks=vram_checks, primer=primer, dtype=dtype,
+    backend = get_align_backend(model_type)
+    if primer is not None and not backend.supports_primer:
+        logger.warning(
+            "Align model profile configures an audio primer, but the %s backend does not "
+            "apply it. First-character timings may be pinned to each segment's start.",
+            backend.name,
         )
-    else:
-        if primer is not None:
-            logger.warning(
-                "Align model profile configures an audio primer, but this model runs the "
-                "sequential path, which does not apply it. First-character timings may be "
-                "pinned to each segment's start."
-            )
-        computed = _compute_vad_emissions_sequential(
-            segments, model, model_type, processor, device, dtype=dtype,
-        )
+        primer = None
+    computed = backend.emissions(
+        segments, model, processor, device, batch_size,
+        vram_checks=vram_checks, primer=primer, dtype=dtype,
+    ) if segments else []
 
     vocab = computed[0][0].shape[-1] if computed else 0
     empty = torch.zeros((0, vocab), dtype=dtype or torch.float32)
@@ -1237,26 +998,10 @@ def _align_segment(
 # --- Public functions ---
 
 def _nominal_frame_rate(model, processor, model_type: str, device) -> Optional[float]:
-    """Emission frames per second of audio, from the model's own length arithmetic.
-
-    Hugging Face models: the processor's feature length for 100 s of audio, run through
-    ``_get_feat_extract_output_lengths`` -- exact, and no forward pass. torchaudio bundles
-    have no such helper, so ten seconds of silence go through the model once and the rate is
-    rounded to the whole number every wav2vec2-family model runs at (edge frames lose one).
-    """
-    seconds = 100 if model_type == "huggingface" else 10
-    silence = np.zeros(SAMPLE_RATE * seconds, dtype=np.float32)
+    """Emission frames per second of audio, from the model's backend (see
+    ``AlignBackend.frame_rate``), or None if it cannot say."""
     try:
-        with torch.inference_mode():
-            if model_type == "huggingface":
-                features = processor(silence, sampling_rate=SAMPLE_RATE, return_tensors="pt",
-                                     return_attention_mask=True)
-                frames = int(model._get_feat_extract_output_lengths(
-                    features["attention_mask"].sum(dim=-1))[0])
-                return frames / seconds
-            dtype = next(model.parameters()).dtype
-            emissions, _ = model(torch.from_numpy(silence)[None].to(device, dtype=dtype))
-            return float(round(emissions.shape[1] / seconds))
+        return get_align_backend(model_type).frame_rate(model, processor, device)
     except Exception as exc:  # the timeline falls back to measuring it
         logger.warning("Could not determine the align model's frame rate: %s", exc)
         return None
@@ -1280,12 +1025,13 @@ def load_align_model(
     opt-in with float32 as the default since it can measurably affect forced-alignment
     accuracy.
     """
+    from cantocaptions_ai.languages import get_language_pack
+    pack = get_language_pack(language_code)
     if model_name is None:
-        if language_code in DEFAULT_ALIGN_MODELS_TORCH:
-            model_name = DEFAULT_ALIGN_MODELS_TORCH[language_code]
-        elif language_code in DEFAULT_ALIGN_MODELS_HF:
-            model_name = DEFAULT_ALIGN_MODELS_HF[language_code]
-        else:
+        # The language pack's choice; an unregistered language's generic pack takes the
+        # built-in tables (languages/align_defaults.py).
+        model_name = pack.default_align_model
+        if model_name is None:
             logger.error(
                 f"No default alignment model for language: {language_code}. "
                 f"Please find a wav2vec2.0 model finetuned on this language at https://huggingface.co/models, "
@@ -1296,50 +1042,23 @@ def load_align_model(
     device = resolve_device(device, device_index)
     dtype = resolve_torch_compute_dtype(compute_type, device, "align")
 
-    import torchaudio
-    processor = None  # torchaudio bundles take raw audio and have none
-    if model_name in torchaudio.pipelines.__all__:
-        pipeline_type = "torchaudio"
-        bundle = torchaudio.pipelines.__dict__[model_name]
-        check_vram_headroom("Alignment model load", device, _ALIGN_MODEL_VRAM_ESTIMATE_MB, _ALIGN_REMEDIATION, vram_checks=vram_checks)
-        align_model = guard_model_load(
-            "alignment", _ALIGN_REMEDIATION,
-            lambda: bundle.get_model(dl_kwargs={"model_dir": model_dir}).to(device, dtype=dtype),
-        )
-        labels = bundle.get_labels()
-        align_dictionary = {c.lower(): i for i, c in enumerate(labels)}
-    else:
-        # The Auto classes resolve the model family from the checkpoint's own config
-        # (wav2vec2-bert -> Wav2Vec2BertForCTC + its fbank processor, wav2vec2 -> Wav2Vec2ForCTC
-        # + its raw-sample processor, and so on) rather than from the repo name.
-        from transformers import AutoModelForCTC, AutoProcessor
-        try:
-            ensure_hf_model_downloaded(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
-        except Exception as e:
-            logger.warning("Could not download %r: %s — using cached version if available.", model_name, e)
-        try:
-            processor = AutoProcessor.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
-            align_model = AutoModelForCTC.from_pretrained(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
-        except Exception as e:
-            logger.error("Error loading model from huggingface (%s): %s", model_name, e)
-            raise ValueError(
-                f'The chosen align_model "{model_name}" could not be found in huggingface '
-                f'(https://huggingface.co/models) or torchaudio (https://pytorch.org/audio/stable/pipelines.html#id14)'
-            )
-        pipeline_type = "huggingface"
-        check_vram_headroom("Alignment model load", device, _ALIGN_MODEL_VRAM_ESTIMATE_MB, _ALIGN_REMEDIATION, vram_checks=vram_checks)
-        align_model = guard_model_load("alignment", _ALIGN_REMEDIATION, lambda: align_model.to(device, dtype=dtype))
-        tokenizer = getattr(processor, "tokenizer", None)
-        if tokenizer is None:
-            raise ValueError(
-                f'align_model "{model_name}" has no CTC tokenizer (its processor is a bare '
-                f'{type(processor).__name__}); alignment needs the character vocabulary'
-            )
-        align_dictionary = {char.lower(): code for char, code in tokenizer.get_vocab().items()}
+    backend = align_backend_for(model_name, cache_dir=model_dir, local_files_only=model_cache_only)
+    align_model, processor, align_dictionary = backend.load(
+        model_name, device, dtype, model_dir=model_dir, cache_only=model_cache_only,
+        vram_checks=vram_checks,
+    )
+    pipeline_type = backend.name
 
     profile = get_align_profile(model_name)
     if char_substitution is None:
         char_substitution = profile.char_substitution
+    readings = pack.char_readings() if pack.char_readings is not None else None
+    if readings is None and char_substitution != "off":
+        logger.warning(
+            "Align char substitution %r needs character readings, which language %r does not "
+            "provide; only the align model's substitution table and --align_substitutions apply.",
+            char_substitution, language_code,
+        )
     align_metadata = {
         "language": language_code,
         "dictionary": align_dictionary,
@@ -1363,6 +1082,7 @@ def load_align_model(
                 bundled_substitutions(profile.substitutions) if profile.substitutions else None,
                 substitution_overrides,
             ),
+            readings=readings,
         ),
         # Resolved once here rather than in align(), which then has no idea which model it
         # is holding. Unknown models get the all-no-op default.

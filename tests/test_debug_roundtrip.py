@@ -81,3 +81,20 @@ def test_a_missing_checkpoint_reads_as_none(d):
                  debug.load_ensemble_debug, debug.load_diarization_debug,
                  debug.load_vad_debug, debug.load_isolation_debug):
         assert load("never-written", d) is None
+
+
+@pytest.mark.parametrize("write, load", [
+    (debug.write_vad_debug, debug.load_vad_debug),
+    (debug.write_isolation_debug, debug.load_isolation_debug),
+])
+def test_checkpoint_audio_reads_back_bit_for_bit(d, write, load):
+    """A replay must run on exactly the samples the original run did. Stored as 16-bit PCM,
+    vocal isolation's float output shifted ~10% of cues by one 40 ms frame on replay."""
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    audio = (rng.standard_normal(16000) * 0.1).astype(np.float32)
+    write("ep", [{"start": 1.0, "end": 2.0, "audio": audio}], d)
+    loaded = load("ep", d)
+    assert loaded[0]["audio"].dtype == np.float32
+    assert np.array_equal(loaded[0]["audio"], audio)

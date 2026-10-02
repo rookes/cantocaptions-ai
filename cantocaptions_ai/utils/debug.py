@@ -77,7 +77,11 @@ def _write_audio_segments(segments: List[VadAudioSegment], stage_dir: str) -> li
         audio = seg["audio"]
         if not isinstance(audio, np.ndarray):
             audio = np.array(audio)
-        sf.write(filepath, audio, SAMPLE_RATE, subtype="PCM_16")
+        # 32-bit float, not PCM_16: the stages downstream run on the in-memory float32 audio,
+        # so a replay must read back exactly those samples. Quantized to 16 bits, vocal
+        # isolation's output moved enough emissions to shift ~10% of cues by one 40 ms
+        # alignment frame between a run and its --load_debug_dir replay.
+        sf.write(filepath, np.asarray(audio, dtype=np.float32), SAMPLE_RATE, subtype="FLOAT")
         record = {
             "index": i,
             "start": seg["start"],

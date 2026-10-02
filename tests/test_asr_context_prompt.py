@@ -130,7 +130,7 @@ class TestContextThreading(unittest.TestCase):
             return ["x"] * len(wavs)
 
         pipe._infer_batch = fake_infer
-        with patch("cantocaptions_ai.pipeline._asr_native.normalize_segment_text",
+        with patch("cantocaptions_ai.languages.yue.text.normalize_segment_text",
                    side_effect=lambda seg, norm: seg):
             pipe.process(segments)
 
@@ -144,7 +144,7 @@ class TestContextThreading(unittest.TestCase):
         captured = []
 
         pipe._infer_batch = lambda wavs, lang, contexts=None: (captured.append(contexts), ["x"])[1]
-        with patch("cantocaptions_ai.pipeline._asr_native.normalize_segment_text",
+        with patch("cantocaptions_ai.languages.yue.text.normalize_segment_text",
                    side_effect=lambda seg, norm: seg):
             pipe.process(segments)
 

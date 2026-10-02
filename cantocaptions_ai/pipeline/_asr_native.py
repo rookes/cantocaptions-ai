@@ -1,25 +1,20 @@
 """Native ASR backend: uses AutoModelForMultimodalLM, transformers' official Qwen3-ASR support.
 
 Loaded lazily by asr.load_model() when native qwen3_asr support is detected
-(transformers>=5.13.0, installed via `uv sync --extra transformers_qwen`).
+(transformers>=5.13.0, a base dependency).
 """
 from typing import List, Optional, Union
 
 import numpy as np
 import torch
 
-from cantocaptions_ai.pipeline.asr import QwenPipeline, _normalize_language
+from cantocaptions_ai.pipeline.asr import BatchedAsrStage, _normalize_language
 from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
-from cantocaptions_ai.utils.schema import SingleSegment, TranscriptionResult, VadAudioSegment, ProgressCallback
 from cantocaptions_ai.utils.model_utils import (
-    partition_by_cache,
-    write_checkpoint,
-    BatchExecutor,
     MemoryPolicy,
     ensure_hf_model_downloaded,
     guard_model_load,
 )
-from cantocaptions_ai.languages.yue.text import normalize_segment_text
 from cantocaptions_ai.text_profiles import DEFAULT_NORMALIZATION, TextNormalization
 from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 from cantocaptions_ai.utils.log_utils import get_logger
@@ -103,13 +98,16 @@ def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device, poli
     )
 
 
-class QwenPipelineNative(QwenPipeline):
+class QwenPipelineNative(BatchedAsrStage):
     """Native backend: uses AutoModelForMultimodalLM (Qwen3ASRForConditionalGeneration).
 
     Loads a Qwen3-ASR checkpoint (repo id / local path resolved from the model profile)
-    via transformers' official qwen3_asr support, and applies the profile's post-ASR
-    ``normalization`` to each decoded segment.
+    via transformers' official qwen3_asr support, and applies the language pack's post-ASR
+    ``normalization`` to each decoded segment. Batching and checkpointing are
+    BatchedAsrStage's; this class supplies the Qwen prompt, generation and decode.
     """
+
+    backend_label = "native"
 
     def __init__(
         self,
@@ -124,108 +122,19 @@ class QwenPipelineNative(QwenPipeline):
         vram_checks: bool = True,
         normalization: TextNormalization = DEFAULT_NORMALIZATION,
     ):
+        super().__init__(
+            device=device, language=language, batch_size=batch_size,
+            print_progress=print_progress, verbose=verbose, vram_checks=vram_checks,
+            normalization=normalization,
+        )
         self.model = model
         self.processor = processor
-        self.normalization = normalization
-        if isinstance(device, torch.device):
-            self.device = device
-        elif isinstance(device, str):
-            self.device = torch.device(device)
-        elif isinstance(device, int) and device >= 0:
-            self.device = torch.device(f"cuda:{device}")
-        else:
-            self.device = torch.device("cpu")
-        self.preset_language = language
-        self._batch_size = batch_size
         self.max_new_tokens = max_new_tokens
-        self.print_progress = print_progress
-        self.verbose = verbose
-        self.vram_checks = vram_checks
-        self.policy = MemoryPolicy(vram_checks)
 
-    def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
-        """Transcribe all files, batching VAD segments across file boundaries.
-
-        Segments from every to-compute file are flattened into one job stream, so
-        batches pack work from different files (no half-empty tail batch per file).
-        """
-        logger.info("Performing transcription (native backend)...")
-        language = _normalize_language(self.preset_language)
-        cached, to_compute = partition_by_cache(items, self, load_debug_dir)
-
-        # jobs are (item_idx, seg_idx); texts scattered back into per-item buffers.
-        jobs: List = []
-        buffers = {}  # idx -> {'segs': List[VadAudioSegment], 'texts': List[Optional[str]], 'item': dict}
-        for idx, item in to_compute:
-            segs = item['vad_segments']
-            buffers[idx] = {'segs': segs, 'texts': [None] * len(segs), 'item': item}
-            jobs.extend((idx, sdx) for sdx in range(len(segs)))
-
-        if progress_callback is not None:
-            progress_callback.set_total(len(jobs), unit="seg")
-
-        def infer_fn(batch):
-            wavs = [buffers[idx]['segs'][sdx]['audio'] for idx, sdx in batch]
-            contexts = [buffers[idx]['segs'][sdx].get('context') for idx, sdx in batch]
-            texts = self._infer_batch(wavs, language, contexts)
-            for (idx, sdx), text in zip(batch, texts):
-                buffers[idx]['texts'][sdx] = text
-
-        # Longest-first: front-loads the largest KV-cache allocation so the allocator's
-        # reserved pool is claimed once up front rather than ratcheting up over the run
-        # (bench_asr_native.py --sort desc confirmed the win). Texts scatter back by
-        # index, so output order is unaffected.
-        BatchExecutor(
-            self._batch_size,
-            order_key=lambda job: len(buffers[job[0]]['segs'][job[1]]['audio']),
-        ).run(jobs, infer_fn, reporter=progress_callback)
-
-        computed = {}
-        for idx, buf in buffers.items():
-            segments: List[SingleSegment] = [
-                normalize_segment_text({'text': text or '', 'start': seg['start'], 'end': seg['end']}, self.normalization)
-                for seg, text in zip(buf['segs'], buf['texts'])
-            ]
-            result: TranscriptionResult = {"segments": segments, "language": language}
-            computed[idx] = result
-            write_checkpoint(self, buf['item'], result, debug_dir)
-
-        result_items = []
-        for idx, item in enumerate(items):
-            result = cached[idx] if idx in cached else computed[idx]
-            result_items.append(self._pack(item, result))
-        return result_items
-
-    def process(
-        self,
-        input: List[VadAudioSegment],
-        *,
-        progress_callback: ProgressCallback = None,
-    ) -> TranscriptionResult:
-        """Transcribe a single file's segments (library/single-file entry point)."""
-        language = _normalize_language(self.preset_language)
-        texts: List[Optional[str]] = [None] * len(input)
-        jobs = list(range(len(input)))
-
-        if progress_callback is not None:
-            progress_callback.set_total(len(jobs), unit="seg")
-
-        def infer_fn(batch):
-            wavs = [input[i]['audio'] for i in batch]
-            contexts = [input[i].get('context') for i in batch]
-            for i, text in zip(batch, self._infer_batch(wavs, language, contexts)):
-                texts[i] = text
-
-        BatchExecutor(
-            self._batch_size,
-            order_key=lambda i: len(input[i]['audio']),
-        ).run(jobs, infer_fn, reporter=progress_callback)
-
-        segments: List[SingleSegment] = [
-            normalize_segment_text({'text': texts[i] or '', 'start': input[i]['start'], 'end': input[i]['end']}, self.normalization)
-            for i in range(len(input))
-        ]
-        return {"segments": segments, "language": language}
+    def _backend_language(self, language: Optional[str]) -> str:
+        # Qwen3-ASR names languages in English ("Cantonese"), and that is also what its
+        # transcription checkpoints have always recorded.
+        return _normalize_language(language)
 
     def _build_context_prompts(self, contexts: List[Optional[str]], language: str) -> List[str]:
         """Render the SDK's prompt shape for a batch carrying context biasing text.
@@ -404,7 +313,7 @@ def load_model_native(
         except Exception as e:
             logger.warning(
                 "torch.compile failed (%s); falling back to eager mode. "
-                "Install the transformers_qwen extra for triton support.",
+                "Install the compile extra for triton support.",
                 e,
             )
 

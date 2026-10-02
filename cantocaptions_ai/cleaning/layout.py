@@ -35,5 +35,7 @@ def linebreak_step(
     """
     if max_line_count is not None and max_line_count < 2:
         return None  # a single-line output can't take a break
+    if not line_max_length:
+        return None  # 0 (or unset): lines are never broken
     breaker = LAYOUTS[layout]
     return lambda text: breaker(text, line_max_length)

@@ -9,7 +9,8 @@ requires-python = ">=3.10, <3.13"
 license = "BSD-2-Clause"
 
 dependencies = [
-    "transformers>=4.57.6",
+    # 5.13 is where Qwen3-ASR, the default model family, is native (AutoModelForMultimodalLM).
+    "transformers>=5.13.0",
     "accelerate>=1.0.0",
     "numpy>=2.1.0",
     "pandas>=2.2.3",
@@ -35,27 +36,25 @@ dependencies = [
 [project.optional-dependencies]
 ensemble = ["faster-whisper>=1.0.0"]
 llm = ["bitsandbytes>=0.43.0"]
-# Recommended ASR backend: native Qwen3-ASR support (AutoModelForMultimodalLM),
-# officially shipped in transformers>=5.13.0. Triton backs the (now-working)
-# torch.compile speedup on CUDA. Mutually exclusive with the `legacy` extra —
-# qwen-asr 0.0.6 hard-pins transformers==4.57.6, which conflicts with this pin.
-transformers_qwen = [
-    "transformers>=5.13.0",
+# Triton, which backs --compile (torch.compile) on CUDA. Every ASR family, Qwen3-ASR
+# included, runs on the base install.
+compile = [
     "triton; sys_platform == 'linux'",
     "triton-windows<3.7; sys_platform == 'win32'",
 ]
-# Legacy ASR backend: the qwen_asr PyPI package, pinned to transformers==4.57.6.
-# Mutually exclusive with `transformers_qwen` (see above). Opt-in only, for cases
-# that need the old backend specifically.
-legacy = ["qwen-asr>=0.0.6"]
+# The extra's former name, from when Qwen3-ASR needed a newer transformers than the base
+# install; kept so existing `--extra transformers_qwen` commands still work.
+transformers_qwen = [
+    "triton; sys_platform == 'linux'",
+    "triton-windows<3.7; sys_platform == 'win32'",
+]
 flash-attn = [
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
-# Everything except `legacy`, which conflicts with transformers_qwen's transformers pin.
+# Every optional extra.
 full = [
     "faster-whisper>=1.0.0",
     "bitsandbytes>=0.43.0",
-    "transformers>=5.13.0",
     "triton; sys_platform == 'linux'",
     "triton-windows<3.7; sys_platform == 'win32'",
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -72,7 +71,7 @@ build-backend = "setuptools.build_meta"
 packages = { find = { where = ["."], include = ["cantocaptions_ai*"] } }
 
 [tool.setuptools.package-data]
-cantocaptions_ai = ["languages/yue/opencc/*", "languages/yue/rules/*.toml", "assets/*", "pipeline/align_substitutions/*.toml"]
+cantocaptions_ai = ["languages/yue/opencc/*", "languages/yue/rules/*.toml", "assets/*", "pipeline/align_substitutions/*.toml", "presets/*.cfg"]
 
 # torchcodec (transitive dep of pyannote-audio >=4) has no wheels for Windows, macOS, or Linux aarch64.
 # Only Linux x86_64 has torchcodec wheels; everywhere else we override it away.
@@ -84,21 +83,6 @@ environments = [
 ]
 override-dependencies = [
     "torchcodec>=0.6.0; sys_platform != 'linux' or platform_machine != 'x86_64'",
-]
-# uv resolves one universal lock covering every extra combination by default.
-# `legacy` (transformers==4.57.6, via qwen-asr) and `transformers_qwen`/`full`
-# (transformers>=5.13.0) pin incompatible transformers versions, so they must be
-# declared as conflicting extras — otherwise `uv lock`/`uv sync` fails outright
-# trying to satisfy both pins in one resolution, even if you never request both.
-conflicts = [
-    [
-        { extra = "legacy" },
-        { extra = "transformers_qwen" },
-    ],
-    [
-        { extra = "legacy" },
-        { extra = "full" },
-    ],
 ]
 
 [tool.uv.sources]

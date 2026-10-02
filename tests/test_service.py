@@ -24,10 +24,12 @@ class TestValidateConfig(unittest.TestCase):
         with self.assertRaises(ConfigError):
             validate_config(cfg)
 
-    def test_no_align_conflicts_with_word_options(self):
+    def test_no_align_keeps_its_line_limits(self):
+        # Line breaking is a text step, so it no longer conflicts with --no_align (the old
+        # rule failed every --no_align run that kept the default line limits).
         cfg = PipelineConfig(no_align=True, max_line_width=18)
-        with self.assertRaises(ConfigError):
-            validate_config(cfg)
+        validate_config(cfg)
+        self.assertEqual((cfg.max_line_width, cfg.max_line_count), (18, 2))
 
     def test_unsupported_language_raises(self):
         cfg = PipelineConfig(language="tlh")  # Klingon
@@ -132,10 +134,8 @@ class TestRealignModeValidation(unittest.TestCase):
             validate_config(cfg)
 
     def test_no_align_is_allowed_with_sync_which_never_aligns(self):
-        # max_line_count/width are a separate, pre-existing no_align conflict; clear them so
-        # this test is about the realign rule and nothing else.
         cfg = PipelineConfig(realign=self._write("a.srt", self.SRT), realign_mode="sync",
-                             no_align=True, max_line_count=None, max_line_width=None)
+                             no_align=True)
         validate_config(cfg)
 
     def test_no_align_still_conflicts_with_transcript_mode(self):
@@ -300,3 +300,36 @@ class TestLanguageSupport(unittest.TestCase):
             validate_config(PipelineConfig(**base, llm_correction=True))
         with self.assertRaisesRegex(ConfigError, "ensemble_model"):
             validate_config(PipelineConfig(**base, ensemble_model="whisper", llm_correction=True))
+
+
+class TestMaxCueDuration(unittest.TestCase):
+    def test_a_cap_too_short_to_hold_two_minimum_cues_is_refused(self):
+        with self.assertRaises(ConfigError):
+            validate_config(PipelineConfig(max_cue_duration=0.8))   # min_cue_duration 0.5
+
+    def test_zero_turns_the_cap_off(self):
+        validate_config(PipelineConfig(max_cue_duration=0))
+
+
+class TestLanguageDefaults(unittest.TestCase):
+    """max_line_width unset takes the language's width, so no Cantonese value leaks."""
+
+    def _width(self, **kw):
+        cfg = PipelineConfig(**kw)
+        validate_config(cfg)
+        return cfg.max_line_width
+
+    def test_cantonese_keeps_its_18(self):
+        self.assertEqual(self._width(), 18)
+
+    def test_a_space_separated_language_gets_42(self):
+        self.assertEqual(self._width(language="en", model="some/asr", no_clean_text=True), 42)
+
+    def test_a_value_the_user_set_is_kept(self):
+        self.assertEqual(self._width(max_line_width=24), 24)
+        self.assertEqual(self._width(max_line_width=0), 0)
+
+    def test_zero_never_breaks_a_line(self):
+        from cantocaptions_ai.cleaning.layout import linebreak_step
+        self.assertIsNone(linebreak_step(0, 2))
+        self.assertIsNotNone(linebreak_step(18, 2))

@@ -4,6 +4,7 @@ The property that matters throughout is that this is a *token* substitution and 
 edit -- the transcript's own character has to survive into the subtitle, the way punctuation
 does while being tokenised as blank.
 """
+import functools
 import os
 import sys
 import tempfile
@@ -26,14 +27,17 @@ from cantocaptions_ai.pipeline.align_vocab import (
     _repairable,
     filter_spotchecks,
     load_substitution_overrides,
-    reading_of,
     substitution_notes,
 )
 from cantocaptions_ai.pipeline.align_profiles import SUBSTITUTIONS_DIR, get_align_profile
 from cantocaptions_ai.pipeline.align_vocab import bundled_substitutions, merge_substitutions
+from cantocaptions_ai.languages.yue.readings import JYUTPING, reading_of
 from cantocaptions_ai.utils.schema import add_note, merge_segments
 
 PAD = "[PAD]"
+
+# These tests are Cantonese: the readings come from the yue pack, as load_align_model passes them.
+YueRepair = functools.partial(VocabRepair, readings=JYUTPING)
 
 
 def dictionary(*chars) -> dict:
@@ -66,17 +70,17 @@ class TestVariantFold(unittest.TestCase):
     """A Simplified form is not an acoustic problem -- it is the wrong character set."""
 
     def test_a_simplified_character_folds_to_the_traditional_one(self):
-        repair = VocabRepair(dictionary("輝"), LEVEL_VARIANT)   # 輝
+        repair = YueRepair(dictionary("輝"), LEVEL_VARIANT)   # 輝
         got = repair.resolve("辉")                              # 辉
         self.assertIsNotNone(got)
         self.assertEqual((got.replacement, got.kind), ("輝", KIND_VARIANT))
 
     def test_the_fold_is_skipped_when_the_traditional_form_is_absent_too(self):
-        repair = VocabRepair(dictionary("區"), LEVEL_VARIANT)   # 區 only
+        repair = YueRepair(dictionary("區"), LEVEL_VARIANT)   # 區 only
         self.assertIsNone(repair.resolve("辉"))
 
     def test_variant_level_stops_before_homophones(self):
-        repair = VocabRepair(dictionary("區"), LEVEL_VARIANT)
+        repair = YueRepair(dictionary("區"), LEVEL_VARIANT)
         self.assertIsNone(repair.resolve("駒"), "駒 should need the homophone tier")
 
 
@@ -84,7 +88,7 @@ class TestHomophones(unittest.TestCase):
     """駒 (keoi1) is absent, 區 (keoi1) is present, and they are the same syllable."""
 
     def test_a_homophone_in_the_vocabulary_is_used(self):
-        repair = VocabRepair(dictionary("區"), LEVEL_HOMOPHONE)
+        repair = YueRepair(dictionary("區"), LEVEL_HOMOPHONE)
         got = repair.resolve("駒")
         self.assertEqual((got.replacement, got.kind, got.reading),
                          ("區", KIND_HOMOPHONE, "keoi1"))
@@ -92,61 +96,61 @@ class TestHomophones(unittest.TestCase):
     def test_a_character_reads_through_its_variant_when_it_has_no_reading_itself(self):
         # 撺 is unknown to the reading data; 攛 (cyun1) is not, and 村 is cyun1.
         self.assertIsNone(reading_of("撺"))
-        repair = VocabRepair(dictionary("村"), LEVEL_HOMOPHONE)
+        repair = YueRepair(dictionary("村"), LEVEL_HOMOPHONE)
         got = repair.resolve("撺")
         self.assertIsNotNone(got, "the variant's reading should carry the lookup")
         self.assertEqual(got.replacement, "村")
 
     def test_a_different_tone_is_not_a_homophone(self):
         # 悍 is hon5; 漢 is hon3. Same syllable, different tone: needs the 'near' tier.
-        repair = VocabRepair(dictionary("漢"), LEVEL_HOMOPHONE)
+        repair = YueRepair(dictionary("漢"), LEVEL_HOMOPHONE)
         self.assertIsNone(repair.resolve("悍"))
 
     def test_the_near_tier_accepts_it(self):
-        repair = VocabRepair(dictionary("漢"), LEVEL_NEAR)
+        repair = YueRepair(dictionary("漢"), LEVEL_NEAR)
         got = repair.resolve("悍")
         self.assertEqual((got.replacement, got.kind), ("漢", KIND_NEAR))
 
     def test_a_character_never_substitutes_for_itself(self):
-        repair = VocabRepair(dictionary("區"), LEVEL_NEAR)
+        repair = YueRepair(dictionary("區"), LEVEL_NEAR)
         got = repair.resolve("區")
         self.assertIsNone(got, "it is already in the vocabulary")
 
     def test_the_choice_is_deterministic(self):
         vocab = dictionary("區", "驅", "俱", "拘")   # all keoi1
-        first = VocabRepair(dict(vocab), LEVEL_HOMOPHONE).resolve("駒")
-        second = VocabRepair(dict(vocab), LEVEL_HOMOPHONE).resolve("駒")
+        first = YueRepair(dict(vocab), LEVEL_HOMOPHONE).resolve("駒")
+        second = YueRepair(dict(vocab), LEVEL_HOMOPHONE).resolve("駒")
         self.assertEqual(first.replacement, second.replacement)
 
 
 class TestLevels(unittest.TestCase):
     def test_off_resolves_nothing(self):
-        repair = VocabRepair(dictionary("區", "輝"), LEVEL_OFF)
+        repair = YueRepair(dictionary("區", "輝"), LEVEL_OFF)
         self.assertIsNone(repair.resolve("駒"))
         self.assertIsNone(repair.resolve("辉"))
         self.assertEqual(repair.augment(["駒辉"]).substitutions, {})
 
     def test_an_unknown_level_is_refused_at_construction(self):
         with self.assertRaises(ValueError):
-            VocabRepair(dictionary("區"), "aggressive")
+            YueRepair(dictionary("區"), "aggressive")
 
 
 class TestOverrides(unittest.TestCase):
     """A hand-picked substitution beats every automatic tier, both ways."""
 
     def test_an_override_wins_over_the_automatic_choice(self):
-        repair = VocabRepair(dictionary("區", "驅"), LEVEL_HOMOPHONE,
+        repair = YueRepair(dictionary("區", "驅"), LEVEL_HOMOPHONE,
                              {"駒": "驅"})
         got = repair.resolve("駒")
         self.assertEqual((got.replacement, got.kind), ("驅", KIND_OVERRIDE))
 
     def test_an_empty_override_leaves_the_character_alone(self):
-        repair = VocabRepair(dictionary("區"), LEVEL_NEAR, {"駒": ""})
+        repair = YueRepair(dictionary("區"), LEVEL_NEAR, {"駒": ""})
         self.assertIsNone(repair.resolve("駒"),
                           "an empty value must switch off one character, not fall through")
 
     def test_an_override_to_a_character_the_model_lacks_substitutes_nothing(self):
-        repair = VocabRepair(dictionary("區"), LEVEL_HOMOPHONE, {"駒": "驅"})
+        repair = YueRepair(dictionary("區"), LEVEL_HOMOPHONE, {"駒": "驅"})
         self.assertIsNone(repair.resolve("駒"))
 
     def test_overrides_load_from_toml(self):
@@ -171,12 +175,12 @@ class TestAugment(unittest.TestCase):
 
     def test_the_dictionary_gains_the_replacement_token_id(self):
         vocab = dictionary("區")
-        VocabRepair(vocab, LEVEL_HOMOPHONE).augment(["駒仔"])
+        YueRepair(vocab, LEVEL_HOMOPHONE).augment(["駒仔"])
         self.assertEqual(vocab["駒"], vocab["區"])
 
     def test_a_second_call_changes_nothing(self):
         vocab = dictionary("區")
-        repair = VocabRepair(vocab, LEVEL_HOMOPHONE)
+        repair = YueRepair(vocab, LEVEL_HOMOPHONE)
         first = repair.augment(["駒"])
         again = repair.augment(["駒"])
         self.assertEqual(len(first.substitutions), 1)
@@ -186,18 +190,18 @@ class TestAugment(unittest.TestCase):
 
     def test_an_unresolvable_character_is_reported_with_its_count(self):
         vocab = dictionary("區")
-        report = VocabRepair(vocab, LEVEL_OFF).augment([])
+        report = YueRepair(vocab, LEVEL_OFF).augment([])
         self.assertEqual(report.unresolved, {})
-        report = VocabRepair(vocab, LEVEL_HOMOPHONE).augment(["仔仔"])
+        report = YueRepair(vocab, LEVEL_HOMOPHONE).augment(["仔仔"])
         self.assertEqual(report.unresolved.get("仔"), 2)
         self.assertNotIn("仔", vocab)
 
     def test_digits_and_punctuation_are_left_out_of_the_report_entirely(self):
-        report = VocabRepair(dictionary("區"), LEVEL_NEAR).augment(["8，."])
+        report = YueRepair(dictionary("區"), LEVEL_NEAR).augment(["8，."])
         self.assertEqual(report.occurrences, {})
 
     def test_occurrences_count_every_use_not_every_character(self):
-        report = VocabRepair(dictionary("區"), LEVEL_HOMOPHONE).augment(
+        report = YueRepair(dictionary("區"), LEVEL_HOMOPHONE).augment(
             ["駒駒", "駒"])
         self.assertEqual(report.occurrences["駒"], 3)
         self.assertEqual(len(report.substitutions), 1)
@@ -210,7 +214,7 @@ class TestSubstitutionIsNotATextEdit(unittest.TestCase):
         from cantocaptions_ai.pipeline.alignment import _preprocess_segment
 
         vocab = dictionary("區", "仔")
-        VocabRepair(vocab, LEVEL_HOMOPHONE).augment(["駒仔"])
+        YueRepair(vocab, LEVEL_HOMOPHONE).augment(["駒仔"])
         data = _preprocess_segment("駒仔", "zh", vocab)
         self.assertEqual(data["clean_char"], ["駒", "仔"])
 
@@ -218,7 +222,7 @@ class TestSubstitutionIsNotATextEdit(unittest.TestCase):
         from cantocaptions_ai.pipeline.realign import line_tokens
 
         vocab = dictionary("區", "仔")
-        VocabRepair(vocab, LEVEL_HOMOPHONE).augment(["駒仔"])
+        YueRepair(vocab, LEVEL_HOMOPHONE).augment(["駒仔"])
         self.assertEqual(line_tokens("駒仔", "zh", vocab, vocab[PAD]),
                          [vocab["區"], vocab["仔"]])
 
@@ -347,7 +351,7 @@ class TestSpotcheckGuard(unittest.TestCase):
 
         checks = get_language_pack("yue").resolve("Qwen3-ASR").spotchecks
         chars = set(checks) | {c for check in checks.values() for c in check.candidates}
-        repair = VocabRepair(dictionary(*chars), LEVEL_NEAR)
+        repair = YueRepair(dictionary(*chars), LEVEL_NEAR)
         repair.augment(["".join(sorted(chars))])
         self.assertEqual(repair.substitutions, {})
         self.assertIs(filter_spotchecks(checks, repair.substitutions), checks)
@@ -393,7 +397,7 @@ class TestBundledSubstitutions(unittest.TestCase):
 
     def test_a_bundled_entry_reaches_the_repair_as_an_override(self):
         vocab = dictionary("弟", "哋")
-        repair = VocabRepair(vocab, LEVEL_NEAR,
+        repair = YueRepair(vocab, LEVEL_NEAR,
                              merge_substitutions(bundled_substitutions(
                                  get_align_profile(self.PROFILE).substitutions), None))
         report = repair.augment(["爹哋"])
@@ -403,3 +407,40 @@ class TestBundledSubstitutions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReadingsComeFromTheLanguage(unittest.TestCase):
+    """The tiers need to know the language; a language without readings gets overrides only."""
+
+    def test_without_readings_only_the_overrides_apply(self):
+        repair = VocabRepair(dictionary("區", "驅"), LEVEL_NEAR, {"駒": "驅"})
+        self.assertEqual(repair.resolve("駒").replacement, "驅")
+        self.assertIsNone(repair.resolve("辉"), "no variant fold without the language's data")
+        self.assertIsNone(repair.resolve("拘"), "no homophone without the language's data")
+
+    def test_a_languages_own_readings_drive_the_homophone_tier(self):
+        class ToyReadings:
+            label = "toy"
+
+            def reading(self, char):
+                return {"ä": "a1", "á": "a2", "à": "a1"}.get(char)
+
+            def toneless(self, reading):
+                return reading.rstrip("0123456789")
+
+            def variant(self, char):
+                return None
+
+            def frequencies(self):
+                return {}
+
+        repair = VocabRepair(dictionary("ä", "á"), LEVEL_NEAR, readings=ToyReadings())
+        self.assertEqual(repair.resolve("à"), Substitution("à", "ä", KIND_HOMOPHONE, "a1"))
+        near = VocabRepair(dictionary("á"), LEVEL_NEAR, readings=ToyReadings()).resolve("à")
+        self.assertEqual((near.replacement, near.kind), ("á", KIND_NEAR))
+
+    def test_yue_supplies_jyutping(self):
+        from cantocaptions_ai.languages import get_language_pack
+
+        self.assertIs(get_language_pack("yue").char_readings(), JYUTPING)
+        self.assertIsNone(get_language_pack("en").char_readings)

@@ -1,15 +1,15 @@
 """The ASR model registry: what each named model *is*, independent of language.
 
 A ``ModelProfile`` says where a model's weights live (``hf_id``, a hub repo id or local
-path) and which languages it can transcribe (``languages``; None for a multilingual model
-such as stock Qwen3-ASR). Everything about how a model *writes* a particular language --
+path), which ASR backend runs it (``backend``; see ``pipeline/asr.py``) and which languages
+it can transcribe (``languages``; None for a multilingual model such as stock Qwen3-ASR). Everything about how a model *writes* a particular language --
 OpenCC normalization, particle spot-checks, cue markers, which cleaning manifest -- belongs
 to that language and lives in its pack (``languages/<code>``, ``LanguagePack.conventions``),
 so stock Qwen3-ASR can carry Cantonese conventions under yue and none elsewhere.
 
 ``get_model_profile(None, language)`` resolves the language pack's default model, so a
 config that leaves ``model`` unset gets that language's own model. An unregistered name is
-treated as a raw hub id or path, mirroring the old ``_MODEL_IDS.get(name, name)``.
+treated as a raw hub id or path, whose backend is read off its own ``config.json``.
 
 This module is a light import (no torch): the model download script and the worker's
 preflight checks read it.
@@ -21,16 +21,18 @@ from typing import Dict, FrozenSet, Mapping, Optional
 
 @dataclass(frozen=True)
 class ModelProfile:
-    """One ASR model: where its weights are, and which languages it transcribes."""
+    """One ASR model: where its weights are, what runs it, which languages it transcribes."""
     hf_id: str
     # None: multilingual (or unknown) -- no language is refused. A set: the model was
     # trained for those languages only, and validate_config refuses it for any other.
     languages: Optional[FrozenSet[str]] = None
+    # A key of pipeline.asr.ASR_BACKENDS; None: identified from the checkpoint's config.
+    backend: Optional[str] = None
 
 
 # Env var pointing at a *local* merged-weights directory. Kept out of the source tree so no
 # machine-specific path ships in git: the "Qwen3-ASR-lora" profile is only registered (and
-# only offered as a --model choice) when this is set. It is the personal/debugging escape
+# only listed in --model's help) when this is set. It is the personal/debugging escape
 # hatch for an unpublished build — the published checkpoint is "cantocaptions-cantonese-ASR",
 # which is pulled from the hub and needs no env var. See _build_profiles.
 _LORA_MODEL_DIR_ENV = "CANTOCAPTIONS_LORA_MODEL_DIR"
@@ -39,20 +41,24 @@ _LORA_MODEL_DIR_ENV = "CANTOCAPTIONS_LORA_MODEL_DIR"
 _CANTOCAPTIONS_HF_ID = "rookes/cantocaptions-cantonese-asr"
 
 _CANTONESE_ONLY = frozenset({"yue"})
+_QWEN = "qwen3-asr"
+_WHISPER = "whisper"
 
 
 def _build_profiles() -> Dict[str, ModelProfile]:
     profiles: Dict[str, ModelProfile] = {
-        "Qwen3-ASR": ModelProfile(hf_id="Qwen/Qwen3-ASR-1.7B-hf"),
-        "Qwen3-ASR-0.6B": ModelProfile(hf_id="Qwen/Qwen3-ASR-0.6B-hf"),
-        "cantocaptions-cantonese-ASR": ModelProfile(_CANTOCAPTIONS_HF_ID, _CANTONESE_ONLY),
+        "Qwen3-ASR": ModelProfile("Qwen/Qwen3-ASR-1.7B-hf", backend=_QWEN),
+        "Qwen3-ASR-0.6B": ModelProfile("Qwen/Qwen3-ASR-0.6B-hf", backend=_QWEN),
+        "cantocaptions-cantonese-ASR": ModelProfile(_CANTOCAPTIONS_HF_ID, _CANTONESE_ONLY, _QWEN),
+        "whisper-large-v3": ModelProfile("openai/whisper-large-v3", backend=_WHISPER),
+        "whisper-large-v3-turbo": ModelProfile("openai/whisper-large-v3-turbo", backend=_WHISPER),
     }
     # The same fine-tune, pointed at a local directory instead. Registered only when the
-    # env var is set; otherwise --model Qwen3-ASR-lora is simply not a valid choice (clean
-    # argparse error) rather than a broken hardcoded path.
+    # env var is set; otherwise --model Qwen3-ASR-lora is read as a hub id that does not
+    # exist (a not-found error) rather than a broken hardcoded path.
     lora_dir = os.environ.get(_LORA_MODEL_DIR_ENV)
     if lora_dir:
-        profiles["Qwen3-ASR-lora"] = ModelProfile(lora_dir, _CANTONESE_ONLY)
+        profiles["Qwen3-ASR-lora"] = ModelProfile(lora_dir, _CANTONESE_ONLY, _QWEN)
     return profiles
 
 

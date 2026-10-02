@@ -81,3 +81,18 @@ def test_resolving_never_needs_torch(code):
         capture_output=True, text=True, timeout=120,
     )
     assert out.stdout.strip() == "False", out.stderr
+
+
+def test_a_pack_defers_its_pronunciation_data():
+    """char_readings is a factory: reading the registry must not load pycantonese or OpenCC."""
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; from cantocaptions_ai.languages import get_language_pack;"
+         "p = get_language_pack('yue'); p.resolve(None); assert p.char_readings is not None;"
+         "print(sorted(m for m in ('pycantonese', 'opencc') if m in sys.modules))"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert out.stdout.strip() == "[]", out.stderr
