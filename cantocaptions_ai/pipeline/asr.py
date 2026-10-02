@@ -208,6 +208,11 @@ class BatchedAsrStage(AsrStage):
         size) and mutate no shared state before the model call.
         """
 
+    def share_emissions(self, align_profile) -> bool:
+        """Hand this stage's encoder output on to alignment, when the align model is this
+        very model. Only a CTC model can (see _asr_ctc.CtcAsr); False everywhere else."""
+        return False
+
     def _segments(self, segs, texts) -> List[SingleSegment]:
         from cantocaptions_ai.languages.yue.text import normalize_segment_text
         return [

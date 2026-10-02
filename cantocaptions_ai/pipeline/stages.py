@@ -955,6 +955,9 @@ class TranscriptionStage(_CachedAsrPath):
             vram_checks=cfg.vram_checks,
             vram_headroom_mb=cfg.vram_headroom_mb,
         ) as model:
+            if _aligner_is_the_asr_model(ctx):
+                from cantocaptions_ai.pipeline.align_profiles import get_align_profile
+                model.share_emissions(get_align_profile(ctx.align_model_name))
             timer.mark_inference_start()
             items = _stage_run(model, ctx, items, timer)
             # Drop this frame's reference so model_scope's exit frees the model; a
@@ -966,6 +969,17 @@ class TranscriptionStage(_CachedAsrPath):
     def from_cache(self, ctx, items):
         from cantocaptions_ai.pipeline.asr import AsrStage
         return AsrStage.load_cache(items, ctx.cfg.load_debug_dir)
+
+
+def _aligner_is_the_asr_model(ctx: RunContext) -> bool:
+    """Whether alignment will run the very model transcription runs, so the encoder pass
+    can be done once (CtcAsr.share_emissions). Not under --realign, which re-cuts the
+    chunks the output was computed over before alignment sees them."""
+    cfg = ctx.cfg
+    if cfg.no_align or cfg.realign or not ctx.align_model_name:
+        return False
+    from cantocaptions_ai.pipeline.model_profiles import get_model_profile
+    return get_model_profile(ctx.profile.model, cfg.language).hf_id == ctx.align_model_name
 
 
 class EnsembleStage(_CachedAsrPath):
