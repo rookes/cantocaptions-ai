@@ -88,7 +88,10 @@ class PipelineConfig:
     # Off by default: the Mel-Band RoFormer stage is a heavy add for a small gain on clean
     # speech. Opt in with --vocal_isolation_method mbroformer for noisy/music-heavy audio.
     vocal_isolation_method: str = "none"
-    vocal_isolation_batch_size: int = 4
+    # Chunks per forward pass. The model is compute-bound at batch 1, so this only moves
+    # VRAM: compiled, on a 34 min file (3080 Ti), batch 2 ran 69 s at 1.67 GB peak and
+    # batch 4 ran 68 s at 2.45 GB.
+    vocal_isolation_batch_size: int = 2
     vocal_isolation_compute_type: str = "float32"
     # How the isolation model consumes a segment. Must match whatever the ASR
     # model was trained on: a model trained on whole-mode isolated audio meets
