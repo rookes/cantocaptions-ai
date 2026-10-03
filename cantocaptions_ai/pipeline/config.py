@@ -124,7 +124,10 @@ class PipelineConfig:
     # (segmentation._split_long_cues). 0 turns the cap off.
     max_cue_duration: float = 4.0
     merge_gap: float = 0.25
-    align_batch_size: int = 2
+    # Measured on 72 min of audio (3080 Ti, float16): batch 2/4/8/16/32 took 63/53/49/48/52 s
+    # at a 2.2/2.9/4.3/7.2/10.7 GB peak. The encoder is compute-bound from 8, so a larger
+    # batch buys nothing, and past free VRAM Windows spills to system RAM and slows sharply.
+    align_batch_size: int = 8
     align_compute_type: str = "float16"
     # Substitute an in-vocabulary character for one the align model has no token for, so the
     # trellis can see it at all. "homophone" (same Jyutping reading) because a dropped
