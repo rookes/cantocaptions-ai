@@ -125,8 +125,18 @@ class TranscriptionSummary:
         self._stages: list[tuple[str, Optional[float], float, Optional[float]]] = []
 
     def record(self, label: str, load_time: Optional[float], run_time: float, vram_peak_mb: Optional[float] = None) -> None:
-        if self.enabled:
-            self._stages.append((label, load_time, run_time, vram_peak_mb))
+        """Add a stage's timings. A stage that runs again (once per file group) is folded
+        into its first row: times summed, VRAM peak the highest of them."""
+        if not self.enabled:
+            return
+        for i, (seen, load, run, vram) in enumerate(self._stages):
+            if seen == label:
+                if load is not None or load_time is not None:
+                    load = (load or 0.0) + (load_time or 0.0)
+                peaks = [v for v in (vram, vram_peak_mb) if v is not None]
+                self._stages[i] = (label, load, run + run_time, max(peaks) if peaks else None)
+                return
+        self._stages.append((label, load_time, run_time, vram_peak_mb))
 
     def print_summary(self, process_elapsed: Optional[float] = None) -> None:
         if not self.enabled or not self._stages:

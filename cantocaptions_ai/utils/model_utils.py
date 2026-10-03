@@ -310,16 +310,37 @@ def model_scope(load_fn: Callable[..., _ModelT], *args, **kwargs) -> Generator[_
         yield model
     finally:
         del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        flush_vram()
+
+
+@lru_cache(maxsize=None)
+def _glibc_malloc_trim() -> Optional[Callable[[int], int]]:
+    """glibc's malloc_trim, or None on any other C library (Windows, macOS, musl)."""
+    import ctypes
+    import ctypes.util
+    import platform
+    if platform.libc_ver()[0] != "glibc":
+        return None
+    try:
+        return ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return None
 
 
 def flush_vram() -> None:
-    """Collect garbage and free CUDA memory. Call after deleting model references."""
+    """Collect garbage, free CUDA memory and return freed host memory to the OS.
+    Call after deleting model references.
+
+    The trim is for glibc, which keeps freed memory in its heap rather than handing it back.
+    Vocal isolation on 72 min of audio left RSS 0.8 GB higher than trimming it did, and the
+    gap grows with every hour a run processes. Other C libraries need no help here.
+    """
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    trim = _glibc_malloc_trim()
+    if trim is not None:
+        trim(0)
 
 
 def _is_cuda_device(device) -> bool:

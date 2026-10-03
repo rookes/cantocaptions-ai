@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 import os
 import time
 import warnings
@@ -261,6 +262,10 @@ def validate_config(cfg) -> None:
     # threshold would otherwise only surface after ASR and alignment have already run.
     if not 0 < cfg.speaker_confidence <= 1:
         raise ConfigError(f"speaker_confidence must be in (0, 1], got {cfg.speaker_confidence}")
+    if cfg.files_per_group < 0:
+        raise ConfigError(
+            f"files_per_group must be 0 (all inputs at once) or more, got {cfg.files_per_group}"
+        )
     if cfg.max_cue_duration and cfg.max_cue_duration < 2 * cfg.min_cue_duration:
         raise ConfigError(
             f"max_cue_duration must be 0 (no cap) or at least twice min_cue_duration "
@@ -666,32 +671,50 @@ def _execute_pipeline(
     if callable(send_plan):
         send_plan(plan_entries(ctx, stage_list))
 
-    items: List[dict] = [
-        {'audio_path': p, 'name': name_of[p], 'checkpoints': checkpoints} for p in audio_paths
-    ]
-    items = run_stages(ctx, stage_list, items)
+    # Every stage runs over all of a group's files before the next stage starts, and each
+    # file's decoded audio is held from VAD until its subtitles are written. Taken all at
+    # once, a 277-episode --input_dir run held ~25 GB of audio and crashed loading the ASR
+    # model on a 16 GB Windows machine. So the inputs go through in groups, each one written
+    # before the next is decoded. Each group reloads the models, which costs seconds.
+    group_size = cfg.files_per_group or len(audio_paths)
+    groups = [audio_paths[i:i + group_size] for i in range(0, len(audio_paths), group_size)]
+    results: List[ProcessingItem] = []
+    for g, group in enumerate(groups, 1):
+        if len(groups) > 1:
+            first = (g - 1) * group_size + 1
+            logger.info(
+                "File group %d of %d: inputs %d-%d of %d",
+                g, len(groups), first, first + len(group) - 1, len(audio_paths),
+            )
+        group_ctx = dataclasses.replace(ctx, audio_paths=list(group))
+        items: List[dict] = [
+            {'audio_path': p, 'name': name_of[p], 'checkpoints': checkpoints} for p in group
+        ]
+        items = run_stages(group_ctx, stage_list, items)
 
-    # Write and/or collect final results
-    results = _merge_and_write(
-        items, writer, align_language, cfg.align_merge_distance, cfg.align_padding, writer_args,
-        cleaner=cleaner, layout=layout, debug_dir=cfg.debug_dir, punctuation=profile.punctuation,
-        segmentation=profile.segmentation, script=profile.script,
-        # Mode sync promises that the subtitle's own proportions survive the round trip, and
-        # the duration floor (pass D) would quietly break that by stretching any cue the
-        # transform made shorter than min_cue_duration. Zero turns passes B-D off, which is
-        # right here for the same reason merge is: every cue's span is already a decision
-        # somebody made, not an artefact of over-splitting.
-        min_cue_duration=0.0 if realign_mode == "sync" else cfg.min_cue_duration,
-        merge_gap=cfg.merge_gap, max_line_width=cfg.max_line_width,
-        max_line_count=cfg.max_line_count,
-        # Under --realign the cue boundaries came from the transcript's own line breaks and
-        # are not an artifact to be undone, so the two passes that join cues are off; the
-        # noise drop and the duration floor still run.
-        merge=not cfg.realign,
-        max_cue_duration=cfg.max_cue_duration,
-        order_cues=bool(cfg.realign),
-        collect=collect, audio_start_offset=audio_start_offset, display_paths=display_paths,
-    )
+        # Write and/or collect final results
+        results += _merge_and_write(
+            items, writer, align_language, cfg.align_merge_distance, cfg.align_padding,
+            writer_args, cleaner=cleaner, layout=layout, debug_dir=cfg.debug_dir,
+            punctuation=profile.punctuation, segmentation=profile.segmentation,
+            script=profile.script,
+            # Mode sync promises that the subtitle's own proportions survive the round trip,
+            # and the duration floor (pass D) would quietly break that by stretching any cue
+            # the transform made shorter than min_cue_duration. Zero turns passes B-D off,
+            # which is right here for the same reason merge is: every cue's span is already
+            # a decision somebody made, not an artefact of over-splitting.
+            min_cue_duration=0.0 if realign_mode == "sync" else cfg.min_cue_duration,
+            merge_gap=cfg.merge_gap, max_line_width=cfg.max_line_width,
+            max_line_count=cfg.max_line_count,
+            # Under --realign the cue boundaries came from the transcript's own line breaks
+            # and are not an artifact to be undone, so the two passes that join cues are
+            # off; the noise drop and the duration floor still run.
+            merge=not cfg.realign,
+            max_cue_duration=cfg.max_cue_duration,
+            order_cues=bool(cfg.realign),
+            collect=collect, audio_start_offset=audio_start_offset, display_paths=display_paths,
+        )
+        del items
 
     summary.print_summary(process_elapsed=time.perf_counter() - process_start)
     return results

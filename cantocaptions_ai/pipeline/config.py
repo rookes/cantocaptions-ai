@@ -47,6 +47,10 @@ class PipelineConfig:
     asr_compute_type: str = "default"
     attn_implementation: str = "sdpa"
     batch_size: int = 8
+    # Inputs taken through the whole pipeline together; 0 runs them all at once. Every
+    # file's decoded audio is held from VAD until its subtitles are written (~0.23 GB an
+    # hour), so this is what bounds host RAM on a long --input_dir run.
+    files_per_group: int = 10
     threads: int = 0
     hf_token: Optional[str] = None
     compile: bool = False
@@ -84,7 +88,10 @@ class PipelineConfig:
     # Off by default: the Mel-Band RoFormer stage is a heavy add for a small gain on clean
     # speech. Opt in with --vocal_isolation_method mbroformer for noisy/music-heavy audio.
     vocal_isolation_method: str = "none"
-    vocal_isolation_batch_size: int = 4
+    # Chunks per forward pass. The model is compute-bound at batch 1, so this only moves
+    # VRAM: compiled, on a 34 min file (3080 Ti), batch 2 ran 69 s at 1.67 GB peak and
+    # batch 4 ran 68 s at 2.45 GB.
+    vocal_isolation_batch_size: int = 2
     vocal_isolation_compute_type: str = "float32"
     # How the isolation model consumes a segment. Must match whatever the ASR
     # model was trained on: a model trained on whole-mode isolated audio meets
@@ -120,7 +127,10 @@ class PipelineConfig:
     # (segmentation._split_long_cues). 0 turns the cap off.
     max_cue_duration: float = 4.0
     merge_gap: float = 0.25
-    align_batch_size: int = 2
+    # Measured on 72 min of audio (3080 Ti, float16): batch 2/4/8/16/32 took 63/53/49/48/52 s
+    # at a 2.2/2.9/4.3/7.2/10.7 GB peak. The encoder is compute-bound from 8, so a larger
+    # batch buys nothing, and past free VRAM Windows spills to system RAM and slows sharply.
+    align_batch_size: int = 8
     align_compute_type: str = "float16"
     # Substitute an in-vocabulary character for one the align model has no token for, so the
     # trellis can see it at all. "homophone" (same Jyutping reading) because a dropped
@@ -368,8 +378,8 @@ SECTION_TITLES: Mapping[str, str] = MappingProxyType({
 CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     "model": ("language", "model", "model_dir", "model_cache_only"),
     "inference": (
-        "device", "device_index", "batch_size", "asr_compute_type", "attn_implementation",
-        "threads", "hf_token", "compile",
+        "device", "device_index", "batch_size", "files_per_group", "asr_compute_type",
+        "attn_implementation", "threads", "hf_token", "compile",
     ),
     "output": (
         "output_dir", "output_format", "verbose", "print_progress", "vram_checks",

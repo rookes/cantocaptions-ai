@@ -161,6 +161,43 @@ def test_asr_model_is_released_before_alignment_loads(tmp_path, media, fakes, sc
     assert alive_at_alignment == [False]
 
 
+def test_file_groups_are_written_before_the_next_is_decoded(tmp_path, scripted, fakes,
+                                                             monkeypatch):
+    """Each file's audio is held until its subtitles are written, so a long input list must
+    not be decoded all at once: 277 episodes held ~25 GB and crashed a 16 GB machine."""
+    from cantocaptions_ai.pipeline import transcribe
+
+    paths = [scripted.write_wav(tmp_path / f"ep{i}.wav") for i in range(3)]
+    events = []
+    process, merge = StubVad.process, transcribe._merge_and_write
+
+    def recording_process(self, input, **kwargs):
+        events.append("vad")
+        return process(self, input, **kwargs)
+
+    def recording_merge(items, *args, **kwargs):
+        events.append([item["name"] for item in items])
+        return merge(items, *args, **kwargs)
+
+    monkeypatch.setattr(StubVad, "process", recording_process)
+    monkeypatch.setattr(transcribe, "_merge_and_write", recording_merge)
+    grouped = _run(paths, _cfg(tmp_path, files_per_group=2))
+    assert events == ["vad", "vad", ["ep0", "ep1"], "vad", ["ep2"]]
+
+    events.clear()
+    together = _run(paths, _cfg(tmp_path, files_per_group=0))
+    assert events == ["vad", "vad", "vad", ["ep0", "ep1", "ep2"]]
+    assert [r["name"] for r in grouped] == ["ep0", "ep1", "ep2"]
+    assert [render_result(r["result"], "srt", {}) for r in grouped] == [
+        render_result(r["result"], "srt", {}) for r in together]
+
+
+def test_negative_files_per_group_is_rejected(tmp_path):
+    from cantocaptions_ai.errors import ConfigError
+    with pytest.raises(ConfigError, match="files_per_group"):
+        _cfg(tmp_path, files_per_group=-1)
+
+
 # --- debug checkpoints ---------------------------------------------------------------
 
 def test_replay_reuses_every_checkpoint(tmp_path, media, fakes):
