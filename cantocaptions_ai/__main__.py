@@ -83,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     inference_grp.add_argument("--device", default=argparse.SUPPRESS, help="device type to use for PyTorch inference (e.g. cpu, cuda, mps)")
     inference_grp.add_argument("--device_index", default=argparse.SUPPRESS, type=int, help="device index to use for inference")
     inference_grp.add_argument("--batch_size", default=argparse.SUPPRESS, type=int, help="the preferred batch size for inference")
+    inference_grp.add_argument("--files_per_group", default=argparse.SUPPRESS, type=int, help="inputs taken through the whole pipeline together, each group's subtitles written before the next starts; bounds host RAM, since every file's decoded audio is held until it is written (~0.23 GB an hour). 0 runs all inputs at once")
     inference_grp.add_argument("--asr_compute_type", default=argparse.SUPPRESS, type=str, choices=["default", "float16", "float32", "int8"], help="compute type for the ASR model; 'default' uses float16 on GPU, float32 on CPU")
     inference_grp.add_argument("--asr", "-asr", choices=["fast", "quality"], default=argparse.SUPPRESS, help="shorthand for --asr_compute_type (fast=int8, quality=float32); for float16/'default' use --asr_compute_type directly. The granular --asr_compute_type flag always wins if both are given.")
     inference_grp.add_argument("--attn_implementation", default=argparse.SUPPRESS, type=str, choices=["sdpa", "flash_attention_2", "eager"], help="attention implementation for transformer models; 'flash_attention_2' requires flash-attn to be installed")

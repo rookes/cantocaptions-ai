@@ -78,6 +78,7 @@ Run `uv run cantocaptions_ai --help` to display the complete flag list.
 **Tips:**
 
 * If you are running out of VRAM, it's recommended to lower `batch_size` and `align_batch_size`
+* If you are running out of system RAM on a long `--input_dir` run, lower `files_per_group` (default 10). Each file's decoded audio is held until its subtitles are written, about 0.23 GB per hour of audio
 * If you want to improve subtitle quality and don't mind extra compute time, turn on vocal isolation with `--vocal_isolation_method mbroformer`
 
 ## Configuration

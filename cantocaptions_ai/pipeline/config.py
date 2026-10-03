@@ -47,6 +47,10 @@ class PipelineConfig:
     asr_compute_type: str = "default"
     attn_implementation: str = "sdpa"
     batch_size: int = 8
+    # Inputs taken through the whole pipeline together; 0 runs them all at once. Every
+    # file's decoded audio is held from VAD until its subtitles are written (~0.23 GB an
+    # hour), so this is what bounds host RAM on a long --input_dir run.
+    files_per_group: int = 10
     threads: int = 0
     hf_token: Optional[str] = None
     compile: bool = False
@@ -368,8 +372,8 @@ SECTION_TITLES: Mapping[str, str] = MappingProxyType({
 CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     "model": ("language", "model", "model_dir", "model_cache_only"),
     "inference": (
-        "device", "device_index", "batch_size", "asr_compute_type", "attn_implementation",
-        "threads", "hf_token", "compile",
+        "device", "device_index", "batch_size", "files_per_group", "asr_compute_type",
+        "attn_implementation", "threads", "hf_token", "compile",
     ),
     "output": (
         "output_dir", "output_format", "verbose", "print_progress", "vram_checks",
