@@ -1,8 +1,10 @@
 import json
 import os
+import re
 import subprocess
+import threading
 from functools import lru_cache
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import numpy as np
 import torch
@@ -579,6 +581,56 @@ def _restore_container_delay(audio: np.ndarray, file: str, audio_track: int,
     return audio
 
 
+_FFMPEG_DURATION = re.compile(rb"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def _ffmpeg_with_progress(cmd: List[str], seconds: Callable[[Optional[float]], Optional[float]],
+                          bytes_per_second: int, progress: Callable[[float], None]) -> bytes:
+    """Run *cmd* for its stdout, as subprocess.run would, calling *progress* with the share
+    decoded so far.
+
+    The expected length is the input's duration from ffmpeg's own header line, passed
+    through *seconds* (which applies any clip). Until that line is read, or for an input
+    that has none, nothing is reported. stderr is drained on its own thread: ffmpeg writes
+    to it throughout, and a full pipe would stall the decode.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    err = bytearray()
+
+    def read_stderr():
+        # read1, not read: the duration line is wanted while the decode is still running.
+        while block := proc.stderr.read1(1 << 16):
+            err.extend(block)
+
+    drain = threading.Thread(target=read_stderr, daemon=True)
+    drain.start()
+    chunks, got, expected = [], 0, None
+    try:
+        while True:
+            chunk = proc.stdout.read(1 << 20)  # ~33 s of 16 kHz s16 audio
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+            if expected is None:
+                match = _FFMPEG_DURATION.search(bytes(err))
+                if match:
+                    h, m, s = match.groups()
+                    span = seconds(int(h) * 3600 + int(m) * 60 + float(s))
+                    expected = span * bytes_per_second if span and span > 0 else 0
+            if expected:
+                progress(min(got / expected, 1.0))
+        returncode = proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        drain.join()
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, cmd, b"".join(chunks), bytes(err))
+    return b"".join(chunks)
+
+
 def load_audio(file: str,
                sr: int = SAMPLE_RATE,
                audio_track: int = 0,
@@ -586,6 +638,7 @@ def load_audio(file: str,
                audio_end: Optional[float] = None,
                downmix: str = "mix",
                normalize: bool = False,
+               progress: Optional[Callable[[float], None]] = None,
                ) -> np.ndarray:
     """
     Open an audio file and read as mono waveform, resampling as necessary
@@ -624,6 +677,10 @@ def load_audio(file: str,
         and it would do it silently, in one stage only. So it is switched on
         explicitly where source media is read, and nowhere else.
 
+    progress: callable, optional
+        Called with the share of the file decoded so far, from 0 to 1, as the
+        decode streams in. Without it the decode runs exactly as it always has.
+
     Returns
     -------
     A NumPy array containing the audio waveform, in float32 dtype.
@@ -641,7 +698,13 @@ def load_audio(file: str,
             cmd += ["-map", f"0:a:{audio_track}"]
         cmd += [*post_input, *filter_args,
                 "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), "-"]
-        out = subprocess.run(cmd, capture_output=True, check=True).stdout
+        if progress is None:
+            out = subprocess.run(cmd, capture_output=True, check=True).stdout
+        else:
+            def clipped(duration):
+                end = duration if audio_end is None else min(duration, audio_end)
+                return end - (audio_start or 0.0)
+            out = _ffmpeg_with_progress(cmd, clipped, sr * 2, progress)
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
 

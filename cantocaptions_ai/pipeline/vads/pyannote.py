@@ -56,8 +56,9 @@ class Pyannote(CurveVad):
         super().__init__(kwargs['vad_onset'])
         self.vad_pipeline = load_vad_model(device, token=token, model_fp=model_fp)
 
-    def __call__(self, audio, **kwargs):
-        return self.vad_pipeline(audio)
+    def __call__(self, audio, hook=None, **kwargs):
+        # hook(completed=, total=) after each batch of windows, for a progress bar.
+        return self.vad_pipeline(audio, hook=hook)
 
     @staticmethod
     def preprocess_audio(audio):

@@ -12,6 +12,18 @@ from tqdm import tqdm
 if TYPE_CHECKING:
     from tqdm import tqdm as _TqdmBar
 
+
+class _StageBar(tqdm):
+    """A stage's bar. Its count can stand partway through a unit (ProgressReporter.partial),
+    which tqdm would print as a raw float, so it is shown to two decimals."""
+
+    @property
+    def format_dict(self):
+        d = super().format_dict
+        if d["n"] != int(d["n"]):
+            d["n"] = round(d["n"], 2)
+        return d
+
 _LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -214,6 +226,16 @@ class ProgressReporter:
     def advance(self, n: int = 1) -> None:
         self._timer._advance(n)
 
+    def partial(self, fraction: float) -> None:
+        """How far through the current unit the stage is, from 0 to 1.
+
+        For a stage whose units are few and slow: VAD counts files, so a group of one file
+        would otherwise sit at 0% until it is done. It moves the console bar only. A
+        ProgressSink never sees it, since its counts are whole units (the worker stores them
+        as integers), and the next advance() discards it.
+        """
+        self._timer._partial(fraction)
+
 
 # The StageTimer currently "in scope" on this thread, so code nested arbitrarily deep inside
 # a stage (e.g. a model download in model_utils.py) can quiet that stage's spinner for the
@@ -246,6 +268,9 @@ class StageTimer:
         self._bar: "Optional[_TqdmBar]" = None
         self._determinate: bool = False
         self._total: Optional[int] = None
+        # Whole units advanced; the bar's own count may also hold a partial one on top.
+        self._units: int = 0
+        self._last_partial: float = 0.0
         self._reporter: "ProgressReporter" = ProgressReporter(self)
         self._spinner_stop: threading.Event = threading.Event()
         self._spinner_thread: Optional[threading.Thread] = None
@@ -364,7 +389,8 @@ class StageTimer:
             self._bar.close()
 
         self._total = total if total and total > 0 else None
-        self._bar = tqdm(
+        self._units = 0
+        self._bar = _StageBar(
             total=self._total,
             desc=self._label,
             unit=unit,
@@ -383,8 +409,25 @@ class StageTimer:
             # advance() before set_total() → fall back to an unbounded bar
             self._start_determinate(0)
         if self._bar is not None:
+            # A finished unit replaces whatever partial progress was shown into it.
+            self._bar.n = self._units
             if self._total is not None:
-                n = min(n, self._total - self._bar.n)
+                n = min(n, self._total - self._units)
                 if n <= 0:
                     return
+            self._units += n
             self._bar.update(n)
+
+    def _partial(self, fraction: float) -> None:
+        if not self._summary.enabled or not self._determinate or self._bar is None:
+            return
+        if self._total is not None and self._units >= self._total:
+            return
+        # Redrawing costs a console write; a VAD hook fires ~70 times a file.
+        now = time.perf_counter()
+        if now - self._last_partial < 0.2:
+            return
+        self._last_partial = now
+        # Never the whole unit: only advance() says it is done.
+        self._bar.n = self._units + min(max(fraction, 0.0), 0.99)
+        self._bar.refresh()

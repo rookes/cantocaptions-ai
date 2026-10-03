@@ -1,4 +1,55 @@
-from cantocaptions_ai.utils.log_utils import TranscriptionSummary
+import io
+import sys
+
+from cantocaptions_ai.utils import log_utils
+from cantocaptions_ai.utils.log_utils import StageTimer, TranscriptionSummary
+
+
+class _Sink:
+    def __init__(self):
+        self.calls = []
+
+    def stage_start(self, name): pass
+    def stage_end(self, name): pass
+    def set_total(self, total, unit="it"): self.calls.append(("total", total))
+    def advance(self, n=1): self.calls.append(("advance", n))
+
+
+def test_partial_progress_moves_the_bar_but_never_reaches_a_sink(monkeypatch):
+    console = io.StringIO()
+    monkeypatch.setattr(sys, "__stdout__", console)
+    sink = _Sink()
+    with StageTimer("VAD", TranscriptionSummary(), progress=sink) as timer:
+        timer.reporter.set_total(1, unit="file")
+        timer._last_partial = -1.0          # past the redraw throttle
+        timer.reporter.partial(0.45)
+        assert timer._bar.n == 0.45
+        assert "0.45/1" in console.getvalue()
+        timer._last_partial = -1.0
+        timer.reporter.partial(1.0)         # a unit is only finished by advance()
+        assert timer._bar.n == 0.99
+        timer.reporter.advance(1)
+        assert timer._bar.n == 1
+    # The worker stores these as integers: a fraction must never get there.
+    assert sink.calls == [("total", 1), ("advance", 1)]
+
+
+def test_advance_after_partial_counts_whole_units(monkeypatch):
+    monkeypatch.setattr(sys, "__stdout__", io.StringIO())
+    with StageTimer("VAD", TranscriptionSummary()) as timer:
+        timer.reporter.set_total(3, unit="file")
+        for _ in range(3):
+            timer._last_partial = -1.0
+            timer.reporter.partial(0.5)
+            timer.reporter.advance(1)
+        assert timer._bar.n == 3
+
+
+def test_partial_is_ignored_with_console_output_off():
+    with StageTimer("VAD", TranscriptionSummary(enabled=False)) as timer:
+        timer.reporter.set_total(1)
+        timer.reporter.partial(0.5)
+        assert timer._bar is None
 
 
 def test_a_stage_run_once_per_file_group_is_one_row():

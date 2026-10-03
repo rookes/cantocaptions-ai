@@ -17,6 +17,9 @@ logger = get_logger(__name__)
 from cantocaptions_ai.pipeline.vads import Vad, Pyannote, Silero
 from cantocaptions_ai.pipeline.vads.curve import frame_middles
 
+# The part of a file's progress-bar share given to decoding it; scoring gets the rest.
+_DECODE_SHARE = 0.5
+
 
 class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
     debug_stage = "vad"
@@ -55,26 +58,56 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
     def write_debug(audio_path, result, debug_dir): write_vad_debug(audio_path, result, debug_dir)
 
     @staticmethod
-    def _extract(item):
+    def _extract(item, progress=None):
         return load_audio(
             item['audio_path'],
             audio_track=item.get('audio_track', 0),
             downmix=item.get('audio_downmix', 'mix'),
             normalize=item.get('audio_normalize', False),
+            progress=progress,
         )
+
+    def _compute(self, item, progress_callback: ProgressCallback = None):
+        """Decode and score one file, moving the console bar through it as both go.
+
+        VAD counts whole files, so with one file in a group (or a run) the bar would sit
+        at 0% until the file was done. Decoding takes the first half of the file's share and
+        scoring the second: on local disk they take about as long as each other, and over a
+        network share decoding takes longer, which only means the first half moves slower.
+        """
+        partial = getattr(progress_callback, "partial", None)
+        if partial is None:
+            return super()._compute(item, progress_callback)
+        audio = self._extract(item, progress=lambda f: partial(_DECODE_SHARE * f))
+        # Handed over as an attribute, not an argument: process() is overridden elsewhere
+        # (the test fakes), and an override that has never heard of it must still work.
+        self._scoring_progress = lambda f: partial(_DECODE_SHARE + (1 - _DECODE_SHARE) * f)
+        try:
+            return self.process(audio)
+        finally:
+            self._scoring_progress = None
 
     @staticmethod
     def _pack(item, result):
         return {**item, 'vad_segments': result}
 
     def process(self, input: np.ndarray, *, progress_callback: ProgressCallback = None) -> List[VadAudioSegment]:
-        """Run VAD on audio and return merged audio segments with timestamps."""
+        """Run VAD on audio and return merged audio segments with timestamps.
+
+        While _compute has set ``_scoring_progress``, a backend that can report how much of
+        the file it has scored does so through it (pyannote can; Silero scores in one call).
+        """
         logger.info("Performing voice activity detection...")
+        on_progress = getattr(self, "_scoring_progress", None)
+        score_kwargs = {}
         if issubclass(type(self.vad_model), Vad):
             waveform = self.vad_model.preprocess_audio(input)
             merge_chunks = self.vad_model.merge_chunks
             cover_chunks = self.vad_model.cover_chunks
             speech_regions = self.vad_model.speech_regions
+            if on_progress is not None:
+                score_kwargs["hook"] = lambda completed=0, total=0, **_: (
+                    on_progress(completed / total) if total else None)
         else:
             waveform = Pyannote.preprocess_audio(input)
             merge_chunks = Pyannote.merge_chunks
@@ -82,7 +115,8 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
             speech_regions = Pyannote.speech_regions
 
         duration = len(input) / SAMPLE_RATE
-        raw_segments = self.vad_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
+        raw_segments = self.vad_model({"waveform": waveform, "sample_rate": SAMPLE_RATE},
+                                      **score_kwargs)
         speech_spans: list = []
         if self.cover_all:
             # Split-only mode: VAD picks the cut points, but nothing is discarded. See
