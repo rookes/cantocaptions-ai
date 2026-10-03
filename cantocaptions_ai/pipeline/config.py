@@ -95,6 +95,10 @@ class PipelineConfig:
     # (~12 s per process, ~50 s the first time). "auto" compiles when the run is long
     # enough to repay it, or the process already has; see vocal_isolation.py.
     vocal_isolation_compile: str = "auto"
+    # Isolate VAD segments at most this many seconds apart as one stretch, with the real
+    # audio between them as context instead of reflected padding: ~13% less isolation
+    # work. 0 isolates every segment on its own.
+    vocal_isolation_span_gap: float = 1.0
 
     # Ensemble & LLM correction
     ensemble_model: str = "none"
@@ -378,7 +382,7 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     ),
     "vocal_isolation": (
         "vocal_isolation_method", "vocal_isolation_batch_size", "vocal_isolation_compute_type",
-        "vocal_isolation_segment_mode", "vocal_isolation_compile",
+        "vocal_isolation_segment_mode", "vocal_isolation_compile", "vocal_isolation_span_gap",
     ),
     "ensemble": (
         "ensemble_model", "llm_correction", "llm_model", "llm_model_dir", "reference_subtitle",

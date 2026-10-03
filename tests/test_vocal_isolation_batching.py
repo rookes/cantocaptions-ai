@@ -287,6 +287,108 @@ class _ScaleModel:
         return batch_t * 0.5 + 0.25 * batch_t.flip(-1)
 
 
+def _file_with_segments(spans_s, seconds=2.0, sr=16000, seed=1):
+    """A decoded 'file' and VAD-style segments cut from it as views, with their source."""
+    full = np.random.default_rng(seed).standard_normal(int(seconds * sr)).astype(np.float32)
+    segs = []
+    for start, end in spans_s:
+        f1, f2 = int(start * sr), int(end * sr)
+        segs.append({"start": start, "end": end, "audio": full[f1:f2], "source": (full, f1)})
+    return full, {"audio_path": "f.wav", "vad_segments": segs}
+
+
+class TestSpans(unittest.TestCase):
+    """--vocal_isolation_span_gap: neighbouring segments isolated as one stretch of the file."""
+
+    SEGS = [(0.10, 0.30), (0.35, 0.60), (0.62, 0.70), (1.20, 1.50), (1.55, 1.90)]
+
+    def _proc(self, span_gap, model=None, mode="chunked"):
+        return MbRoformerProcessor(
+            model=model or _FakeMbModel(), config=_no_resample_config(chunk_size=64),
+            device=torch.device("cpu"), batch_size=3, segment_mode=mode, span_gap=span_gap,
+        )
+
+    def _run(self, proc, item):
+        return proc.run([item], debug_dir=None, load_debug_dir=None)[0]["vad_segments"]
+
+    def test_grouping(self):
+        _, item = _file_with_segments(self.SEGS)
+        segs = item["vad_segments"]
+        group = lambda gap, **kw: [[segs.index(s) for s in sp]
+                                   for sp in self._proc(gap, **kw)._spans(segs)]
+        self.assertEqual(group(0.1), [[0, 1, 2], [3, 4]])
+        self.assertEqual(group(0.6), [[0, 1, 2, 3, 4]])
+        self.assertEqual(group(0.0), [[0], [1], [2], [3], [4]])  # off
+        self.assertEqual(group(0.6, mode="whole"), [[0], [1], [2], [3], [4]])
+        with mock.patch.object(vi, "_SPAN_MAX_S", 1.0):
+            self.assertEqual(group(0.6), [[0, 1, 2], [3, 4]])
+
+    def test_each_segment_is_cut_back_at_its_own_samples(self):
+        # An identity model hands the audio back, so a wrong offset shows as wrong audio.
+        _, item = _file_with_segments(self.SEGS)
+        out = self._run(self._proc(0.1), item)
+        self.assertEqual(len(out), len(self.SEGS))
+        for seg, iso in zip(item["vad_segments"], out):
+            self.assertEqual((iso["start"], iso["end"]), (seg["start"], seg["end"]))
+            np.testing.assert_allclose(iso["audio"], seg["audio"], atol=1e-6)
+            self.assertNotIn("source", iso)
+
+    def test_span_context_is_the_real_audio_between(self):
+        # Unlike the identity, a model that mixes in the time-reversed chunk depends on what
+        # surrounds each segment, so spans and single segments give different results.
+        _, item = _file_with_segments(self.SEGS)
+        alone = self._run(self._proc(0.0, _ScaleModel()), item)
+        joined = self._run(self._proc(0.1, _ScaleModel()), item)
+        self.assertFalse(np.allclose(alone[0]["audio"], joined[0]["audio"]))
+
+    def test_a_replay_decodes_the_file_and_isolates_the_same_audio(self):
+        full, item = _file_with_segments(self.SEGS)
+        fresh = self._run(self._proc(0.1, _ScaleModel()), item)
+        replay_item = {"audio_path": "f.wav", "vad_segments": [
+            {k: v for k, v in seg.items() if k != "source"} for seg in item["vad_segments"]]}
+        from cantocaptions_ai.pipeline.vad import VadProcessor
+        with mock.patch.object(VadProcessor, "_extract", return_value=full) as extract:
+            replay = self._run(self._proc(0.1, _ScaleModel()), replay_item)
+        extract.assert_called_once()
+        for a, b in zip(fresh, replay):
+            np.testing.assert_array_equal(a["audio"], b["audio"])
+
+    def test_audio_that_does_not_match_falls_back_to_single_segments(self):
+        full, item = _file_with_segments(self.SEGS)
+        for seg in item["vad_segments"]:
+            seg["source"] = (full * 2, seg["source"][1])
+        with self.assertLogs(vi.logger, "WARNING"):
+            out = self._run(self._proc(0.1, _ScaleModel()), item)
+        alone = self._run(self._proc(0.0, _ScaleModel()), _file_with_segments(self.SEGS)[1])
+        for a, b in zip(alone, out):
+            np.testing.assert_array_equal(a["audio"], b["audio"])
+
+    def test_persisted_keys_follow_each_segment(self):
+        _, item = _file_with_segments(self.SEGS)
+        item["vad_segments"][1]["expanded"] = [[0.35, 0.4]]
+        out = self._run(self._proc(0.1), item)
+        self.assertEqual(out[1]["expanded"], [[0.35, 0.4]])
+        self.assertNotIn("expanded", out[0])
+
+    def test_progress_estimate_counts_the_chunks_run(self):
+        # Proportioned like the real model (a 4 s step, gaps <= 1 s, segments many steps
+        # long): only then does joining segments save chunks rather than add the gaps' own.
+        _, item = _file_with_segments([(i * 1.05, i * 1.05 + 1.0) for i in range(5)], seconds=6.0)
+        proc = MbRoformerProcessor(
+            model=_FakeMbModel(), config=_no_resample_config(chunk_size=4096),
+            device=torch.device("cpu"), batch_size=3, span_gap=0.1,
+        )
+        estimate = sum(
+            proc._estimate_chunks(int(round((sp[-1]["end"] - sp[0]["start"]) * 16000)))
+            if len(sp) > 1 else proc._estimate_num_offsets(sp[0])
+            for sp in proc._spans(item["vad_segments"]))
+        seen = []
+        proc._separate_chunks = lambda b: (seen.append(b.shape[0]), b)[1]
+        self._run(proc, item)
+        self.assertEqual(sum(seen), estimate)
+        self.assertLess(estimate, sum(proc._estimate_num_offsets(s) for s in item["vad_segments"]))
+
+
 class _FakeCompiled:
     """Stands in for torch.compile's output: records the batch sizes it is fed, and can
     raise once to act out a failed compile or an OOM."""

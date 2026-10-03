@@ -159,6 +159,7 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
                 'start': seg['start'],
                 'end': seg['end'],
                 'audio': input[f1:f2],
+                'source': (input, f1),
             }
             # Clip the file-level expansion spans to this segment. Carried per segment
             # (rather than per file) so it survives the VAD and vocal-isolation debug
