@@ -148,6 +148,12 @@ it (about 13 minutes of speech), or when the process has compiled it already. `o
 force it either way. It needs Triton: included on Linux; on Windows install the `compile` extra.
 Without it, isolation runs uncompiled.
 
+The separator works on overlapping 8 s windows, and pads each speech segment with reflected
+audio so its edges get the same overlap. `vocal_isolation_span_gap` (default 1.0 s) isolates
+segments that close together as one stretch instead, with the real audio between them as
+context, which removes about 13% of the work at no measurable cost in accuracy. `0` isolates
+every segment on its own.
+
 ### Alignment
 
 To get an accurate timing for the subtitles, an alignment model is used (`no_align = True` to skip the timing step). 

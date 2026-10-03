@@ -51,6 +51,12 @@ _DURATION_TOLERANCE_S = 0.005  # seconds
 # it essentially never triggers in normal operation.
 _MAX_SEGMENTS_PER_WINDOW = 128
 
+# The longest stretch of neighbouring VAD segments isolated together (--vocal_isolation_span_gap).
+# A span's overlap-add buffers are three (2, length) float32 arrays at the model rate, ~130 MB
+# at 120 s; longer spans would save almost nothing more, since each span costs only about
+# one chunk on top of its length.
+_SPAN_MAX_S = 120.0
+
 # torch.compile for the chunked path (--vocal_isolation_compile). Every chunk is the same
 # (batch, 2, chunk_size) shape, so one static graph serves a whole run, once each file's
 # short last batch is padded up to size. Measured on a 3080 Ti at batch 4: eager ~152
@@ -194,6 +200,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         batch_size: Optional[int] = None,
         segment_mode: Optional[str] = None,
         compile: str = "off",
+        span_gap: float = 0.0,
     ):
         self.model = model
         self.config = config
@@ -204,6 +211,8 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             raise ValueError(f"unknown vocal isolation compile setting {compile!r} "
                              "(expected 'auto', 'on' or 'off')")
         self._compile = compile
+        # Isolate VAD segments at most this many seconds apart as one span (see _spans).
+        self._span_gap = float(span_gap)
         # Set per run by _choose_forward: the compiled model, or None to run eagerly.
         self._compiled = None
         self._compile_started = None
@@ -253,18 +262,24 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         # every call, so set_total must only be called once, up front), and decides
         # whether compiling pays.
         total_jobs = sum(
-            self._estimate_num_offsets(seg)
+            self._estimate_chunks(int(round((span[-1]['end'] - span[0]['start']) * SAMPLE_RATE)))
+            if len(span) > 1 else self._estimate_num_offsets(span[0])
             for _, item in to_compute
-            for seg in item['vad_segments']
+            for span in self._spans(item['vad_segments'])
         )
         if progress_callback is not None:
             progress_callback.set_total(total_jobs, unit="chunk")
         self._compiled = self._choose_forward(total_jobs)
 
+        source = None  # (item index, decoded file) for the file being isolated
         for window in self._iter_windows(to_compute):
             seg_state: Dict[Tuple[int, int], dict] = {}
             jobs: List[Tuple[Tuple[int, int], int]] = []
-            for idx, sdx, seg in window:
+            idx = window[0][0]
+            if source is not None and source[0] != idx:
+                source = None
+            units, source = self._units(window, item_out[idx]['item'], source)
+            for idx, sdx, seg, members in units:
                 mixture, total_length, padded = self._prepare_mixture(seg['audio'])
                 key = (idx, sdx)
                 if self._mode == "whole" and total_length <= self._whole_max:
@@ -287,6 +302,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                     'start': seg['start'],
                     'end': seg['end'],
                     'src_len': len(seg['audio']),
+                    'members': members,
                     **{k: seg[k] for k in _PERSISTED_SEGMENT_KEYS if k in seg},
                 }
                 jobs.extend((key, off) for off in offsets)
@@ -356,6 +372,92 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                 chunk = segs[start:start + _MAX_SEGMENTS_PER_WINDOW]
                 yield [(idx, start + offset, seg) for offset, seg in enumerate(chunk)]
 
+    def _spans(self, segs) -> List[list]:
+        """Group a file's segments into spans to isolate together: neighbours at most
+        span_gap seconds apart, up to _SPAN_MAX_S long. Every segment is its own span when
+        spans are off (span_gap 0) or the mode is not chunked.
+
+        Isolated on its own, a segment is padded with a border of reflected audio on each
+        side, so its edges get the 2x overlap too. VAD segments sit close together (a
+        median gap of 0.7 s on the eval episodes), so isolating neighbours as one span
+        replaces two borders of reflected audio with the real audio between them, and saves
+        about one chunk per segment joined. Every sample still gets the 2x overlap.
+        """
+        if self._span_gap <= 0 or self._mode != "chunked":
+            return [[seg] for seg in segs]
+        spans: List[list] = []
+        for seg in segs:
+            if (spans and seg['start'] - spans[-1][-1]['end'] <= self._span_gap
+                    and seg['end'] - spans[-1][0]['start'] <= _SPAN_MAX_S):
+                spans[-1].append(seg)
+            else:
+                spans.append([seg])
+        return spans
+
+    def _units(self, window, item, source):
+        """What to isolate for one window: (idx, sdx, segment-or-span, members) per unit.
+
+        A span of several segments is one unit whose audio is the file's own between its
+        first segment's start and last one's end; members lists (sdx, segment, offset) to
+        cut back out. Single segments are isolated exactly as before. source is the
+        (idx, decoded file) cached from this file's previous window, if any; the one in use
+        is returned so a file split over windows is decoded at most once.
+        """
+        singles = [(idx, sdx, seg, None) for idx, sdx, seg in window]
+        segs = [seg for _, _, seg in window]
+        spans = self._spans(segs)
+        if all(len(sp) == 1 for sp in spans):
+            return singles, source
+        idx = window[0][0]
+        full, offsets = self._file_audio(item, segs, source[1] if source else None)
+        if full is None:
+            return singles, source
+        sdx_of = {id(seg): sdx for _, sdx, seg in window}
+        offset_of = {id(seg): off for seg, off in zip(segs, offsets)}
+        units = []
+        for sp in spans:
+            first, last = sp[0], sp[-1]
+            if len(sp) == 1:
+                units.append((idx, sdx_of[id(first)], first, None))
+                continue
+            f1 = offset_of[id(first)]
+            f2 = offset_of[id(last)] + len(last['audio'])
+            span = {'start': first['start'], 'end': last['end'], 'audio': full[f1:f2]}
+            members = [(sdx_of[id(seg)], seg, offset_of[id(seg)] - f1) for seg in sp]
+            units.append((idx, sdx_of[id(first)], span, members))
+        return units, (idx, full)
+
+    @staticmethod
+    def _file_audio(item, segs, cached=None):
+        """The decoded file the segments were cut from, and each one's first sample; or
+        (None, None) if it can't be had exactly.
+
+        VAD leaves it on every segment (segment['source']). Segments read back from a VAD
+        checkpoint don't carry it, so the file is decoded again, with VAD's own loader and
+        settings: a replay must isolate the same audio a fresh run did. Either way, every
+        segment's samples are checked against the file before it is used.
+        """
+        sources = [seg.get('source') for seg in segs]
+        if all(s is not None for s in sources) and all(s[0] is sources[0][0] for s in sources):
+            full, offsets = sources[0][0], [s[1] for s in sources]
+        else:
+            full = cached
+            if full is None:
+                from cantocaptions_ai.pipeline.vad import VadProcessor
+                try:
+                    full = VadProcessor._extract(item)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Could not decode %s again to isolate its segments as spans "
+                                   "(%s); isolating them one by one.", item.get('audio_path'), e)
+                    return None, None
+            offsets = [int(seg['start'] * SAMPLE_RATE) for seg in segs]
+        for seg, off in zip(segs, offsets):
+            if not np.array_equal(full[off:off + len(seg['audio'])], seg['audio']):
+                logger.warning("The decoded audio of %s does not match its VAD segments; "
+                               "isolating them one by one.", item.get('audio_path'))
+                return None, None
+        return full, offsets
+
     def _estimate_num_offsets(self, seg) -> int:
         """Cheap approximate chunk count for a segment, for the progress bar's total
         only — mirrors _prepare_mixture's resample+pad arithmetic without actually
@@ -364,7 +466,11 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         round()); harmless since only the progress bar consumes this, never buffer
         sizing (which always uses _prepare_mixture's real, exact total_length).
         """
-        approx_len = round(len(seg['audio']) * self.model_sample_rate / SAMPLE_RATE)
+        return self._estimate_chunks(len(seg['audio']))
+
+    def _estimate_chunks(self, n_samples: int) -> int:
+        """_estimate_num_offsets for a stretch of n_samples 16 kHz samples."""
+        approx_len = round(n_samples * self.model_sample_rate / SAMPLE_RATE)
         padded = approx_len > 2 * self._border and self._border > 0
         if padded:
             approx_len += 2 * self._border
@@ -504,9 +610,31 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         """Unpad, downmix to mono, resample back to 16 kHz and file the result.
 
         `estimated` is the separated (2, total_length) stereo signal: normalized
-        overlap-add output in chunked mode, the raw model output in whole mode.
+        overlap-add output in chunked mode, the raw model output in whole mode. A span of
+        several segments (st['members']) is cut back into them at their own samples.
         """
         idx, sdx = key
+        vocals_mono = self._to_mono(st, estimated)
+        members = st.get('members')
+        if not members:
+            self._file(idx, sdx, st, vocals_mono, item_out)
+            return
+        for m_sdx, seg, offset in members:
+            self._file(idx, m_sdx, seg, vocals_mono[offset:offset + len(seg['audio'])], item_out)
+
+    def _file(self, idx, sdx, meta, audio, item_out) -> None:
+        """File one segment's isolated audio under its own timestamps and provenance."""
+        _validate_segment_duration(meta['start'], meta['end'], audio)
+        rebuilt = {'start': meta['start'], 'end': meta['end'], 'audio': audio}
+        # Isolation rewrites the audio but must not lose provenance the VAD stage
+        # attached (currently 'expanded', which --asr_context_scope reads downstream).
+        for key in _PERSISTED_SEGMENT_KEYS:
+            if key in meta:
+                rebuilt[key] = meta[key]
+        item_out[idx]['segs'][sdx] = rebuilt
+
+    def _to_mono(self, st, estimated) -> np.ndarray:
+        """The separated stereo signal as 16 kHz mono, at the input's own sample count."""
         if st['padded']:
             estimated = estimated[:, self._border:-self._border]
         vocals_mono = estimated.mean(axis=0).astype(np.float32)
@@ -526,14 +654,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                 vocals_mono = vocals_mono[:src_len]
             else:
                 vocals_mono = np.pad(vocals_mono, (0, src_len - len(vocals_mono)))
-        _validate_segment_duration(st['start'], st['end'], vocals_mono)
-        rebuilt = {'start': st['start'], 'end': st['end'], 'audio': vocals_mono}
-        # Isolation rewrites the audio but must not lose provenance the VAD stage
-        # attached (currently 'expanded', which --asr_context_scope reads downstream).
-        for key in _PERSISTED_SEGMENT_KEYS:
-            if key in st:
-                rebuilt[key] = st[key]
-        item_out[idx]['segs'][sdx] = rebuilt
+        return vocals_mono
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +672,7 @@ def load_vocal_isolation(
     local_files_only: bool = False,
     segment_mode: Optional[str] = None,
     compile: str = "off",
+    span_gap: float = 0.0,
 ) -> VocalIsolationProcessor:
     """Load a vocal isolation model and return a processor.
 
@@ -563,7 +685,8 @@ def load_vocal_isolation(
     runs under the existing autocast (see infer_fn) so activations/STFT stay numerically
     safe regardless of the stored weight dtype.
     compile is "on", "off" or "auto" (compile when the run is long enough to repay it);
-    see _COMPILE_MIN_CHUNKS.
+    see _COMPILE_MIN_CHUNKS. span_gap > 0 isolates VAD segments at most that many seconds
+    apart together (chunked mode); see MbRoformerProcessor._spans.
     """
     if model_name != "mbroformer":
         raise ValueError(
@@ -621,4 +744,5 @@ def load_vocal_isolation(
         batch_size=batch_size,
         segment_mode=segment_mode,
         compile=compile,
+        span_gap=span_gap,
     )

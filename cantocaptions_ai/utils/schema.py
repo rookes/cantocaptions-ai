@@ -46,6 +46,11 @@ class VadAudioSegment(TypedDict):
     # themselves. Persisted for the same reason as 'expanded': the score curve it came from
     # is gone by the time anything downstream wants it. Read by realign's ASR anchor.
     speech: NotRequired[List[List[float]]]
+    # The decoded file this segment's audio was cut from, and the sample it starts at. Set
+    # by VAD, never persisted: vocal isolation reads it to isolate neighbouring segments
+    # together, with the real audio between them as context. 'audio' is a view of the same
+    # array, so carrying it holds no extra memory.
+    source: NotRequired[Tuple[np.ndarray, int]]
 
 
 class SingleWordSegment(TypedDict):
