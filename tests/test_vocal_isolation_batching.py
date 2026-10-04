@@ -490,6 +490,48 @@ class TestCompiledChunks(unittest.TestCase):
         for sa, sb in zip(eager[0]["vad_segments"], out[0]["vad_segments"]):
             np.testing.assert_array_equal(sa["audio"], sb["audio"])
 
+    def _status(self, proc, items):
+        """The one line a run logs about which model it used."""
+        with self.assertLogs(vi.logger, "INFO") as logs:
+            proc.run(items, debug_dir=None, load_debug_dir=None)
+        lines = [line for line in logs.output
+                 if "Vocal isolation: " in line or "Compiling the vocal" in line]
+        self.assertEqual(len(lines), 1, logs.output)
+        return lines[0]
+
+    def test_every_run_says_which_model_it_used(self):
+        """A reused compile and a declined "auto" used to log nothing at all."""
+        with self._compile(), mock.patch.object(vi, "_COMPILE_MIN_CHUNKS", 100):
+            with mock.patch.object(vi, "_can_compile", return_value=True):
+                self.assertRegex(self._status(self._proc("auto"), _make_items(2, 4)),
+                                 r"auto: \d+ chunks, under the 100")
+                self.assertIn("Compiling the vocal isolation model for 3-chunk",
+                              self._status(self._proc("auto"), _make_items(3, 4)))
+                self.assertIn("using the compiled model (compiled earlier in this process",
+                              self._status(self._proc("auto"), _make_items(1, 1)))
+            self.assertIn("needs a CUDA device",
+                          self._status(self._proc("auto"), _make_items(3, 4)))
+            self.assertIn("vocal_isolation_compile is off",
+                          self._status(self._proc("off"), _make_items(1, 1)))
+            self.assertIn("only chunked mode compiles",
+                          self._status(self._proc("on", mode="whole"), _make_items(1, 1)))
+
+    def test_no_triton_is_named_on_a_cuda_device(self):
+        proc = self._proc("auto")
+        proc.device = torch.device("cuda")
+        with mock.patch.object(vi, "_can_compile", return_value=False), \
+                self.assertLogs(vi.logger, "INFO") as logs:
+            self.assertIsNone(proc._choose_forward(500))
+        self.assertIn("no working Triton; on Windows, install the `compile` extra",
+                      logs.output[0])
+
+    def test_after_a_failed_compile_later_runs_say_so(self):
+        with self._compile(fail=RuntimeError("triton: no working compiler")):
+            with self.assertLogs(vi.logger, "WARNING"):
+                self._proc("on").run(self._noisy_items(1), debug_dir=None, load_debug_dir=None)
+            self.assertIn("an earlier compile in this process failed",
+                          self._status(self._proc("on"), _make_items(1, 1)))
+
     def test_padding_follows_an_oom_retry_down(self):
         # Padding a retried half batch back up to full size would run out of memory again.
         with self._compile(fail=torch.cuda.OutOfMemoryError("CUDA out of memory")):
