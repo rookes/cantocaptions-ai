@@ -12,6 +12,18 @@ from tqdm import tqdm
 if TYPE_CHECKING:
     from tqdm import tqdm as _TqdmBar
 
+
+class _StageBar(tqdm):
+    """A stage's bar. Its count can stand partway through a unit (ProgressReporter.partial),
+    which tqdm would print as a raw float, so it is shown to two decimals."""
+
+    @property
+    def format_dict(self):
+        d = super().format_dict
+        if d["n"] != int(d["n"]):
+            d["n"] = round(d["n"], 2)
+        return d
+
 _LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -25,6 +37,42 @@ class TqdmLoggingHandler(logging.StreamHandler):
             self.flush()
         except Exception:
             self.handleError(record)
+
+
+# The --log_file handler, while there is one: where _InductorSmNote writes.
+_log_file_handler: Optional[logging.Handler] = None
+
+
+class _InductorSmNote(logging.Filter):
+    """Keep Inductor's "Not enough SMs to use max_autotune_gemm mode" off the console.
+
+    Inductor logs it once per process when it compiles on a GPU with fewer than 68 SMs
+    (a 4060 Ti or 5060 Ti has 34-36), in any compile mode, through its own stderr
+    handler. It only means max-autotune's matmul templates are unavailable, which the
+    default mode never uses, but on a console it reads as a failure: a user stopped a run
+    over it. It is rewritten as a note for the log file, or for --log_level debug when there
+    is none. Whether vocal isolation compiled is logged separately ("Compiled the vocal
+    isolation model ..." or "... failed; running it uncompiled").
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not record.getMessage().startswith("Not enough SMs"):
+            return True
+        avail = getattr(record, "avail_sms", "too few")
+        wanted = getattr(record, "min_sms", 68)
+        note = logging.getLogger("cantocaptions_ai.torch_compile").makeRecord(
+            "cantocaptions_ai.torch_compile", logging.INFO, record.pathname, record.lineno,
+            "torch.compile: this GPU has %s SMs, under the %s Inductor wants for "
+            "max-autotune matmul templates. Compiling goes ahead without them; this is not "
+            "an error (Inductor's own warning, kept off the console).",
+            (avail, wanted), None,
+        )
+        if _log_file_handler is not None:
+            _log_file_handler.handle(note)
+        else:
+            note.levelno, note.levelname = logging.DEBUG, "DEBUG"
+            logging.getLogger("cantocaptions_ai.torch_compile").handle(note)
+        return False
 
 
 def setup_logging(
@@ -54,6 +102,11 @@ def setup_logging(
     # lightning.pytorch imports torch.utils.flop_counter at load time, which logs a
     # spurious warning about triton being absent on CUDA-only builds (no Windows wheels).
     logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
+    inductor_utils = logging.getLogger("torch._inductor.utils")
+    if not any(isinstance(f, _InductorSmNote) for f in inductor_utils.filters):
+        inductor_utils.addFilter(_InductorSmNote())
+    global _log_file_handler
+    _log_file_handler = None
 
     logging.captureWarnings(True)
     warnings_logger = logging.getLogger("py.warnings")
@@ -72,6 +125,7 @@ def setup_logging(
             file_handler.setLevel(log_level)
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
+            _log_file_handler = file_handler
 
             warnings_file_handler = logging.StreamHandler(log_fh)
             warnings_file_handler.setFormatter(formatter)
@@ -214,6 +268,16 @@ class ProgressReporter:
     def advance(self, n: int = 1) -> None:
         self._timer._advance(n)
 
+    def partial(self, fraction: float) -> None:
+        """How far through the current unit the stage is, from 0 to 1.
+
+        For a stage whose units are few and slow: VAD counts files, so a group of one file
+        would otherwise sit at 0% until it is done. It moves the console bar only. A
+        ProgressSink never sees it, since its counts are whole units (the worker stores them
+        as integers), and the next advance() discards it.
+        """
+        self._timer._partial(fraction)
+
 
 # The StageTimer currently "in scope" on this thread, so code nested arbitrarily deep inside
 # a stage (e.g. a model download in model_utils.py) can quiet that stage's spinner for the
@@ -246,6 +310,9 @@ class StageTimer:
         self._bar: "Optional[_TqdmBar]" = None
         self._determinate: bool = False
         self._total: Optional[int] = None
+        # Whole units advanced; the bar's own count may also hold a partial one on top.
+        self._units: int = 0
+        self._last_partial: float = 0.0
         self._reporter: "ProgressReporter" = ProgressReporter(self)
         self._spinner_stop: threading.Event = threading.Event()
         self._spinner_thread: Optional[threading.Thread] = None
@@ -364,7 +431,8 @@ class StageTimer:
             self._bar.close()
 
         self._total = total if total and total > 0 else None
-        self._bar = tqdm(
+        self._units = 0
+        self._bar = _StageBar(
             total=self._total,
             desc=self._label,
             unit=unit,
@@ -383,8 +451,25 @@ class StageTimer:
             # advance() before set_total() → fall back to an unbounded bar
             self._start_determinate(0)
         if self._bar is not None:
+            # A finished unit replaces whatever partial progress was shown into it.
+            self._bar.n = self._units
             if self._total is not None:
-                n = min(n, self._total - self._bar.n)
+                n = min(n, self._total - self._units)
                 if n <= 0:
                     return
+            self._units += n
             self._bar.update(n)
+
+    def _partial(self, fraction: float) -> None:
+        if not self._summary.enabled or not self._determinate or self._bar is None:
+            return
+        if self._total is not None and self._units >= self._total:
+            return
+        # Redrawing costs a console write; a VAD hook fires ~70 times a file.
+        now = time.perf_counter()
+        if now - self._last_partial < 0.2:
+            return
+        self._last_partial = now
+        # Never the whole unit: only advance() says it is done.
+        self._bar.n = self._units + min(max(fraction, 0.0), 0.99)
+        self._bar.refresh()

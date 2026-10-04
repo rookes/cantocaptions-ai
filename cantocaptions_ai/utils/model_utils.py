@@ -286,12 +286,17 @@ class PipelineStage(ABC, Generic[InputT, OutputT]):
         for item in items:
             result = read_checkpoint(cls, item, load_debug_dir)
             if result is None:
-                result = self.process(cls._extract(item))
+                result = self._compute(item, progress_callback)
                 write_checkpoint(cls, item, result, debug_dir)
             result_items.append(cls._pack(item, result))
             if progress_callback is not None:
                 progress_callback.advance(1)
         return result_items
+
+    def _compute(self, item: dict, progress_callback: ProgressCallback = None):
+        """One item's result on a cache miss. A stage whose items are slow to process may
+        override this to report progress within the item (see VadProcessor)."""
+        return self.process(type(self)._extract(item))
 
 
 @contextmanager
