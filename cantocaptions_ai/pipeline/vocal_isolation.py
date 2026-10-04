@@ -506,16 +506,36 @@ class MbRoformerProcessor(VocalIsolationProcessor):
 
         Only chunked mode compiles: its chunks share one shape, while whole mode's
         segments are each a new length. A fixed batch size is needed for the same reason.
+
+        Every run with chunks to isolate logs which model it uses, and why when it is the
+        uncompiled one. A compile reused within the process (a later file group, the
+        worker's next job) and an "auto" that declined both used to pass in silence, so a
+        log could not say whether compiling was in use at all.
         """
-        if (self._compile == "off" or self._mode != "chunked" or not self._batch_size
-                or n_chunks == 0 or _COMPILE_FAILED):
+        if n_chunks == 0:
             return None
+        if self._compile == "off":
+            return self._uncompiled("vocal_isolation_compile is off")
+        if self._mode != "chunked":
+            return self._uncompiled(f"only chunked mode compiles, not {self._mode!r}")
+        if not self._batch_size:
+            return self._uncompiled("compiling needs a fixed vocal_isolation_batch_size")
+        if _COMPILE_FAILED:
+            return self._uncompiled("an earlier compile in this process failed")
         warm = self._shape_key(self._pad_to) in _COMPILED_SHAPES
-        if self._compile == "auto" and not (
-            _can_compile(self.device) and (warm or n_chunks >= _COMPILE_MIN_CHUNKS)
-        ):
-            return None
-        if not warm:
+        if self._compile == "auto":
+            if not _can_compile(self.device):
+                return self._uncompiled(
+                    "compiling needs a CUDA device" if self.device.type != "cuda" else
+                    "no working Triton; on Windows, install the `compile` extra")
+            if not warm and n_chunks < _COMPILE_MIN_CHUNKS:
+                return self._uncompiled(
+                    f"auto: {n_chunks} chunks, under the {_COMPILE_MIN_CHUNKS} that repay "
+                    "compiling")
+        if warm:
+            logger.info("Vocal isolation: using the compiled model (compiled earlier in this "
+                        "process for %d-chunk batches)", self._pad_to)
+        else:
             logger.info("Compiling the vocal isolation model for %d-chunk batches (once per "
                         "process; about 10-50 s)...", self._pad_to)
         # The model's rotary embeddings (rotary_embedding_torch) fill a frequency cache on
@@ -527,6 +547,11 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                 self.model(torch.zeros((1, 2, self._C), device=self.device))
         self._compile_started = None if warm else time.perf_counter()
         return _compile_model(self.model)
+
+    @staticmethod
+    def _uncompiled(reason: str) -> None:
+        logger.info("Vocal isolation: running the model uncompiled (%s)", reason)
+        return None
 
     def _separate_chunks(self, batch_t: torch.Tensor) -> torch.Tensor:
         """Run a batch of chunks through the model, compiled when the run chose it.
