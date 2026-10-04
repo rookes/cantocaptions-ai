@@ -39,6 +39,42 @@ class TqdmLoggingHandler(logging.StreamHandler):
             self.handleError(record)
 
 
+# The --log_file handler, while there is one: where _InductorSmNote writes.
+_log_file_handler: Optional[logging.Handler] = None
+
+
+class _InductorSmNote(logging.Filter):
+    """Keep Inductor's "Not enough SMs to use max_autotune_gemm mode" off the console.
+
+    Inductor logs it once per process when it compiles on a GPU with fewer than 68 SMs
+    (a 4060 Ti or 5060 Ti has 34-36), in any compile mode, through its own stderr
+    handler. It only means max-autotune's matmul templates are unavailable, which the
+    default mode never uses, but on a console it reads as a failure: a user stopped a run
+    over it. It is rewritten as a note for the log file, or for --log_level debug when there
+    is none. Whether vocal isolation compiled is logged separately ("Compiled the vocal
+    isolation model ..." or "... failed; running it uncompiled").
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not record.getMessage().startswith("Not enough SMs"):
+            return True
+        avail = getattr(record, "avail_sms", "too few")
+        wanted = getattr(record, "min_sms", 68)
+        note = logging.getLogger("cantocaptions_ai.torch_compile").makeRecord(
+            "cantocaptions_ai.torch_compile", logging.INFO, record.pathname, record.lineno,
+            "torch.compile: this GPU has %s SMs, under the %s Inductor wants for "
+            "max-autotune matmul templates. Compiling goes ahead without them; this is not "
+            "an error (Inductor's own warning, kept off the console).",
+            (avail, wanted), None,
+        )
+        if _log_file_handler is not None:
+            _log_file_handler.handle(note)
+        else:
+            note.levelno, note.levelname = logging.DEBUG, "DEBUG"
+            logging.getLogger("cantocaptions_ai.torch_compile").handle(note)
+        return False
+
+
 def setup_logging(
     level: str = "info",
     log_file: Optional[str] = None,
@@ -66,6 +102,11 @@ def setup_logging(
     # lightning.pytorch imports torch.utils.flop_counter at load time, which logs a
     # spurious warning about triton being absent on CUDA-only builds (no Windows wheels).
     logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
+    inductor_utils = logging.getLogger("torch._inductor.utils")
+    if not any(isinstance(f, _InductorSmNote) for f in inductor_utils.filters):
+        inductor_utils.addFilter(_InductorSmNote())
+    global _log_file_handler
+    _log_file_handler = None
 
     logging.captureWarnings(True)
     warnings_logger = logging.getLogger("py.warnings")
@@ -84,6 +125,7 @@ def setup_logging(
             file_handler.setLevel(log_level)
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
+            _log_file_handler = file_handler
 
             warnings_file_handler = logging.StreamHandler(log_fh)
             warnings_file_handler.setFormatter(formatter)
