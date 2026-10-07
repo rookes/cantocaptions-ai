@@ -209,7 +209,8 @@ Logistic regression, cross-validated by show (no show in both train and test):
 
 In order of expected value:
 
-1. **For the merge gate, stop using final diarization labels.** Score each boundary between
+1. **For the merge gate, stop using final diarization labels.** *Implemented as
+   `speaker_change`; see the next section.* Score each boundary between
    aligned subsegments directly, from:
    - the segmentation model's local speaker posteriors over the boundary (before
      clustering);
@@ -233,11 +234,102 @@ In order of expected value:
    changes WeSpeaker's output even with masked pooling. Batch only equal lengths, or embed
    one at a time.
 
+## The speaker-change gate (`speaker_change = True`)
+
+Recommendation 1, implemented in `pipeline/speaker_change.py` as a stage after alignment.
+It is independent of `diarize`: either or both can be on, and each can veto a merge.
+
+**What it does.** Each boundary between adjacent aligned subsegments is scored when both
+sides hold at least 0.3 s and the gap is under 1 s. It uses two features:
+- `local`: pyannote's segmentation model, run on the boundary's VAD segment, before any
+  clustering. Within each 10 s window that holds both sides, it measures how different the
+  two sides' local-speaker activity is, then averages over windows.
+- `knn_cos`: each side's WeSpeaker embedding (at most 4 s nearest the boundary) is pulled
+  toward its 10 nearest neighbours among the file's other subsegments of 1 s or more, from
+  other VAD segments. The feature is the cosine between the two pulled embeddings.
+
+A logistic model turns these into P(speaker change). At or above `speaker_change_threshold`
+(default 0.8), the right-hand subsegment gets `speaker_break`, and cue assembly will not
+join it to its left neighbour. The raw cosine is computed and logged, but given `knn_cos` it
+added nothing.
+
+**How it was fitted.** The study's 1,647 boundaries (474 changes) from 22 shows, with the
+features computed by the shipped code. Cross-validated by show: AUC 0.877.
+
+| threshold | sentences falsely split | changes caught |
+|---|---|---|
+| 0.85 | 0.5% | 21.5% |
+| **0.80 (default)** | **1.0%** | **28.5%** |
+| 0.73 | 2.0% | 34.6% |
+
+**Held-out shows.** Six shows not in the fit: Sailor Moon, Another World, War of the
+Genders, Princess Mononoke, Silver Spoon and Attack on Titan Junior High. Scored with
+`scripts/eval_diarization.py --speaker_change`:
+
+| gate | changes caught | sentences falsely split | adjacent cues called different |
+|---|---|---|---|
+| diarization labels (segment scope) | 4.8% | 0.4% | 12.2% |
+| speaker change | 23.8% | 1.4% | 20.3% |
+
+That's only 42 change boundaries, so the recall figure is coarse.
+
+**End to end, 5 eval episodes (50 min, 1,234 reference cues, mbroformer isolation).**
+Replays of the same ASR, so only cue assembly differs:
+
+| gate | CER | cues matched | starts ≤0.2 s | starts ≤0.5 s | breaks added | on a reference break |
+|---|---|---|---|---|---|---|
+| none | 8.79% | 1153 | 78.4% | 81.5% | — | — |
+| diarization labels | 8.79% | 1167 | 79.4% | 82.3% | 21 | 81% |
+| speaker change | 8.78% | 1177 | 79.8% | 82.9% | 31 | 81% |
+| both | 8.78% | 1179 | 79.9% | 83.0% | 36 | 78% |
+
+- **How to read it.** "Breaks added" counts cue boundaries the gate created over the
+  no-gate run. "On a reference break" is the share of those the reference also has. Reading
+  the rest, several are real speaker changes the reference left in one cue
+  (`飲杯咖啡先講啦， | 我唔飲咖啡啊，`, `安娜公主， | 咩啊？`).
+- **Why the gains are modest.** Most scored changes sit where punctuation already blocks
+  the merge: 182 boundaries were held, but only 31 changed a merge decision.
+
+**End to end, 7 episodes (7.0 h, 10,044 reference cues, no isolation).** Replays as above:
+
+| gate | CER | cues matched | starts ≤0.2 s | starts ≤0.5 s | breaks added | on a reference break | reference breaks restored |
+|---|---|---|---|---|---|---|---|
+| none | 14.07% | 9377 | 79.0% | 82.3% | — | — | — |
+| diarization labels | 14.07% | 9471 | 79.7% | 83.1% | 135 | 84% | 103 (8%) |
+| speaker change | 14.07% | 9559 | 80.1% | 83.5% | 240 | 75% | 171 (14%) |
+| both | 14.07% | 9573 | 80.1% | 83.6% | 268 | 75% | 185 (15%) |
+
+- **Restored breaks.** "Reference breaks restored" counts, out of the 1,235 reference cue
+  breaks at short pauses that the no-gate run merges over, how many each gate restores.
+  Many of those breaks are one speaker's line breaks, so no speaker gate could restore them.
+- **Paired bootstrap, per show (starts ≤0.2 s, 425 windows).**
+  - Speaker change vs no gate: **+1.09 pt** (95% CI +0.82 to +1.36), positive in all 7
+    shows.
+  - Speaker change vs diarization labels: **+0.42 pt** (+0.20 to +0.65).
+  - Both vs diarization labels: +0.45 pt, so adding diarization to speaker change gains
+    nothing measurable.
+- **The trade.** The gate adds more breaks than diarization at somewhat lower precision
+  (75% vs 84% land on a reference break). Some of the rest are real speaker changes the
+  reference keeps in one cue.
+- **Recommendation.** Use `speaker_change = True` in place of `diarize` for cue
+  splitting. Keep `diarize` only if you want its labels.
+
+**Cost.** About 13 s per 50 minutes of audio on an RTX 3080 Ti, with no new download (the
+diarization model's own networks).
+
+**Debugging.** With `--debug_dir`, `<stem>/speaker_change/` holds two files:
+- `boundaries.json`: every scored boundary, with its features and probability.
+- `<stem>.srt`: the subsegments, each prefixed with its probability, and `‖` where a merge
+  is held.
+
+The cue-assembly log names each veto with its probability.
+
 ## Tools
 
 - `scripts/eval_diarization.py`: scores change, same and adjacent boundaries from any
-  audio file plus verbatim subtitles that use the hyphen convention. Diarization comes from
-  a run's `--debug_dir` checkpoint, or from pyannote run in file or segment scope.
+  audio file plus verbatim subtitles that use the hyphen convention. Decisions come from a
+  run's `--debug_dir` diarization checkpoint, from pyannote run in file or segment scope,
+  or from the speaker-change model (`--speaker_change`).
   `--embeddings` adds the side-vs-side cosine separability; `--out` dumps every boundary.
 - `scripts/probe_speaker_embeddings.py`: embeds every one-speaker cue across several files
   and clusters them together. It prints each cluster's file spread, cohesion and sample

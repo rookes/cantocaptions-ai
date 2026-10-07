@@ -185,6 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     diarize_grp.add_argument("--speaker_conflict_share", default=argparse.SUPPRESS, type=float, metavar="SHARE", help="share the second speaker must hold for a subtitle to be flagged as multi-speaker (needs --flag_speaker_conflicts)")
     diarize_grp.add_argument("--flag_speaker_conflicts", action="store_true", default=argparse.SUPPRESS, help="(experimental) flag subtitles that appear to contain more than one speaker, in the diarization debug output")
     diarize_grp.add_argument("--speaker_labels", action="store_true", default=argparse.SUPPRESS, help="prefix each subtitle with its speaker label in the output; off by default, since diarization is normally used only to keep cues from merging across speakers")
+    diarize_grp.add_argument("--speaker_change", action="store_true", default=argparse.SUPPRESS, help="score each boundary between aligned clauses for a change of voice and keep cues from merging across one; independent of --diarize, and much better at this job (see docs/diarization.md)")
+    diarize_grp.add_argument("--speaker_change_threshold", default=argparse.SUPPRESS, type=float, metavar="P", help="probability of a speaker change at or above which a boundary is held (default 0.8, ~1%% of one-speaker sentences split); lower splits more eagerly")
     diarize_grp.add_argument("--speaker_embeddings", action="store_true", default=argparse.SUPPRESS, help="include speaker embeddings in JSON output (only works with --diarize)")
 
     input_grp = parser.add_argument_group("batch input")

@@ -496,6 +496,64 @@ class TestSpeakerVetoLogging(unittest.TestCase):
         )
 
 
+class TestSpeakerBreakGate(unittest.TestCase):
+    """speaker_break, from the speaker-change stage: a hard veto on joining a cue to its left."""
+
+    def test_pass_a_holds_a_marked_boundary(self):
+        cues = assemble_cues(
+            [seg(0.0, 2.0, "你好嗎，"), seg(2.04, 4.0, "幾好呀，", speaker_break=True,
+                                              speaker_change=0.93)],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["你好嗎，", "幾好呀，"])
+
+    def test_unmarked_boundary_merges_as_before(self):
+        cues = assemble_cues(
+            [seg(0.0, 2.0, "你好嗎，"), seg(2.04, 4.0, "幾好呀，", speaker_change=0.2)],
+            min_cue_duration=0,
+        )
+        self.assertEqual(len(cues), 1)
+
+    def test_the_mark_follows_the_right_boundary_through_merges(self):
+        # a|b merge (b unmarked); c is marked, so (ab)|c must still hold.
+        cues = assemble_cues(
+            [seg(0.0, 1.0, "一，"), seg(1.04, 2.0, "二，"), seg(2.04, 3.0, "三，", speaker_break=True)],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["一，二，", "三，"])
+
+    def test_a_merged_cue_does_not_carry_its_inner_mark_outward(self):
+        # b is marked, so a|b holds; b|c merges, and the result's own mark (b's) faces a.
+        cues = assemble_cues(
+            [seg(0.0, 1.0, "一，"), seg(1.04, 2.0, "二，", speaker_break=True), seg(2.04, 3.0, "三，")],
+            min_cue_duration=0,
+        )
+        self.assertEqual(texts(cues), ["一，", "二，三，"])
+
+    def test_pass_c_rescues_a_fragment_in_the_unmarked_direction(self):
+        cues = assemble_cues(
+            [
+                seg(0.0, 2.0, "你好嗎，"),
+                seg(2.15, 2.21, "係，", speaker_break=True),
+                seg(2.36, 5.0, "多謝關心。"),
+            ],
+            min_cue_duration=0.5,
+        )
+        self.assertEqual(texts(cues), ["你好嗎，", "係，多謝關心。"])
+
+    def test_veto_log_names_the_speaker_change(self):
+        logger_name = "cantocaptions_ai.pipeline.segmentation"
+        with self.assertLogs(logger_name, level="INFO") as captured:
+            assemble_cues(
+                [seg(0.0, 2.0, "你好嗎，"), seg(2.04, 4.0, "幾好呀，", speaker_break=True,
+                                                  speaker_change=0.93)],
+                min_cue_duration=0,
+            )
+        held = [m for m in captured.output if "held a cue boundary" in m]
+        self.assertEqual(len(held), 1)
+        self.assertIn("Speaker change (p=0.93)", held[0])
+
+
 class TestMergeDisabled(unittest.TestCase):
     """merge=False: the incoming cue boundaries are authoritative (--realign)."""
 

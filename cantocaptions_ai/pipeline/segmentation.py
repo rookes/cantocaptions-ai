@@ -82,8 +82,8 @@ class _MergeVetoLog:
     """Boundaries where the speaker gate blocked a merge that would otherwise have happened.
 
     Only merges that were admissible on every *other* count are recorded, so a line here
-    always means "diarization is the reason these two cues stayed separate" and never
-    "punctuation would have kept them apart anyway".
+    always means "the speaker gate (diarization labels or a speaker-change mark) is the reason
+    these two cues stayed separate" and never "punctuation would have kept them apart anyway".
 
     Keyed by boundary time because pass C rescans the whole cue list after each merge, so
     the same stranded cue is examined many times; blocked pairs never merge, so the boundary
@@ -101,7 +101,9 @@ class _MergeVetoLog:
         text = _text(segment)
         if len(text) > _VETO_PREVIEW_CHARS:
             text = text[:_VETO_PREVIEW_CHARS] + "\u2026"
-        return f"[{segment.get('speaker')}] {text}"
+        if segment.get("speaker") is not None:
+            return f"[{segment.get('speaker')}] {text}"
+        return text
 
     def report(self) -> None:
         """Log one line per held boundary, plus a count. Silent when nothing was blocked."""
@@ -112,30 +114,45 @@ class _MergeVetoLog:
 
         for boundary in sorted(self._by_boundary):
             left, right = self._by_boundary[boundary]
+            if right.get("speaker_break"):
+                change = right.get("speaker_change")
+                source = "Speaker change" + (f" (p={change:.2f})" if change is not None else "")
+            else:
+                source = "Diarization"
             logger.info(
-                "Diarization held a cue boundary at %s: %s | %s",
+                "%s held a cue boundary at %s: %s | %s",
+                source,
                 format_timestamp(boundary, always_include_hours=True, decimal_marker=","),
                 self._preview(left),
                 self._preview(right),
             )
         held = len(self._by_boundary)
         logger.info(
-            "Diarization kept %d cue %s from merging",
+            "The speaker gate kept %d cue %s from merging",
             held, "boundary" if held == 1 else "boundaries",
         )
 
 
 def _same_speaker(seg1: SingleAlignedSegment, seg2: SingleAlignedSegment) -> bool:
-    """True when merging won't destroy a speaker attribution.
+    """True when merging won't join two voices, as far as anything upstream can tell.
 
-    Segments only carry ``speaker`` when diarization ran; if either side lacks a label there
-    is nothing to contradict, so the merge is allowed.
+    Two independent signals can say no:
 
-    Under ``--diarize_scope segment``, labels are namespaced per VAD segment because speaker
-    identity is only established within one (``S0003/SPEAKER_00`` and ``S0004/SPEAKER_00`` are
-    unrelated voices). Comparing across that boundary would veto every merge spanning a VAD
-    segment on no evidence at all, so differing scopes read as "unknown" and permit the merge.
+    * ``speaker_break`` on the right-hand side, from the speaker-change stage
+      (``pipeline/speaker_change.py``): the boundary at its start was scored as a change of
+      voice. Merging keeps the left side's keys, so a merged cue carries the mark of its own
+      first subsegment, which is always the one that faces its left neighbour -- the mark
+      stays attached to the right boundary however the pieces were glued.
+    * differing ``speaker`` labels, from diarization. Segments only carry ``speaker`` when
+      diarization ran; if either side lacks a label there is nothing to contradict, so the
+      merge is allowed. Under ``--diarize_scope segment``, labels are namespaced per VAD
+      segment because speaker identity is only established within one (``S0003/SPEAKER_00``
+      and ``S0004/SPEAKER_00`` are unrelated voices). Comparing across that boundary would
+      veto every merge spanning a VAD segment on no evidence at all, so differing scopes read
+      as "unknown" and permit the merge.
     """
+    if seg2.get("speaker_break"):
+        return False
     spk1, spk2 = seg1.get("speaker"), seg2.get("speaker")
     if spk1 is None or spk2 is None:
         return True

@@ -27,6 +27,10 @@ Diarization comes from one of three sources:
     # what VAD produces, without running it.
     python scripts/eval_diarization.py --pair ep01.mkv ep01.srt --pair ep02.mkv ep02.srt --scope segment
 
+    # the speaker-change scorer (--speaker_change), on the same pseudo-VAD segments, with
+    # the file's reference cues of 1 s or more as its neighbour pool
+    python scripts/eval_diarization.py --pair ep01.mkv ep01.srt --speaker_change
+
 --embeddings also embeds both sides of every boundary with the diarization model's own
 embedding network and reports how well their cosine separates change from same, which is
 the ceiling for any veto built on comparing the two sides directly. --out writes every
@@ -208,6 +212,10 @@ def main(argv=None):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--debug_dir", help="score the diarization checkpoints of a real run")
     source.add_argument("--scope", choices=("file", "segment"), help="run pyannote here instead")
+    source.add_argument("--speaker_change", action="store_true",
+                        help="score boundaries with the speaker-change model instead of diarization")
+    parser.add_argument("--speaker_change_threshold", type=float, default=None,
+                        help="--speaker_change: decision threshold (default: the shipped one)")
     parser.add_argument("--language", default="yue", help="aligner language (default: yue)")
     parser.add_argument("--audio_track", type=int, default=0)
     parser.add_argument("--device", default="cuda")
@@ -230,7 +238,11 @@ def main(argv=None):
         files.append((audio_path, cues))
     aligner.prepare([c.text for _, cues in files for c in cues])
 
-    diarizer = None
+    diarizer = scorer = None
+    if args.speaker_change:
+        from cantocaptions_ai.pipeline.speaker_change import SpeakerChangeScorer
+        scorer = SpeakerChangeScorer.load(args.diarize_model, device=args.device,
+                                          token=args.hf_token, batch_size=args.diarize_batch_size)
     if args.scope:
         from cantocaptions_ai.pipeline.diarize import load_diarization
         diarizer = load_diarization(
@@ -246,26 +258,30 @@ def main(argv=None):
         audio = load_audio(audio_path, audio_track=args.audio_track)
         boundaries = build_boundaries(audio, cues, aligner, stem)
 
-        if args.debug_dir:
-            path = os.path.join(args.debug_dir, stem, "diarization", "result.json")
-            with open(path, encoding="utf-8") as fh:
-                result = json.load(fh)
-        elif args.scope == "file":
-            result = diarizer.process(audio)
+        if scorer is not None:
+            decisions.extend(speaker_change_decisions(scorer, audio, cues, boundaries, args))
         else:
-            result = diarizer.process(pseudo_vad_segments(audio, cues, args.merge_gap, args.chunk_size))
-        turns = sorted(result["turns"], key=lambda t: (t["start"], t["end"]))
-
-        for b in boundaries:
-            decisions.append(scoped_decision(turns, b, args.speaker_confidence))
-            if args.embeddings:
+            if args.debug_dir:
+                path = os.path.join(args.debug_dir, stem, "diarization", "result.json")
+                with open(path, encoding="utf-8") as fh:
+                    result = json.load(fh)
+            elif args.scope == "file":
+                result = diarizer.process(audio)
+            else:
+                result = diarizer.process(pseudo_vad_segments(audio, cues, args.merge_gap, args.chunk_size))
+            turns = sorted(result["turns"], key=lambda t: (t["start"], t["end"]))
+            decisions.extend(scoped_decision(turns, b, args.speaker_confidence) for b in boundaries)
+        if args.embeddings:
+            for b in boundaries:
                 cut = lambda span: audio[int(span[0] * SAMPLE_RATE):int(span[1] * SAMPLE_RATE)]
                 side_audio.append((cut(b.left), cut(b.right)))
         all_boundaries.extend(boundaries)
         counts = {k: sum(b.kind == k for b in boundaries) for k in ("change", "same", "adjacent")}
         print(f"{stem}: {counts}", flush=True)
 
-    print("\nPipeline decision (diarization turns -> speaker_assign labels -> merge gate):")
+    print("\nPipeline decision ("
+          + ("speaker-change model" if scorer is not None
+             else "diarization turns -> speaker_assign labels") + " -> merge gate):")
     for line in format_rates(decision_rates(all_boundaries, decisions)):
         print("  " + line)
     adjacent_q = [d for b, d in zip(all_boundaries, decisions) if b.kind == "adjacent" and b.meta.get("question")]
@@ -288,6 +304,29 @@ def main(argv=None):
             for b, d, c in zip(all_boundaries, decisions, cosines):
                 fh.write(json.dumps({"kind": b.kind, "source": b.source, "left": b.left, "right": b.right,
                                      "decision": d, "cosine": c, **b.meta}, ensure_ascii=False) + "\n")
+
+
+def speaker_change_decisions(scorer, audio, cues, boundaries, args) -> List[str]:
+    """"diff"/"same" per boundary from the speaker-change model ("unknown" if unscorable).
+
+    Also records the probability on each boundary's meta, so --out carries it.
+    """
+    from cantocaptions_ai.pipeline.speaker_change import DEFAULT_MODEL, DEFAULT_THRESHOLD, POOL_MIN
+
+    threshold = args.speaker_change_threshold or DEFAULT_THRESHOLD
+    vad = pseudo_vad_segments(audio, cues, args.merge_gap, args.chunk_size)
+    pool = [(c.start + 0.05, c.end - 0.1) for c in cues
+            if c.end - c.start - 0.15 >= POOL_MIN and not _NON_DIALOGUE.match(c.text)]
+    features = scorer.features(vad, [(b.left, b.right) for b in boundaries], pool)
+    out = []
+    for b, f in zip(boundaries, features):
+        if f is None:
+            out.append("unknown")
+            continue
+        p = DEFAULT_MODEL.probability(f)
+        b.meta["speaker_change"] = round(p, 4)
+        out.append("diff" if p >= threshold else "same")
+    return out
 
 
 def embedding_cosines(side_audio, args) -> List[float]:

@@ -262,6 +262,10 @@ def validate_config(cfg) -> None:
     # threshold would otherwise only surface after ASR and alignment have already run.
     if not 0 < cfg.speaker_confidence <= 1:
         raise ConfigError(f"speaker_confidence must be in (0, 1], got {cfg.speaker_confidence}")
+    if not 0 < cfg.speaker_change_threshold < 1:
+        raise ConfigError(
+            f"speaker_change_threshold must be in (0, 1), got {cfg.speaker_change_threshold}"
+        )
     if cfg.files_per_group < 0:
         raise ConfigError(
             f"files_per_group must be 0 (all inputs at once) or more, got {cfg.files_per_group}"

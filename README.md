@@ -182,6 +182,11 @@ more eagerly. Add `speaker_labels = True` if you also want each line prefixed wi
 (note: speaker identification is currently highly inaccurate).
 See [docs/diarization.md](docs/diarization.md) for measured accuracy and the scripts that score it.
 
+For keeping two speakers out of one subtitle, `speaker_change = True` works better than `diarize`. It scores
+each boundary between clauses for a change of voice directly, and on the eval episodes it catches about twice as
+many speaker changes as diarization labels, for a few seconds per episode. It uses the same gated model, and either
+or both can be on. `speaker_change_threshold` (default 0.8) trades splits for recall.
+
 Diarization requires a gated model download, so you need to accept its terms on HuggingFace and supply a 
 token (see below).
 
