@@ -709,3 +709,40 @@ def write_speaker_assignment_debug(
         f"Speaker assignment debug output written to {stage_dir} "
         f"({len(assignments)} subsegments, {flagged} flagged multi-speaker)"
     )
+
+
+def write_speaker_change_debug(
+    name: str,
+    segments: List[SingleAlignedSegment],
+    records: List[dict],
+    threshold: float,
+    debug_dir: str,
+) -> None:
+    """Write the speaker-change scores to {debug_dir}/{stem}/speaker_change/.
+
+    boundaries.json holds every scored boundary with its features; {stem}.srt shows the
+    pre-assembly subsegments, each prefixed with the probability that the voice changes at
+    its start, and "‖" where that reaches the threshold (the merge is held). A snapshot, not
+    a checkpoint: scoring re-runs on a replay, since its inputs are alignment's output.
+    """
+    from cantocaptions_ai.utils.output import WriteSRT
+
+    stage_dir = _stage_dir(name, "speaker_change", debug_dir)
+    with open(os.path.join(stage_dir, "boundaries.json"), "w", encoding="utf-8") as f:
+        json.dump({"name": name, "threshold": threshold, "boundaries": records},
+                  f, ensure_ascii=False, indent=2)
+
+    def label(segment):
+        p = segment.get("speaker_change")
+        if p is None:
+            return "[  - ]"
+        return f"[{'‖' if p >= threshold else ' '}{p:.2f}]"
+
+    shadow = {
+        "language": None,
+        "segments": [
+            {"start": s["start"], "end": s["end"], "text": f"{label(s)} {s['text'].strip()}"}
+            for s in sorted(segments, key=lambda s: (s["start"], s["end"]))
+        ],
+    }
+    WriteSRT(stage_dir)(shadow, _leaf(name), {})

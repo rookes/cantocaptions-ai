@@ -186,6 +186,14 @@ class PipelineConfig:
     speaker_conflict_share: float = 0.25
     flag_speaker_conflicts: bool = False
     speaker_labels: bool = False
+    # Score every boundary between aligned subsegments for a change of voice and refuse to
+    # merge across one (pipeline/speaker_change.py). Independent of --diarize, which it
+    # outperforms at this job: ~29% of speaker changes caught at ~1% split sentences, against
+    # ~7% for diarization labels (docs/diarization.md). Uses the same gated pyannote model.
+    speaker_change: bool = False
+    # P(speaker change) at or above which a boundary is held. Lower splits more eagerly:
+    # 0.85 / 0.80 / 0.73 measured 0.5% / 1% / 2% of one-speaker sentences split.
+    speaker_change_threshold: float = 0.8
 
     # Realign: put a transcript on the audio timeline. See pipeline/realign.py.
     realign: Optional[str] = None
@@ -417,6 +425,7 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
         "diarize", "min_speakers", "max_speakers", "diarize_model", "diarize_scope",
         "diarize_batch_size", "speaker_embeddings", "speaker_confidence",
         "speaker_conflict_share", "flag_speaker_conflicts", "speaker_labels",
+        "speaker_change", "speaker_change_threshold",
     ),
     "realign": (
         "realign", "realign_mode", "realign_max_scale", "realign_cut_policy",

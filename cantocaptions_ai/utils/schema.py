@@ -133,6 +133,12 @@ class SingleAlignedSegment(TypedDict):
     speaker: NotRequired[str]
     speaker_confidence: NotRequired[float]
     speaker_conflict: NotRequired[bool]
+    # Attached by the speaker-change stage (pipeline/speaker_change.py): P(the voice changes
+    # at this segment's start), and whether that reached the threshold, in which case cue
+    # assembly will not join this segment to the one before it. A merged cue keeps its first
+    # subsegment's values, so on a cue they describe the cue's own start.
+    speaker_change: NotRequired[float]
+    speaker_break: NotRequired[bool]
     # Why this cue's timing is doubtful, from --realign. Written to realign/suspect.srt and
     # summarised at the end of the run; see realign.REASON_HELP.
     realign_reason: NotRequired[str]

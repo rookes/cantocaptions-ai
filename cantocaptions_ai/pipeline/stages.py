@@ -228,6 +228,57 @@ def _assign_speakers(
     return items
 
 
+def _run_speaker_change(
+    items: List[ProcessingItem],
+    cfg,
+    summary: TranscriptionSummary,
+    progress: Optional[ProgressSink],
+) -> List[ProcessingItem]:
+    """Score every subsegment boundary for a change of voice and mark the held ones.
+
+    No checkpoint: its input is alignment's output, which is not checkpointed, and the
+    work is a few seconds per episode (one segmentation pass per VAD segment, one
+    embedding per subsegment).
+    """
+    from cantocaptions_ai.pipeline.speaker_change import (
+        SpeakerChangeScorer,
+        mark_breaks,
+        score_segments,
+    )
+    from cantocaptions_ai.utils.debug import write_speaker_change_debug
+
+    with StageTimer("Speaker change", summary, progress=progress) as stage:
+        scorer = load_with_offline_fallback(
+            SpeakerChangeScorer.load,
+            cfg.diarize_model,
+            device=cfg.device,
+            device_index=cfg.device_index,
+            token=cfg.hf_token,
+            model_dir=cfg.model_dir,
+            batch_size=cfg.diarize_batch_size,
+        )
+        stage.mark_inference_start()
+        stage.reporter.set_total(len(items), unit="file")
+        for item in items:
+            segments = item["result"]["segments"]
+            records = score_segments(scorer, segments, item["vad_segments"])
+            held = mark_breaks(segments, cfg.speaker_change_threshold)
+            logger.info(
+                "Speaker change: %d of %d subsegment boundaries scored, %d held "
+                "(threshold %.2f)", len(records), max(0, len(segments) - 1), held,
+                cfg.speaker_change_threshold,
+            )
+            if cfg.debug_dir is not None:
+                write_speaker_change_debug(
+                    item_name(item), segments, records, cfg.speaker_change_threshold,
+                    cfg.debug_dir,
+                )
+            stage.reporter.advance(1)
+    del scorer
+    flush_vram()
+    return items
+
+
 def _load_realign_checkpoint(item: dict, realign_path: str, load_debug_dir: Optional[str]):
     """Cached line placements for *item*, or None if absent or made under other settings."""
     from cantocaptions_ai.utils.checkpoints import checkpoint_is_current
@@ -1208,12 +1259,28 @@ class SpeakerAssignStage(Stage):
         return _assign_speakers(items, ctx.cfg, debug_dir=ctx.cfg.debug_dir)
 
 
+class SpeakerChangeStage(Stage):
+    """After alignment, like diarization: scores each boundary between aligned subsegments
+    for a change of voice and marks the ones cue assembly must not merge across."""
+
+    name = "Speaker change"
+    key = "speaker_change"
+    timed = True
+
+    def active(self, ctx):
+        return bool(ctx.cfg.speaker_change)
+
+    def run(self, ctx, items):
+        return _run_speaker_change(items, ctx.cfg, ctx.summary, ctx.progress)
+
+
 # --- The list -----------------------------------------------------------------------------
 
 DEFAULT_STAGES = (
     VadStage, VocalIsolationStage, RealignAcousticStage, AsrContextStage, TranscriptionStage,
     EnsembleStage, ReferenceMatchStage, LlmCorrectionStage, RealignAsrStage,
     PreAlignCleanStage, AlignmentStage, TimestampsStage, DiarizationStage, SpeakerAssignStage,
+    SpeakerChangeStage,
 )
 
 
