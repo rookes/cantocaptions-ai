@@ -180,6 +180,7 @@ Set `diarize = True` to attempt to check the speaker for each cue. By default, t
 stop one subtitle from being used for two different speakers' dialogue. Lower `speaker_confidence` to split
 more eagerly. Add `speaker_labels = True` if you also want each line prefixed with `[SPEAKER_00]:` 
 (note: speaker identification is currently highly inaccurate).
+See [docs/diarization.md](docs/diarization.md) for measured accuracy and the scripts that score it.
 
 Diarization requires a gated model download, so you need to accept its terms on HuggingFace and supply a 
 token (see below).
