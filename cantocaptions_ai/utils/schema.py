@@ -61,6 +61,10 @@ class SingleWordSegment(TypedDict):
     start: float
     end: float
     score: float
+    # Weakest character's peak own-token probability (alignment._align_segment). Unlike
+    # ``score``, which averages in the blank's probability over held frames, this is low
+    # when the model did not hear the word here.
+    peak: NotRequired[float]
     speaker: NotRequired[str]  # attached by speaker_assign when diarization ran
 
 class SingleCharSegment(TypedDict):
@@ -71,6 +75,7 @@ class SingleCharSegment(TypedDict):
     start: float
     end: float
     score: float
+    peak: NotRequired[float]  # highest own-token probability on the character's frames
 
 class TimeStampChar(TypedDict):
     """

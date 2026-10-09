@@ -7,8 +7,8 @@ be compared against the second it actually belongs at, which is the only honest 
 whether the placement search works. Nothing else in the repo can tell you that -- SubER and
 CER score *text*, and --realign never changes the text.
 
-    uv run python scripts/eval_realign.py --audio test/bluey/bluey_test.wav \
-        --groundtruth test/bluey/bluey_groundtruth.srt
+    uv run python scripts/eval_realign.py --audio experiments/fixtures/bluey/bluey_test.wav \
+        --groundtruth experiments/fixtures/bluey/bluey_groundtruth.srt
     uv run python scripts/eval_realign.py ... --anchor both
     uv run python scripts/eval_realign.py ... --worst 20
 

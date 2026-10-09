@@ -209,7 +209,7 @@ MIN_CHUNK_DURATION = 0.1
 # vowel that scores well against almost any voiced frame, so the search will happily park it
 # in earlier audio and drag the cue's start back with it.
 #
-# Measured on test/bluey: 7 interjection-initial lines drifted -2.62s on average (worst
+# Measured on experiments/fixtures/bluey: 7 interjection-initial lines drifted -2.62s on average (worst
 # -8.81s) while the other 125 averaged +0.07s (worst -0.35s). The confidence score does not
 # see this at all -- those misplacements scored 0.96-0.99, higher than the median -- because
 # the model really is confident, just about the wrong frame. So the detached token has to be

@@ -109,6 +109,54 @@ class CorrectionPrompts:
 
 
 @dataclass(frozen=True)
+class ProofreadStandard:
+    """One transcription standard a language's subtitles can be proofread against.
+
+    Everything the LLM proofreading stage (``pipeline/proofread``) needs to know about a
+    language or a house style, as data. The stage's own prompt carries the instructions that
+    never vary -- what to return, how to decide, how names work -- and splices these in, so a
+    new language or a second standard for the same language is one more instance, not new
+    code. Every field has a neutral default: a language with no standard still proofreads,
+    for meaning alone.
+
+    ``language_name``  -- how the prompt names the written language ("written Cantonese").
+    ``description``    -- a paragraph on who the subtitles are for and what the standard is.
+    ``error_examples`` -- Markdown bullets added to the prompt's list of error kinds, for
+                          errors particular to this language (its particles, its homophones).
+    ``conventions``    -- a Markdown file of spelling and usage conventions, appended whole.
+    ``foreign_register`` -- characters (or words, for a spaced script) of a *different*
+                          register the subtitles must not acquire: an edit introducing one is
+                          applied as a flag for review instead. Written Cantonese uses this
+                          for Standard Written Chinese function characters, which the model
+                          otherwise borrows from a reference subtitle.
+    ``foreign_register_name`` -- what to call that register in the flag.
+    ``name_example``   -- forms of one made-up name (full, short, nickname), for the prompt's
+                          instruction that each form is its own entry.
+    ``final_particles`` -- the language's sentence-final particles (characters, or words for
+                          a spaced script). Which one was said is usually a matter of tone,
+                          which a text-only proofreader cannot hear and a reference in another
+                          language cannot settle, so by default (``proofread_particles =
+                          protect``) a change to a clause-final run of them is not applied
+                          but kept as a flag. Empty: nothing is protected.
+    ``final_particle_rule`` -- the prompt bullet saying so, added to "what is not an error"
+                          while particles are protected.
+    ``final_particle_errors`` -- the prompt bullet describing particle errors, added to the
+                          error kinds instead when ``proofread_particles = allow``.
+    """
+    name: str
+    language_name: str
+    description: str = ""
+    error_examples: str = ""
+    conventions: Optional[Path] = None
+    foreign_register: Tuple[str, ...] = ()
+    foreign_register_name: str = ""
+    name_example: str = ""
+    final_particles: Tuple[str, ...] = ()
+    final_particle_rule: str = ""
+    final_particle_errors: str = ""
+
+
+@dataclass(frozen=True)
 class RunProfile:
     """Everything the stages need for one run: a language pack resolved for one ASR model.
 
@@ -148,6 +196,23 @@ class LanguagePack:
     # () -> CharReadings, for alignment's vocab repair. A factory so that importing a pack
     # never imports its pronunciation data; None: only per-model substitution tables apply.
     char_readings: Optional[Callable[[], CharReadings]] = None
+    # Standards the optional LLM proofreading stage can hold this language's subtitles to,
+    # by name, and the one used when the config names none. Empty: proofreading still runs,
+    # with the neutral standard_for() fallback (meaning only, no conventions).
+    proofreading: Mapping[str, ProofreadStandard] = field(default_factory=dict)
+    default_proofreading: Optional[str] = None
+
+    def standard_for(self, name: Optional[str]) -> ProofreadStandard:
+        """The named proofreading standard, this language's default, or a neutral one."""
+        key = name or self.default_proofreading
+        if key is not None:
+            if key not in self.proofreading:
+                raise KeyError(
+                    f"language '{self.code}' has no proofreading standard {key!r}"
+                    + (f"; it has: {', '.join(sorted(self.proofreading))}"
+                       if self.proofreading else ""))
+            return self.proofreading[key]
+        return ProofreadStandard(name="generic", language_name=self.code)
 
     @property
     def fully_supported(self) -> bool:

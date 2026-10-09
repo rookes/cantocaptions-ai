@@ -247,3 +247,5 @@ output/
 # NAME.cfg presets, all kept out of git. Its README stays, so a clone has the directory.
 config/*
 !config/README.md
+
+experiments/*

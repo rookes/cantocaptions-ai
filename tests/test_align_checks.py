@@ -157,7 +157,7 @@ class TestGappedCues(unittest.TestCase):
     """A cue holding a silence between two of its own adjacent characters.
 
     CTC must place every token it is given, so a cue whose text contains something not said
-    where the cue sits gets those characters put wherever scores least badly. On test/bluey,
+    where the cue sits gets those characters put wherever scores least badly. On experiments/fixtures/bluey,
     ASR emitted 爸爸， once for what the reference has as two separate calls: the first 爸
     landed 3.35 s before the second, and the subtitle appeared that far ahead of the speech.
     """

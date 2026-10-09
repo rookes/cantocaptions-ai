@@ -16,6 +16,17 @@ put here, except this file.
   vocal_isolation_method = mbroformer
   ```
 
+  This is also the only place an online stage should be switched on by default. LLM
+  proofreading needs the network and an API key and costs money per run, so the shipped
+  presets keep it off; opt in here if you want it on every run:
+
+  ```ini
+  [proofreading]
+  proofread = gemini
+  ```
+
+  The API key itself belongs in the environment (`GEMINI_API_KEY`), not in this file.
+
 * `NAME.cfg`: a preset for `--cfg NAME`. A file here named like a shipped preset
   (`default`, `cpu`, `fast_test`) replaces it.
 

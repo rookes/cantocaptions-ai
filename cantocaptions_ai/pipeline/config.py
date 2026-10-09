@@ -267,6 +267,10 @@ class PipelineConfig:
     # Constant offset applied to every reference cue before use, for a reference sourced
     # from a different release or OCR'd with a systematic lag. Affects both consumers.
     reference_offset: float = 0.0
+    # Under --realign, which timeline the reference follows: 'subtitle' (the --realign
+    # input's own timings) or 'media' (the audio/video's). Decides whether proofreading
+    # runs before realign, on the input, or after it, on the realigned cues.
+    reference_timing: Optional[str] = None
 
     # Reference subtitle as ASR context (experimental). Routes the same
     # --reference_subtitle file into Qwen3-ASR's context-biasing system prompt and,
@@ -284,6 +288,40 @@ class PipelineConfig:
     # timeline. Every cue is included -- there is no confidence gate -- so this is the
     # only knob controlling how much audio the reference contributes.
     asr_context_padding: float = 0.5
+
+    # LLM proofreading (stage 9; pipeline/proofread). OFF by default and never turned on by
+    # anything but the user: it is the one stage that needs the network and costs money per
+    # run, against the library's offline contract. Enable per run (--proofread gemini) or as
+    # a personal default in user.cfg ([proofreading] proofread = gemini).
+    proofread: str = "none"
+    # None: the provider's default (gemini-3.7-flash; claude-opus-5-5).
+    proofread_model: Optional[str] = None
+    # Thinking effort. "medium" measured at half the cost of "high" for about one fewer
+    # correction per forty cues.
+    proofread_effort: str = "medium"
+    # A standard the language pack registers (LanguagePack.proofreading); None: its default.
+    proofread_standard: Optional[str] = None
+    # Markdown file replacing the standard's conventions, and a file replacing the stage's
+    # whole prompt template (pipeline/proofread/prompt.md, placeholders optional).
+    proofread_conventions: Optional[str] = None
+    proofread_prompt: Optional[str] = None
+    # Text file with a paragraph about the show (who's who, setting), sent with each file.
+    proofread_context: Optional[str] = None
+    # Edits below this confidence become flags for review instead of being applied.
+    proofread_min_confidence: str = "low"
+    proofread_particles: str = "protect"
+    # Refuse a request whose estimated cost (US dollars) exceeds this. None: no ceiling.
+    # A whole episode measured around a tenth of this on the default model.
+    proofread_max_cost: Optional[float] = 1.0
+    # Write each request (and its token and cost estimate) without sending it.
+    proofread_dry_run: bool = False
+    # Seconds before a request is abandoned and retried once.
+    proofread_timeout: float = 1800.0
+    # Cues per request; 0 sends each file whole, which is what lets the model reconcile
+    # names across it. Set only for inputs too long for one request.
+    proofread_chunk_cues: int = 0
+    proofread_chunk_context: int = 6
+    proofread_parallel: int = 4
 
     @classmethod
     def from_args(cls, args: dict) -> "PipelineConfig":
@@ -381,6 +419,7 @@ SECTION_TITLES: Mapping[str, str] = MappingProxyType({
     "cleaning": "text cleaning",
     "diarization": "diarization",
     "realign": "existing transcript",
+    "proofreading": "LLM proofreading (online, opt-in)",
 })
 
 CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
@@ -404,7 +443,7 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     ),
     "ensemble": (
         "ensemble_model", "llm_correction", "llm_model", "llm_model_dir", "reference_subtitle",
-        "reference_correction_semantic", "reference_offset",
+        "reference_correction_semantic", "reference_offset", "reference_timing",
     ),
     "asr_context": (
         "asr_context", "asr_context_template", "asr_context_scope", "asr_context_neighbours",
@@ -431,6 +470,12 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
         "realign", "realign_mode", "realign_max_scale", "realign_cut_policy",
         "realign_adjust_tolerance", "realign_normalize", "realign_sync_anchor_density",
         "realign_anchor", "realign_window", "realign_commit_margin", "realign_min_score",
+    ),
+    "proofreading": (
+        "proofread", "proofread_model", "proofread_effort", "proofread_standard",
+        "proofread_conventions", "proofread_prompt", "proofread_context",
+        "proofread_min_confidence", "proofread_particles", "proofread_max_cost", "proofread_dry_run",
+        "proofread_timeout", "proofread_chunk_cues", "proofread_chunk_context", "proofread_parallel",
     ),
 })
 

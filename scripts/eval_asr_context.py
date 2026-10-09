@@ -34,9 +34,9 @@ Caveats on the measurement's validity
 
 Usage:
     uv run python scripts/eval_asr_context.py \
-        --audio test/bluey/bluey_test.wav \
-        --reference test/bluey/bluey_standardchinese.srt \
-        --groundtruth test/bluey/bluey_groundtruth.srt
+        --audio experiments/fixtures/bluey/bluey_test.wav \
+        --reference experiments/fixtures/bluey/bluey_standardchinese.srt \
+        --groundtruth experiments/fixtures/bluey/bluey_groundtruth.srt
 
     uv run python scripts/eval_asr_context.py ... --diff
     uv run python scripts/eval_asr_context.py ... --sweep template

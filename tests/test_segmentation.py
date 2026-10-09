@@ -215,6 +215,55 @@ class TestRescueDirection(unittest.TestCase):
         self.assertEqual(texts(cues), ["你係咪做錯事？", "係。唔好意思。"])
 
 
+def voiced(start, chars, end=None):
+    """A segment whose chars carry timings: (char, start, end) triples. Punctuation included."""
+    toks = [{"char": c, "start": a, "end": b, "score": 0.9} for c, a, b in chars]
+    return {"start": start, "end": end if end is not None else toks[-1]["end"],
+            "text": "".join(c for c, _, _ in chars), "words": toks, "chars": toks}
+
+
+class TestSpokenPauseDirection(unittest.TestCase):
+    """A short fragment joins the side it is spoken closer to, not the side the cue edges say.
+
+    Each clause ends in a comma that alignment maps to blank, so the comma's dwell fills the
+    pause after it and every cue touches its neighbours at the edges. The pause between the
+    last spoken character on one side and the first on the other is what tells a name that
+    opens the next line from one that closes the previous.
+    """
+
+    # Each test caps a line at 8 characters so only one of the two joins fits: with every
+    # boundary a clean comma, pass A would otherwise merge all three clauses into one cue
+    # and hide which side the name went to.
+
+    def _three(self, pause_before, pause_after):
+        # "...氣息喎，" | "阿明，" | "你收聲啊，" with the given spoken pauses either side.
+        a_end = 10.0
+        b0 = a_end + pause_before
+        b1 = b0 + 0.25
+        c0 = b1 + pause_after
+        first = voiced(8.0, [("氣", 8.0, 8.5), ("息", 8.5, 9.0), ("喎", 9.0, a_end), ("，", a_end, b0)])
+        name = voiced(b0, [("阿", b0, b0 + 0.12), ("明", b0 + 0.12, b1), ("，", b1, c0)])
+        last = voiced(c0, [("你", c0, c0 + 0.2), ("收", c0 + 0.2, c0 + 0.4), ("聲", c0 + 0.4, c0 + 0.6),
+                           ("啊", c0 + 0.6, c0 + 0.8), ("，", c0 + 0.8, c0 + 1.0)])
+        return [first, name, last]
+
+    def test_name_spoken_closer_to_the_next_line_joins_it(self):
+        cues = assemble_cues(self._three(pause_before=0.36, pause_after=0.20), min_cue_duration=0.5,
+                             max_chars=8)
+        self.assertEqual(texts(cues), ["氣息喎，", "阿明，你收聲啊，"])
+
+    def test_name_spoken_closer_to_the_previous_line_stays_with_it(self):
+        cues = assemble_cues(self._three(pause_before=0.10, pause_after=0.40), min_cue_duration=0.5,
+                             max_chars=8)
+        self.assertEqual(texts(cues), ["氣息喎，阿明，", "你收聲啊，"])
+
+    def test_pass_a_alone_is_unchanged(self):
+        # With passes B-D off nothing would place a held-back fragment, so none is held.
+        cues = assemble_cues(self._three(pause_before=0.36, pause_after=0.20), min_cue_duration=0,
+                             max_chars=8)
+        self.assertEqual(texts(cues), ["氣息喎，阿明，", "你收聲啊，"])
+
+
 class TestDurationFloor(unittest.TestCase):
     """Pass D."""
 
@@ -622,7 +671,7 @@ class TestEmptyCuesAreRefused(unittest.TestCase):
     def test_a_long_empty_cue_is_dropped_although_pass_b_would_keep_it(self):
         # Pass B only drops a cue *shorter* than min_cue_duration, deliberately: a long cue
         # with noisy text may still be speech. An empty one is different, and is commonly the
-        # longest cue in the file (20.2s on test/bluey).
+        # longest cue in the file (20.2s on experiments/fixtures/bluey).
         out = assemble_cues([self._cue(1.0, 1.4, "你好"), self._cue(5.0, 25.0, "")],
                             min_cue_duration=0.5, merge_gap=0.25)
         self.assertEqual([c["text"] for c in out], ["你好"])

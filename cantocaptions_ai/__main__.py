@@ -100,8 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
     output_grp.add_argument("--print_progress", type=str2bool, default=argparse.SUPPRESS, help="if True, display stage progress bars and a timing summary; also enables per-batch progress in transcribe() and align() methods")
     output_grp.add_argument("--vram_checks", type=str2bool, default=argparse.SUPPRESS, help="if True, proactively estimate and log per-stage/per-batch VRAM headroom before running it (queries torch.cuda.mem_get_info each call); set False for zero per-batch overhead when turnaround time matters more than OOM safety margins")
     output_grp.add_argument("--vram_headroom_mb", type=int, default=argparse.SUPPRESS, help="caps the CUDA allocator this many MB below the device ceiling so a near-OOM raises a catchable error (triggering adaptive batch-size halving) instead of silently paging GPU memory into host RAM (very slow on Windows/WDDM); 0 disables; CUDA-only")
-    output_grp.add_argument("--debug_dir", type=str, default=argparse.SUPPRESS, help="if set, write intermediate stage data (audio segments and JSON manifests) to this directory for debugging and replay")
-    output_grp.add_argument("--load_debug_dir", type=str, default=argparse.SUPPRESS, help="load intermediate stage data from a previous --debug_dir run; completed stages are skipped and their results are loaded instead")
+    output_grp.add_argument("--debug_dir", type=str, default=argparse.SUPPRESS, help="if set, write intermediate stage data (audio segments and JSON manifests) to this directory for debugging and replay. Writing only: checkpoints already in it are not reused unless the same directory is also passed as --load_debug_dir")
+    output_grp.add_argument("--load_debug_dir", type=str, default=argparse.SUPPRESS, help="load intermediate stage data from a previous --debug_dir run; completed stages are skipped and their results are loaded instead. To reuse some stages of an earlier run in a new one, copy those stage folders into a fresh directory and pass it as both --debug_dir and --load_debug_dir")
 
     audio_grp = parser.add_argument_group("audio")
     audio_grp.add_argument("--audio_start", type=float, default=argparse.SUPPRESS, help="seconds of audio to skip before processing")
@@ -136,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     ensemble_grp.add_argument("--reference_subtitle", type=str, default=argparse.SUPPRESS, metavar="SUBTITLE_FILE", help="same-content subtitle file in another language (SRT/VTT), used as reference by --llm_correction and/or --asr_context; fixes homophone errors in proper nouns, idioms, etc. (requires one of those two)")
     ensemble_grp.add_argument("--reference_correction_semantic", action="store_true", default=argparse.SUPPRESS, help="also attempt semantic fixes from the reference subtitle (e.g. missing negations, punctuation); higher false-positive risk, requires --reference_subtitle")
     ensemble_grp.add_argument("--reference_offset", type=float, default=argparse.SUPPRESS, metavar="SECONDS", help="shift every --reference_subtitle cue by this many seconds before use (negative = earlier); for a reference that runs consistently early or late against the audio. If the offset drifts rather than being constant, use --realign with --realign_mode sync, which fits a transform instead of a single shift")
+    ensemble_grp.add_argument("--reference_timing", type=str, default=argparse.SUPPRESS, choices=["subtitle", "media"], help="with --realign: which timeline --reference_subtitle follows. 'subtitle': the --realign input's own timings, so proofreading runs first, on the input, and realign places the corrected text. 'media': the audio/video's timings, so proofreading runs after realign, on the realigned cues. Required when --realign, --proofread and --reference_subtitle are combined, since a reference on the wrong timeline pairs every line with the wrong reference line")
 
     ctx_grp = parser.add_argument_group("asr context (experimental)")
     ctx_grp.add_argument("--asr_context", action="store_true", default=argparse.SUPPRESS, help="feed --reference_subtitle into Qwen3-ASR's context-biasing system prompt so each VAD segment decodes with its matching reference cues as background knowledge (experimental; measure with scripts/eval_asr_context.py)")
@@ -189,6 +190,24 @@ def build_parser() -> argparse.ArgumentParser:
     diarize_grp.add_argument("--speaker_change_threshold", default=argparse.SUPPRESS, type=float, metavar="P", help="probability of a speaker change at or above which a boundary is held (default 0.8, ~1%% of one-speaker sentences split); lower splits more eagerly")
     diarize_grp.add_argument("--speaker_embeddings", action="store_true", default=argparse.SUPPRESS, help="include speaker embeddings in JSON output (only works with --diarize)")
 
+    proof_grp = parser.add_argument_group("LLM proofreading (online, opt-in)")
+    proof_grp.add_argument("--proofread", type=str, default=argparse.SUPPRESS, choices=["none", "gemini", "anthropic"], help="send each file's finished subtitles to a hosted LLM for proofreading against the language's standard, with --reference_subtitle as evidence when given. OFF by default: this is the only stage that needs the network and costs money per run (roughly ten US cents per 25-minute episode on the default Gemini model). Needs pip install 'cantocaptions_ai[proofread]' and GEMINI_API_KEY or ANTHROPIC_API_KEY in the environment. To make it your default, set it in user.cfg")
+    proof_grp.add_argument("--proofread_input", nargs="+", default=argparse.SUPPRESS, metavar="SUBTITLE", help="proofread these existing subtitle files (SRT/WebVTT) instead of transcribing audio: no audio input, no ASR, no GPU. Needs --proofread (or proofread in user.cfg); --reference_subtitle is optional, and with one input only. Writes NAME.proofread.srt to --output_dir, never over the input; cue timings and untouched cues are kept exactly")
+    proof_grp.add_argument("--proofread_model", type=str, default=argparse.SUPPRESS, metavar="MODEL", help="the provider's model id; default gemini-3.7-flash for gemini, claude-opus-5-5 for anthropic")
+    proof_grp.add_argument("--proofread_effort", type=str, default=argparse.SUPPRESS, choices=["low", "medium", "high", "xhigh", "max"], help="how much the model thinks; thinking is most of the cost. medium measured at half the cost of high for about one fewer correction per forty cues; on a whole episode high took over 25 minutes, so keep medium")
+    proof_grp.add_argument("--proofread_standard", type=str, default=argparse.SUPPRESS, metavar="NAME", help="one of the proofreading standards the language pack registers (yue: cantocaptions); default the language's own")
+    proof_grp.add_argument("--proofread_conventions", type=str, default=argparse.SUPPRESS, metavar="FILE", help="Markdown file of spelling and usage conventions replacing the standard's own; the way to hold subtitles to a different house style, or to give a language without a standard some conventions")
+    proof_grp.add_argument("--proofread_prompt", type=str, default=argparse.SUPPRESS, metavar="FILE", help="file replacing the stage's whole prompt template (pipeline/proofread/prompt.md); the placeholders {LANGUAGE_NAME}, {DESCRIPTION}, {ERROR_EXAMPLES}, {NAME_EXAMPLE} and {CONVENTIONS} are filled in when present. The output format it asks for must stay the same")
+    proof_grp.add_argument("--proofread_context", type=str, default=argparse.SUPPRESS, metavar="FILE", help="text file with a paragraph about the show (who is who, setting, recurring terms), sent with every file")
+    proof_grp.add_argument("--proofread_particles", type=str, default=argparse.SUPPRESS, choices=["protect", "allow"], help="protect (default): changes to sentence-final particles are listed as flags, not applied -- which one was said is a matter of tone the model cannot hear; allow: let the model change them")
+    proof_grp.add_argument("--proofread_min_confidence", type=str, default=argparse.SUPPRESS, choices=["low", "medium", "high"], help="edits the model marks below this confidence are listed as flags for review instead of applied")
+    proof_grp.add_argument("--proofread_max_cost", type=optional_float, default=argparse.SUPPRESS, metavar="USD", help="refuse a request whose estimated cost exceeds this many US dollars (estimated from the provider's free token count and its price); the file is then written unproofread. None removes the ceiling")
+    proof_grp.add_argument("--proofread_dry_run", type=str2bool, default=argparse.SUPPRESS, help="if True, write each request and its token and cost estimate without sending anything")
+    proof_grp.add_argument("--proofread_timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS", help="seconds before a request is abandoned and retried once")
+    proof_grp.add_argument("--proofread_chunk_cues", type=int, default=argparse.SUPPRESS, metavar="N", help="cues per request; 0 (default) sends each file whole, which is what lets the model make a name consistent across it. Set only for inputs too long for one request")
+    proof_grp.add_argument("--proofread_chunk_context", type=int, default=argparse.SUPPRESS, metavar="N", help="with --proofread_chunk_cues: this many read-only cues of the neighbouring chunks shown either side of each one (default 6), so a line at a chunk edge is read in context")
+    proof_grp.add_argument("--proofread_parallel", type=int, default=argparse.SUPPRESS, metavar="N", help="with --proofread_chunk_cues: how many chunk requests run at once (default 4). The first chunk always goes alone, so the prompt cache is in place before the rest start")
+
     input_grp = parser.add_argument_group("batch input")
     input_grp.add_argument("--input_dir", type=str, default=argparse.SUPPRESS, metavar="DIR", help="directory of media files to transcribe (mutually exclusive with positional audio args)")
     input_grp.add_argument("--recursive", action="store_true", default=argparse.SUPPRESS, help="when used with --input_dir, also scan subdirectories for media files")
@@ -222,10 +241,19 @@ def cli():
     audio = merged.get("audio") or []
     input_dir = merged.pop("input_dir", None)
     recursive = merged.pop("recursive", False)
+    proofread_input = merged.pop("proofread_input", None)
+    if proofread_input:
+        if audio or input_dir:
+            parser.error("--proofread_input proofreads existing subtitles; it takes no audio "
+                         "files or --input_dir")
+        merged.pop("audio", None)
+        from cantocaptions_ai.pipeline.transcribe import proofread_task
+        proofread_task(merged, parser, proofread_input)
+        return
     if audio and input_dir:
         parser.error("positional audio files and --input_dir are mutually exclusive")
     if not audio and not input_dir:
-        parser.error("provide at least one audio file or --input_dir")
+        parser.error("provide at least one audio file, --input_dir, or --proofread_input SUBTITLE")
     if input_dir:
         try:
             audio = discover_media_files(input_dir, recursive=recursive)

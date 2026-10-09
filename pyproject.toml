@@ -53,6 +53,9 @@ transformers_qwen = [
 flash-attn = [
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+# The SDKs for the LLM proofreading stage (--proofread). Installing them turns nothing on:
+# the stage stays off, and the pipeline offline, until it is enabled per run or in user.cfg.
+proofread = ["google-genai>=2.0", "anthropic>=1.0"]
 # Every optional extra.
 full = [
     "faster-whisper>=1.0.0",
@@ -60,6 +63,8 @@ full = [
     "triton; sys_platform == 'linux'",
     "triton-windows<3.7; sys_platform == 'win32'",
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "google-genai>=2.0",
+    "anthropic>=1.0",
 ]
 
 [project.scripts]
@@ -73,7 +78,7 @@ build-backend = "setuptools.build_meta"
 packages = { find = { where = ["."], include = ["cantocaptions_ai*"] } }
 
 [tool.setuptools.package-data]
-cantocaptions_ai = ["languages/yue/opencc/*", "languages/yue/rules/*.toml", "assets/*", "pipeline/align_substitutions/*.toml", "presets/*.cfg"]
+cantocaptions_ai = ["languages/yue/opencc/*", "languages/yue/rules/*.toml", "assets/*", "pipeline/align_substitutions/*.toml", "presets/*.cfg", "languages/yue/proofread/*.md", "pipeline/proofread/*.md"]
 
 # torchcodec (transitive dep of pyannote-audio >=4) has no wheels for Windows, macOS, or Linux aarch64.
 # Only Linux x86_64 has torchcodec wheels; everywhere else we override it away.

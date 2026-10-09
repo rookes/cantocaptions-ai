@@ -8,7 +8,7 @@ ground truth.
 
     # once per fixture (needs the align model, a few minutes)
     uv run python scripts/bench_realign_placement.py cache --name bluey \
-        --audio test/bluey/bluey_test.wav --groundtruth test/bluey/bluey_groundtruth.srt
+        --audio experiments/fixtures/bluey/bluey_test.wav --groundtruth experiments/fixtures/bluey/bluey_groundtruth.srt
 
     # then as often as you like (seconds, no model)
     uv run python scripts/bench_realign_placement.py score --name bluey --worst 10

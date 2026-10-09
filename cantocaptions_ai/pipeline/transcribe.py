@@ -89,6 +89,10 @@ def _merge_and_write(
     collect: bool = False,
     audio_start_offset: float = 0.0,
     display_paths: Optional[dict] = None,
+    proofreader=None,
+    reference_cues: Optional[list] = None,
+    load_debug_dir: Optional[str] = None,
+    output_dir: Optional[str] = None,
 ) -> List[ProcessingItem]:
     """Assemble cues, clean, offset, then write (unless writer is None) and/or return results.
 
@@ -100,6 +104,9 @@ def _merge_and_write(
 
     ``layout`` (text -> text) breaks lines when there is no ``cleaner`` to do it; with a
     cleaner, line breaking is one of its own manifest steps.
+
+    ``proofreader`` (``pipeline/proofread``, None unless the user enabled it) runs last on
+    the finished cues, on the source timeline so ``reference_cues`` line up with them.
     """
     # An ordinary merge is capped at one subtitle line, but a short-cue rescue may use the
     # full multi-line budget -- the cleaner's linebreak step will split the result across
@@ -186,11 +193,235 @@ def _merge_and_write(
         # Map clip-relative times back onto the source-media timeline before output.
         _offset_result_times(result, audio_start_offset)
 
+        if proofreader is not None and result["segments"]:
+            _proofread(proofreader, name, result, reference_cues, cleaner, layout,
+                       debug_dir, load_debug_dir, output_dir=output_dir if writer else None)
+
         if writer is not None:
             writer(result, name, writer_args)
         if collect:
             finalized.append({'audio_path': audio_path, 'name': name, 'result': result})
     return finalized
+
+
+def _load_reference(cfg) -> Optional[list]:
+    """``--reference_subtitle``'s cues with ``--reference_offset`` applied, or None."""
+    if not cfg.reference_subtitle:
+        return None
+    from cantocaptions_ai.utils.subtitles import load_subtitle_file
+    logger.info("Loading reference subtitle: %s", cfg.reference_subtitle)
+    reference_cues = load_subtitle_file(cfg.reference_subtitle)
+    logger.info("Loaded %d reference subtitle lines.", len(reference_cues))
+    if cfg.reference_offset:
+        from cantocaptions_ai.pipeline.reference_context import shift_cues
+        before = len(reference_cues)
+        reference_cues = shift_cues(reference_cues, cfg.reference_offset)
+        logger.info(
+            "Shifted reference subtitle by %+.3fs (%d cue(s), %d dropped before zero)",
+            cfg.reference_offset, len(reference_cues), before - len(reference_cues),
+        )
+    return reference_cues
+
+
+def proofreads_before_realign(cfg) -> bool:
+    """Whether this run proofreads the ``--realign`` input first, rather than its output.
+
+    First whenever the input carries timings and the reference (if any) shares them
+    (``reference_timing = subtitle``): the corrected text is then what realign places, and the
+    reference pairs with the cues it was timed against. A reference timed to the media
+    (``media``), or a bare transcript with nothing to pair it against, waits for the
+    realigned cues instead.
+    """
+    if cfg.proofread == "none" or not cfg.realign:
+        return False
+    from cantocaptions_ai.utils.subtitles import subtitle_has_timings
+    if not subtitle_has_timings(cfg.realign):
+        return False
+    return not cfg.reference_subtitle or cfg.reference_timing == "subtitle"
+
+
+def _proofread_realign_input(cfg, collect: bool = False):
+    """Proofread the ``--realign`` input on its own timeline; return *cfg* realigning the copy.
+
+    The corrected copy is written as ``{input stem}.proofread.srt`` (to ``output_dir``, or a
+    temporary folder when nothing is written to disk) beside the review files, exactly as
+    ``--proofread_input`` would write it, and the returned config points ``realign`` at it
+    with proofreading switched off so the realigned result is not proofread twice. No text
+    cleaning here: the realign run cleans (or, for a finished subtitle, deliberately does
+    not clean) the whole file afterwards.
+    """
+    import tempfile
+    from cantocaptions_ai.languages import get_language_pack
+    from cantocaptions_ai.pipeline.proofread import load_proofreader
+    from cantocaptions_ai.utils.output import WriteSRT
+    from cantocaptions_ai.utils.subtitles import read_subtitle_cues
+
+    src = cfg.realign
+    stem = os.path.splitext(os.path.basename(src))[0]
+    pack = get_language_pack(cfg.language)
+    proofreader = load_proofreader(cfg, pack, pack.resolve(cfg.model))
+    segments = [{"start": c.start, "end": c.end, "text": c.text} for c in read_subtitle_cues(src)]
+    result = {"segments": segments, "language": cfg.language}
+    logger.info("Proofreading the realign input before realigning it (%d cues): %s",
+                len(segments), src)
+    out_dir = tempfile.mkdtemp(prefix="cantocaptions-proofread-") if collect else cfg.output_dir
+    os.makedirs(out_dir, exist_ok=True)
+    _proofread(proofreader, stem, result, _load_reference(cfg), None, None,
+               cfg.debug_dir, cfg.load_debug_dir, output_dir=out_dir)
+    WriteSRT(out_dir)(result, f"{stem}.proofread", build_writer_args(cfg))
+    path = os.path.join(out_dir, f"{stem}.proofread.srt")
+    logger.info("Realigning the proofread copy: %s", path)
+    return dataclasses.replace(cfg, realign=path, proofread="none")
+
+
+def _build_cleaner(cfg, pack, profile):
+    """``(cleaner, layout)`` for *cfg*: at most one is set, and both are None when neither applies.
+
+    Constructed eagerly by callers so bad rule files fail before any model inference.
+    """
+    if not cfg.no_clean_text:
+        from cantocaptions_ai.cleaning import SubtitleCleaner
+        spec = pack.cleaning  # validate_config guarantees one when cleaning is on
+        return SubtitleCleaner(
+            rules_dir=cfg.clean_rules_dir or spec.rules_dir,
+            line_max_length=cfg.max_line_width,
+            max_line_count=cfg.max_line_count,
+            # How much cleaning the text needs depends on how the model writes it, so the
+            # step manifest comes from the model's conventions like every other output one.
+            manifest=profile.cleaning.manifest,
+            builtin_steps=spec.builtin_steps(),
+            noise_tokens=spec.noise_tokens,
+            layout=profile.script.layout,
+        ), None
+    if cfg.max_line_width:
+        # --no_clean_text turns off the rewriting, not the line limits the user also set:
+        # line breaking lives in the cleaner's manifest, so it is applied on its own here.
+        from cantocaptions_ai.cleaning.layout import linebreak_step
+        return None, linebreak_step(cfg.max_line_width, cfg.max_line_count, profile.script.layout)
+    return None, None
+
+
+def proofread_task(args: dict, parser: argparse.ArgumentParser, inputs: List[str]) -> None:
+    """CLI adapter for ``--proofread_input``: proofread existing subtitles, no audio and no ASR.
+
+    The same stage as at the end of a normal run, on cues read from disk instead of
+    produced: each file is one request (or ``proofread_chunk_cues`` chunks), with
+    ``--reference_subtitle`` interleaved when one is given. Validation errors become
+    ``parser.error`` like :func:`transcribe_task`'s.
+    """
+    from cantocaptions_ai.errors import ConfigError
+    from cantocaptions_ai.pipeline.config import PipelineConfig
+    from cantocaptions_ai.utils.output import output_names
+    from cantocaptions_ai.utils.subtitles import subtitle_has_timings
+
+    cfg = PipelineConfig.from_args(args)
+    try:
+        validate_config(cfg)
+        if cfg.proofread == "none":
+            raise ConfigError("proofread_input needs a provider: --proofread gemini or "
+                              "--proofread anthropic (or proofread = ... in user.cfg)")
+        for path in inputs:
+            if not os.path.isfile(path):
+                raise ConfigError(f"proofread_input file not found: {path}")
+            if not subtitle_has_timings(path):
+                raise ConfigError(f"proofread_input must be a timed subtitle (SRT or WebVTT): {path}")
+        if cfg.reference_subtitle and len(inputs) > 1:
+            raise ConfigError("reference_subtitle is one file's reference; pass one "
+                              "proofread_input with it, or leave it out")
+        names = output_names(inputs)
+    except ConfigError as e:
+        parser.error(str(e))
+    proofread_files(inputs, cfg, names)
+
+
+def proofread_files(paths: List[str], cfg, names: Optional[Dict[str, str]] = None) -> List[dict]:
+    """Proofread finished subtitle files and write ``{name}.proofread.{ext}`` for each.
+
+    Cue timings and every cue the model leaves alone come out exactly as they went in;
+    edited cues go back through text cleaning (unless ``no_clean_text``), as in a normal run.
+    The input is never overwritten: the output name carries ``.proofread`` even when
+    ``output_dir`` is the input's own folder. Returns ``{'path', 'name', 'result'}`` per file.
+    Assumes *cfg* has passed :func:`validate_config`.
+    """
+    from cantocaptions_ai.languages import get_language_pack
+    from cantocaptions_ai.pipeline.proofread import load_proofreader
+    from cantocaptions_ai.utils.output import output_names
+    from cantocaptions_ai.utils.subtitles import read_subtitle_cues
+
+    pack = get_language_pack(cfg.language)
+    profile = pack.resolve(cfg.model)
+    cleaner, layout = _build_cleaner(cfg, pack, profile)
+    proofreader = load_proofreader(cfg, pack, profile)
+    names = names or output_names(paths)
+
+    reference_cues = _load_reference(cfg)
+    if reference_cues is None:
+        logger.info("No reference subtitle: proofreading from the text alone")
+
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    writer = get_writer(cfg.output_format, cfg.output_dir)
+    writer_args = build_writer_args(cfg)
+    done = []
+    for path in paths:
+        name = names[path]
+        # Line breaks kept: inside a cue one usually marks a change of speaker.
+        segments = [{"start": c.start, "end": c.end, "text": c.text}
+                    for c in read_subtitle_cues(path)]
+        result = {"segments": segments, "language": cfg.language}
+        logger.info("Proofreading %s (%d cues)", path, len(segments))
+        _proofread(proofreader, name, result, reference_cues, cleaner, layout,
+                   cfg.debug_dir, cfg.load_debug_dir, output_dir=cfg.output_dir)
+        if not cfg.proofread_dry_run:
+            writer(result, f"{name}.proofread", writer_args)
+        done.append({"path": path, "name": name, "result": result})
+    return done
+
+
+def _proofread(proofreader, name, result, reference_cues, cleaner, layout,
+               debug_dir, load_debug_dir, output_dir: Optional[str] = None) -> None:
+    """Stage 9: proofread one file's finished cues in place. A failure costs only itself.
+
+    A request that fails or would exceed ``proofread_max_cost`` leaves the file exactly as
+    the rest of the pipeline wrote it, with a warning: a finished subtitle is worth more than
+    a proofreading attempt. Edited cues go back through the cleaner (or the line layout), so
+    a correction is held to the same rules as everything else, and one the cleaner reduces to
+    noise is dropped like any other.
+
+    The model's answers and the review files (``changes.srt``, ``flags.srt``,
+    ``summary.json``) are kept whatever the settings, since they were paid for: in the debug
+    stage dir when there is one, else in ``{output_dir}/{name}.proofread/``.
+    """
+    from cantocaptions_ai.pipeline.proofread.providers import ProviderError
+
+    segments = result["segments"]
+    save_dir = None
+    if not debug_dir and output_dir:
+        save_dir = os.path.join(output_dir, *f"{name}.proofread".split("/"))
+    try:
+        done = proofreader.run(name, segments, reference=reference_cues or [],
+                               debug_dir=debug_dir, load_debug_dir=load_debug_dir,
+                               save_dir=save_dir)
+    except ProviderError as e:
+        spent = e.usage.get("cost_usd") if getattr(e, "usage", None) else None
+        logger.warning("Proofreading skipped for %s: %s%s", name, e,
+                       f" (the attempt cost ${spent:.3f})" if spent else "")
+        return
+    edited = {e["id"] for e in done.edits}
+    if cleaner is not None or layout is not None:
+        kept = []
+        for k, segment in enumerate(segments, 1):
+            if k in edited:
+                text = cleaner.clean(segment["text"]) if cleaner is not None else layout(segment["text"])
+                if cleaner is not None and cleaner.is_noise(text):
+                    continue
+                segment["text"] = text
+            kept.append(segment)
+        result["segments"] = kept
+    cost = done.usage.get("cost_usd")
+    logger.info(
+        "Proofreading %s: %d cue(s) edited, %d flagged for review%s%s", name, len(edited),
+        len(done.flags), f", {done.replayed} answer(s) replayed" if done.replayed else "",
+        f", ${cost:.3f}" if cost else "")
 
 
 def _validate_language_support(cfg) -> None:
@@ -283,8 +514,9 @@ def validate_config(cfg) -> None:
     # would run to completion and its output would be thrown away.
     if cfg.ensemble_model != "none" and not cfg.llm_correction:
         raise ConfigError("ensemble_model requires llm_correction")
-    if cfg.reference_subtitle and not (cfg.llm_correction or cfg.asr_context):
-        raise ConfigError("reference_subtitle requires llm_correction or asr_context")
+    if cfg.reference_subtitle and not (cfg.llm_correction or cfg.asr_context
+                                       or cfg.proofread != "none"):
+        raise ConfigError("reference_subtitle requires llm_correction, asr_context or proofread")
     if cfg.reference_correction_semantic and not cfg.reference_subtitle:
         warnings.warn("reference_correction_semantic has no effect without reference_subtitle")
     if cfg.asr_context and not cfg.reference_subtitle:
@@ -325,6 +557,24 @@ def validate_config(cfg) -> None:
         )
     if cfg.reference_offset and not cfg.reference_subtitle:
         warnings.warn("reference_offset has no effect without reference_subtitle")
+    if cfg.reference_timing not in (None, "subtitle", "media"):
+        raise ConfigError(f"reference_timing must be 'subtitle' or 'media', got {cfg.reference_timing!r}")
+    if cfg.reference_timing and not (cfg.realign and cfg.reference_subtitle):
+        warnings.warn("reference_timing has no effect without realign and reference_subtitle "
+                      "(without realign, a reference always follows the media's timeline)")
+    if cfg.realign and cfg.reference_subtitle and cfg.proofread != "none":
+        from cantocaptions_ai.utils.subtitles import subtitle_has_timings
+        if cfg.reference_timing is None:
+            raise ConfigError(
+                "realign with proofread and reference_subtitle needs reference_timing: "
+                "'subtitle' if the reference is timed like the --realign input (proofreading then "
+                "runs first, on the input), or 'media' if it is timed to this audio/video "
+                "(proofreading then runs after realign, on the realigned cues)")
+        if cfg.reference_timing == "subtitle" and os.path.isfile(cfg.realign) \
+                and not subtitle_has_timings(cfg.realign):
+            raise ConfigError(
+                "reference_timing 'subtitle' needs a --realign input with timings to pair the "
+                f"reference with, and {cfg.realign} is a bare transcript; use 'media'")
     if cfg.realign:
         from cantocaptions_ai.pipeline.realign import REALIGN_MODES, resolve_realign_mode
         from cantocaptions_ai.utils.subtitles import subtitle_has_timings
@@ -417,6 +667,53 @@ def validate_config(cfg) -> None:
     for option, from_profile in LANGUAGE_DEFAULTED.items():
         if getattr(cfg, option) is None:
             setattr(cfg, option, from_profile(profile))
+
+    _validate_proofreading(cfg)
+
+
+def _validate_proofreading(cfg) -> None:
+    """Fail at startup, not after an hour of ASR, if proofreading cannot run.
+
+    Off (the default) checks nothing: the stage then never imports a provider SDK or reads
+    the environment. A dry run needs neither SDK nor key, since it sends nothing.
+    """
+    from cantocaptions_ai.errors import ConfigError
+
+    if cfg.proofread == "none":
+        return
+    from cantocaptions_ai.languages import get_language_pack
+    from cantocaptions_ai.pipeline.proofread.providers import PROVIDERS, preflight
+    if cfg.proofread not in PROVIDERS:
+        raise ConfigError(f"proofread must be 'none' or one of {PROVIDERS}, got {cfg.proofread!r}")
+    try:
+        get_language_pack(cfg.language).standard_for(cfg.proofread_standard)
+    except KeyError as e:
+        raise ConfigError(str(e.args[0])) from None
+    for option in ("proofread_conventions", "proofread_prompt", "proofread_context"):
+        path = getattr(cfg, option)
+        if path and not os.path.isfile(path):
+            raise ConfigError(f"{option} file not found: {path}")
+    if cfg.proofread_chunk_context < 0:
+        raise ConfigError(f"proofread_chunk_context must be >= 0, got {cfg.proofread_chunk_context}")
+    if cfg.proofread_parallel < 1:
+        raise ConfigError(f"proofread_parallel must be >= 1, got {cfg.proofread_parallel}")
+    if cfg.proofread_particles not in ("protect", "allow"):
+        raise ConfigError("proofread_particles must be protect or allow, got "
+                          f"{cfg.proofread_particles!r}")
+    if cfg.proofread_min_confidence not in ("low", "medium", "high"):
+        raise ConfigError("proofread_min_confidence must be low, medium or high, got "
+                          f"{cfg.proofread_min_confidence!r}")
+    if cfg.proofread_max_cost is not None and cfg.proofread_max_cost <= 0:
+        raise ConfigError(f"proofread_max_cost must be positive or None, got {cfg.proofread_max_cost}")
+    if cfg.proofread_chunk_cues < 0:
+        raise ConfigError(f"proofread_chunk_cues must be 0 (whole file) or more, got "
+                          f"{cfg.proofread_chunk_cues}")
+    if cfg.proofread_timeout <= 0:
+        raise ConfigError(f"proofread_timeout must be positive, got {cfg.proofread_timeout}")
+    if not cfg.proofread_dry_run:
+        problem = preflight(cfg.proofread)
+        if problem:
+            raise ConfigError(f"proofread {cfg.proofread}: {problem}")
 
 
 def _prepare_clips(audio_paths: List[str], cfg):
@@ -536,6 +833,12 @@ def _execute_pipeline(
         names = output_names(originals)
     name_of = {p: names[orig] for p, orig in zip(audio_paths, originals)}
 
+    # --realign with proofreading, on an input with timings: proofread the input on its own
+    # timeline first and realign the corrected copy (see proofreads_before_realign). Done
+    # before anything reads cfg.realign, so every stage and checkpoint sees the copy.
+    if proofreads_before_realign(cfg):
+        cfg = _proofread_realign_input(cfg, collect=collect)
+
     # The settings each stage's debug checkpoint must have been made with to be replayed;
     # carried on every item so the stages can check what they read (utils/checkpoints.py).
     from cantocaptions_ai.utils.checkpoints import checkpoint_settings
@@ -591,25 +894,8 @@ def _execute_pipeline(
                 "Text cleaning skipped: --realign_mode %s preserves the subtitle's own text "
                 "(it is already a finished subtitle, not a raw transcript)", realign_mode,
             )
-    elif not cfg.no_clean_text:
-        from cantocaptions_ai.cleaning import SubtitleCleaner
-        spec = pack.cleaning  # validate_config guarantees one when cleaning is on
-        cleaner = SubtitleCleaner(
-            rules_dir=cfg.clean_rules_dir or spec.rules_dir,
-            line_max_length=cfg.max_line_width,
-            max_line_count=cfg.max_line_count,
-            # How much cleaning the text needs depends on how the model writes it, so the
-            # step manifest comes from the model's conventions like every other output one.
-            manifest=profile.cleaning.manifest,
-            builtin_steps=spec.builtin_steps(),
-            noise_tokens=spec.noise_tokens,
-            layout=profile.script.layout,
-        )
-    elif cfg.max_line_width:
-        # --no_clean_text turns off the rewriting, not the line limits the user also set:
-        # line breaking lives in the cleaner's manifest, so it is applied on its own here.
-        from cantocaptions_ai.cleaning.layout import linebreak_step
-        layout = linebreak_step(cfg.max_line_width, cfg.max_line_count, profile.script.layout)
+    else:
+        cleaner, layout = _build_cleaner(cfg, pack, profile)
 
     if cfg.load_debug_dir:
         missing = [
@@ -631,25 +917,18 @@ def _execute_pipeline(
         from cantocaptions_ai.pipeline.realign import realign_punctuation
         realign_punct = realign_punctuation(profile.punctuation, profile.script)
 
+    # None unless the user turned proofreading on (the default is off): it is the one stage
+    # that needs the network. Built up front so a bad standard or override file fails here.
+    from cantocaptions_ai.pipeline.proofread import load_proofreader
+    proofreader = load_proofreader(cfg, pack, profile)
+
     summary = TranscriptionSummary(enabled=cfg.print_progress)
     process_start = time.perf_counter()
 
     # Loaded once here because two stages want it: VAD expansion (stage 1) and ASR
     # context (stage 3), plus LLM reference correction (stage 3c) further down.
-    reference_cues = None
-    if cfg.reference_subtitle:
-        from cantocaptions_ai.utils.subtitles import load_subtitle_file
-        logger.info("Loading reference subtitle: %s", cfg.reference_subtitle)
-        reference_cues = load_subtitle_file(cfg.reference_subtitle)
-        logger.info("Loaded %d reference subtitle lines.", len(reference_cues))
-        if cfg.reference_offset:
-            from cantocaptions_ai.pipeline.reference_context import shift_cues
-            before = len(reference_cues)
-            reference_cues = shift_cues(reference_cues, cfg.reference_offset)
-            logger.info(
-                "Shifted reference subtitle by %+.3fs (%d cue(s), %d dropped before zero)",
-                cfg.reference_offset, len(reference_cues), before - len(reference_cues),
-            )
+    reference_cues = _load_reference(cfg)
+    if reference_cues is not None:
         if cfg.asr_context and len(audio_paths) > 1:
             warnings.warn(
                 f"asr_context is using one reference subtitle for {len(audio_paths)} audio "
@@ -717,6 +996,8 @@ def _execute_pipeline(
             max_cue_duration=cfg.max_cue_duration,
             order_cues=bool(cfg.realign),
             collect=collect, audio_start_offset=audio_start_offset, display_paths=display_paths,
+            proofreader=proofreader, reference_cues=reference_cues, output_dir=cfg.output_dir,
+            load_debug_dir=cfg.load_debug_dir,
         )
         del items
 

@@ -75,10 +75,35 @@ class _InductorSmNote(logging.Filter):
         return False
 
 
+def make_console_safe() -> None:
+    """Stop console output from raising on characters the stream cannot encode.
+
+    Every console handler and the end-of-run summary write to ``sys.__stdout__``. Redirected
+    to a file on Windows, that stream takes the locale's code page (cp1252), so the first
+    log line carrying a CJK character, an arrow or the summary's box-drawing rule raised
+    ``UnicodeEncodeError`` -- after every output had been written, turning a successful run
+    into exit status 1. A redirected stream is switched to UTF-8 (what a log file of this
+    pipeline's text needs anyway); a real console keeps its encoding and replaces what it
+    cannot show.
+    """
+    for stream in (sys.__stdout__, sys.__stderr__):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            if stream.isatty():
+                reconfigure(errors="replace")
+            else:
+                reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):  # a closed or detached stream: nothing to protect
+            pass
+
+
 def setup_logging(
     level: str = "info",
     log_file: Optional[str] = None,
 ) -> None:
+    make_console_safe()
     logger = logging.getLogger("cantocaptions_ai")
 
     logger.handlers.clear()

@@ -602,6 +602,56 @@ def write_segment_notes(
     return len(annotated)
 
 
+def proofread_checkpoint_path(name: str, debug_dir: str, chunk: int) -> str:
+    """{debug_dir}/{stem}/proofread/chunk_NN.json, the paid answer for one request."""
+    return os.path.join(_stage_dir(name, "proofread", debug_dir), f"chunk_{chunk:02d}.json")
+
+
+def write_proofread_debug(name: str, debug_dir: str, chunk: int, record: dict,
+                          request_text: str) -> str:
+    """Save one proofreading request's answer (and the request itself, for reading).
+
+    ``record`` carries ``request_hash``, which is what makes the checkpoint reusable: see
+    load_proofread_debug.
+    """
+    return write_proofread_record(_stage_dir(name, "proofread", debug_dir), chunk, record,
+                                  request_text)
+
+
+def write_proofread_record(directory: str, chunk: int, record: dict, request_text: str) -> str:
+    """``write_proofread_debug`` into any directory -- the output folder, when there is no
+    debug dir, so an answer that was paid for is never thrown away."""
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"chunk_{chunk:02d}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False, indent=1)
+    with open(path[:-len(".json")] + ".request.md", "w", encoding="utf-8") as f:
+        f.write(request_text)
+    return path
+
+
+def load_proofread_debug(name: str, debug_dir: str, chunk: int, request_hash: str) -> Optional[dict]:
+    """A saved proofreading answer for exactly this request, or None.
+
+    Reused only when the request is byte-identical. The answer's edits are keyed by cue
+    number, so replaying it against a draft that has since changed (a different ASR model,
+    a cleaning rule edit, another reference) would rewrite the wrong cues -- the same reason
+    the realign checkpoint refuses a different transcript. A mismatch costs a new request,
+    which is logged.
+    """
+    path = proofread_checkpoint_path(name, debug_dir, chunk)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        record = json.load(f)
+    if record.get("request_hash") != request_hash:
+        logger.warning(
+            "Ignoring proofreading checkpoint %s: it answers a different request (the draft, "
+            "reference, prompt or model changed); a new request will be made", path)
+        return None
+    return record
+
+
 def load_realign_debug(name: str, transcript_path: str, debug_dir: str) -> Optional[list]:
     """Load coarse realign placements from a previous debug run, or None if unusable.
 

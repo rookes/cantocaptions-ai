@@ -10,6 +10,10 @@ for the transcription step, alvanlii's [wav2vec2-BERT-Cantonese model](https://h
 alignment step, and adds a wide array of other subtitling improvements designed specifically for written
 Cantonese. The target written Cantonese standard is the [CantoCaptions standard](https://cantocaptions.com).
 
+An optional proofreading pass through a hosted LLM is available, but it is off unless you turn it on
+(see [Online proofreading](#online-proofreading-opt-in)); nothing else in the pipeline needs the network once
+the models are downloaded.
+
 ## Prerequisites
 
 - Python 3.10, 3.11, or 3.12
@@ -28,7 +32,7 @@ uv sync
 This installs all dependencies into an isolated virtual environment and pins exact versions; every ASR
 family (Qwen3-ASR, Whisper, CTC) runs on it. Torch is pulled from the PyTorch CUDA 12.8 index on Linux
 and Windows; the CPU build is used on macOS. Optional extras: `compile` (triton, for `--compile`),
-`ensemble`, `llm`, `flash-attn`, or `full` for all of them. `transformers_qwen` is the old name of
+`ensemble`, `llm`, `flash-attn`, `proofread` (the hosted-LLM clients for `--proofread`), or `full` for all of them. `transformers_qwen` is the old name of
 `compile` and still works.
 
 ## Basic Usage
@@ -190,6 +194,78 @@ or both can be on. `speaker_change_threshold` (default 0.8) trades splits for re
 Diarization requires a gated model download, so you need to accept its terms on HuggingFace and supply a 
 token (see below).
 
+### Online proofreading (opt-in)
+
+The finished subtitles can be sent to a hosted LLM (Gemini or Claude) for a proofreading pass. This is
+the one stage that needs the network and costs money per run, so it is **never on by default**: you
+enable it per run with `--proofread gemini`, or make it your own default in `config/user.cfg`:
+
+```ini
+[proofreading]
+proofread = gemini
+```
+
+It needs the client libraries (`uv sync --extra proofread`) and an API key in the environment,
+`GEMINI_API_KEY` or `ANTHROPIC_API_KEY`. Keys are read from the environment only; do not put them in a
+config file.
+
+```bash
+uv run cantocaptions_ai episode.mkv --proofread gemini --reference_subtitle episode.chi.srt
+```
+
+The proofreader works best with `--reference_subtitle`: a same-content subtitle in another language (for
+Cantonese, usually a Standard Chinese track) is interleaved with the cues by time, which is what lets it
+recover names and mishearings the ASR could not. It is told to correct what was *said*, never to copy the
+reference's wording. Its answer is structured (name decisions, per-cue edits, doubts) and is applied in code:
+edits that would drift into a foreign register (Standard Written Chinese forms such as 的/這/沒 for Cantonese)
+or that the model marks below `proofread_min_confidence` are refused and listed for review instead, and every
+edited cue goes back through text cleaning. Cue timings and boundaries never change: the model may not move
+words from one cue to another, and a pair of edits that does is listed for review rather than applied.
+
+Sentence-final particles (啦/喇, 吖/啊, 㗎/𠿪 …) are left alone by default. Which one was said is a matter of
+tone, which a text-only model cannot hear, and in testing its particle changes were wrong several times as
+often as right. The prompt tells it not to change them, and any change it proposes anyway is listed in
+`flags.srt` instead of being applied. `proofread_particles = allow` lifts this.
+
+Measured on Cantonese episodes with a human-made reference transcript and a Standard Chinese reference
+subtitle, using Gemini 3.7 Flash at medium effort: it removed roughly a quarter of the remaining character
+errors, with about nine correct edits for every wrong one, at around 10-15 US cents and three to four minutes
+per 25-minute episode. Keep `proofread_effort` at `medium`: at `high` a whole episode had not come back after
+25 minutes. Results without a reference subtitle, and on other languages, have not been measured.
+
+To proofread a subtitle you already have, with no audio and no ASR pass, give it as `--proofread_input`
+instead of a media file. The reference subtitle is optional:
+
+```bash
+uv run cantocaptions_ai --proofread_input episode.srt --proofread gemini
+uv run cantocaptions_ai --proofread_input episode.srt --proofread gemini --reference_subtitle episode.chi.srt
+```
+
+This writes `episode.proofread.srt` to `output_dir` and never overwrites the input. Cue timings, and every cue
+the model leaves alone, come out exactly as they went in; edited cues are re-cleaned as in a normal run (add
+`--no_clean_text` to apply the model's text as is). Several files can be given at once, but a reference
+subtitle only with a single file. Without a reference, the model works from the text alone, so expect it to
+catch fewer mishearings and names.
+
+Useful settings:
+
+* `proofread_max_cost` (default 1.0 USD) — refuse any request estimated above this. `None` removes it.
+* `proofread_dry_run = True` — write the exact request and its cost estimate, send nothing.
+* `proofread_chunk_cues N` — split a file into requests of N cues (0, the default, sends it whole), each shown
+  `proofread_chunk_context` (6) read-only cues of its neighbours. The first chunk goes alone and the rest
+  `proofread_parallel` (4) at a time, sharing one cached copy of the system prompt; a chunk whose request fails
+  is skipped and the others still apply. Name fixes are still applied across the whole file.
+* `proofread_context FILE` — a short paragraph about the show (setting, main characters), if you have one.
+* `proofread_standard`, `proofread_conventions FILE`, `proofread_prompt FILE` — pick a different writing
+  standard, or replace its conventions or the whole prompt template, without touching code. The CantoCaptions
+  conventions ship at `cantocaptions_ai/languages/yue/proofread/cantocaptions.md`.
+
+Every answer is saved, since it was paid for: under `debug_dir` when one is set (`{debug_dir}/{name}/proofread/`),
+otherwise beside the output in `{output_dir}/{name}.proofread/`. There, `changes.srt` shows each edited cue with its
+previous text, `flags.srt` lists lines the model doubted but did not change (and particle or register changes it
+was not allowed to make), for checking against the audio, and `summary.json` holds the edits, names and cost. A
+`load_debug_dir` replay reuses a saved answer whenever the request is unchanged, so it is never billed twice.
+
 ### Debugging
 
 `debug_dir` is off by default. Set it to a directory (e.g. `--debug_dir temp` for `./temp/`) and each 
@@ -256,6 +332,30 @@ realign: cues moved by a median of +65.98s (largest +127.61s)
 
 Text cleaning is **off** by default for a subtitle input, although punctuation is still normalized. 
 Use `--realign_normalize False` to turn off all realign normalization.
+
+### Proofreading while realigning
+
+`--realign` and `--proofread` combine: a human-edited subtitle can be proofread against a reference and then put
+on another release's timeline in one run. The reference subtitle has to be on the *same* timeline as the cues
+it is compared with, so say which one it follows with `--reference_timing`:
+
+```bash
+# reference timed like the subtitle being realigned: proofread first, then realign the corrected copy
+uv run cantocaptions_ai bluray.mkv --realign episode.srt --proofread gemini     --reference_subtitle episode.chi.srt --reference_timing subtitle
+
+# reference timed to bluray.mkv: realign first, then proofread the realigned cues
+uv run cantocaptions_ai bluray.mkv --realign episode.srt --proofread gemini     --reference_subtitle bluray.chi.srt --reference_timing media
+```
+
+The run refuses to start without `--reference_timing` when all three are combined. With `subtitle`, the
+corrected copy is also written as `episode.proofread.srt`, and its review files go to `episode.proofread/`
+(or the debug dir). Without a reference, proofreading runs first. Add `--proofread_min_confidence medium` (or
+`high`) to apply only the model's confident changes and list the rest as flags.
+
+Every proofread run also checks that the reference really does share the cues' timeline: a matching reference
+has 85-95% of its cues starting within half a second of a cue, and a shifted one, or one from another release,
+falls to under half. Below 60% nothing is sent, and the error names any constant `--reference_offset` that
+would line it up.
 
 ### Other realign options
 

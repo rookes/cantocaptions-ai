@@ -3,7 +3,8 @@
 Everything Cantonese-specific the pipeline uses is declared here: written-Cantonese
 conventions (CJK script and punctuation), the CantoCaptions fine-tune and the Cantonese
 align model as defaults, how each supported ASR model writes Cantonese, the HK cleaning
-rules, the audio-track preference, and the LLM correction prompts. The implementations live
+rules, the audio-track preference, the LLM correction prompts, and the CantoCaptions
+standard for the optional proofreading stage. The implementations live
 beside it in this package (``text``, ``numbers``, ``linebreak``, ``rules/``, ...).
 
 Module import must stay cheap: OpenCC, pycantonese and the cleaning builtins load on use.
@@ -12,6 +13,7 @@ from typing import List, Mapping
 
 from cantocaptions_ai.languages.base import CleaningSpec, LanguagePack, ModelConventions
 from cantocaptions_ai.languages.yue.paths import RULES_DIR
+from cantocaptions_ai.languages.yue.proofreading import CANTOCAPTIONS
 from cantocaptions_ai.languages.yue.prompts import CORRECTION_PROMPTS
 from cantocaptions_ai.languages.yue.text import REMOVE_STANDALONE_CHARS
 from cantocaptions_ai.text_profiles import (
@@ -110,4 +112,6 @@ YUE = LanguagePack(
     ensemble_model=("alvanlii/whisper-small-cantonese", "cts"),
     track_selector=_select_track,
     char_readings=_char_readings,
+    proofreading={CANTOCAPTIONS.name: CANTOCAPTIONS},
+    default_proofreading=CANTOCAPTIONS.name,
 )

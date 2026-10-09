@@ -138,7 +138,7 @@ def find_gapped_cues(
 
     CTC must place every token it is given, so when a cue's text contains something that was
     not said where the cue sits, the extra characters are put wherever scores least badly --
-    typically seconds away, leaving a hole in the middle of the cue. On `test/bluey`, ASR
+    typically seconds away, leaving a hole in the middle of the cue. On `experiments/fixtures/bluey`, ASR
     emitted 爸爸， once for what the reference has as two separate calls: the first 爸 landed
     at 56.44 s and the second at 59.80 s, so the subtitle went on screen **3.35 s** before
     anybody spoke (the reference cue starts at 59.790).

@@ -60,6 +60,39 @@ GAP_EPS = 1e-6
 _TOKEN_TRIM = "，。？！；…～~ "
 
 
+# How much closer (seconds of sounded pause) a short fragment must sit to its next neighbour
+# than to its previous one before pass A holds it back for the rescue pass to place.
+FORWARD_PAUSE_MARGIN = 0.05
+
+
+def _sounded_bounds(seg: SingleAlignedSegment) -> Optional[tuple]:
+    """(start of the first, end of the last) *sounded* timed token of *seg*, or None.
+
+    A cue's own start and end include punctuation, which alignment maps to blank and which
+    therefore dwells across the pause beside it -- so two clauses joined by "，" touch at the
+    cue edges whatever the silence between them. The pause a listener hears is between the
+    last spoken character of one and the first of the next.
+    """
+    tokens = seg.get("chars") or seg.get("words") or []
+    timed = [t for t in tokens
+             if t.get("start") is not None and t.get("end") is not None
+             and str(t.get("char", t.get("word", ""))).strip(_TOKEN_TRIM + "、：；「」『』（）")]
+    if not timed:
+        return None
+    return timed[0]["start"], timed[-1]["end"]
+
+
+def _sounded_pause(left: SingleAlignedSegment, right: SingleAlignedSegment) -> float:
+    """Seconds of pause between *left*'s last spoken token and *right*'s first.
+
+    Falls back to the gap between the cue edges when either side has no timed tokens.
+    """
+    a, b = _sounded_bounds(left), _sounded_bounds(right)
+    if a is None or b is None:
+        return right["start"] - left["end"]
+    return b[0] - a[1]
+
+
 def _duration(seg: SingleAlignedSegment) -> float:
     return seg["end"] - seg["start"]
 
@@ -175,25 +208,37 @@ def _adjacency_merge(
 ) -> List[SingleAlignedSegment]:
     """Pass A: greedily join touching neighbours with a clean join boundary.
 
-    One exception: a too-short cue that is a known *leading* marker is not absorbed backwards
-    here. This pass accumulates strictly left to right, so it would otherwise glue "嗱，" onto
-    the end of the preceding sentence before anything got to weigh the other direction. Held
-    back, the marker reaches the rescue pass, which prefers to join it forwards onto the
-    clause it introduces -- and still joins it backwards if forwards turns out impossible.
+    Two exceptions, both too-short cues held back for the rescue pass instead of being
+    absorbed backwards. This pass accumulates strictly left to right, so it would otherwise
+    decide before anything got to weigh the other direction:
+
+    * a known *leading* marker ("嗱，" glued onto the end of the preceding sentence);
+    * any fragment whose spoken pause to the *next* cue is shorter than to the previous one.
+      A short clause that opens the next utterance -- a name called before a sentence,
+      "阿明，你過嚟" -- is one comma away from both neighbours, and the cue edges cannot tell
+      the two directions apart because each comma's dwell fills its pause. The spoken
+      characters can: here the pause before the name is the longer one.
+
+    Held back, the fragment reaches the rescue pass, which weighs both sides and still joins
+    it backwards if forwards turns out impossible.
     """
     threshold = align_merge_distance - align_padding
     merged: List[SingleAlignedSegment] = []
 
-    for segment in segments:
+    for k, segment in enumerate(segments):
         if not merged:
             merged.append(segment)
             continue
 
         prev = merged[-1]
         gap = segment["start"] - prev["end"]
-        defer = (
-            _duration(segment) < min_cue_duration
-            and _text(segment).strip(_TOKEN_TRIM) in leading_markers
+        short = _duration(segment) < min_cue_duration
+        nxt = segments[k + 1] if k + 1 < len(segments) else None
+        defer = short and (
+            _text(segment).strip(_TOKEN_TRIM) in leading_markers
+            or (nxt is not None
+                and _sounded_pause(segment, nxt) + FORWARD_PAUSE_MARGIN
+                < _sounded_pause(prev, segment))
         )
         # The speaker gate is checked last so a veto can be attributed to diarization
         # alone: everything else about this join already reads cleanly.
@@ -254,7 +299,9 @@ def _rescue_short_cues(
     2. **Direction** -- a cue that is itself one of the profile's ``leading_markers`` joins
        forwards, because those markers introduce the clause that follows them ("嗱，你知啦"
        reads as one thought; "…嘅感覺，嗱，" strands the marker on the wrong sentence).
-    3. **Distance** -- otherwise the smaller gap decides.
+    3. **Distance** -- otherwise the shorter *spoken* pause decides: the silence between
+       the last spoken character on one side and the first on the other, not the gap
+       between cue edges, which punctuation's dwell closes to nothing on both sides.
 
     Merging makes the result longer, so a rescued cue stops being a candidate; the loop
     therefore terminates. It restarts after each merge because indices shift.
@@ -296,7 +343,7 @@ def _rescue_short_cues(
                 rank = 0 if boundary_is_mergeable(_text(left), punctuation) else 1
                 # left_idx == i means this cue is the left member, i.e. joining forwards.
                 direction = 0 if (is_marker and left_idx == i) else 1
-                candidates.append((rank, direction, gap, left_idx))
+                candidates.append((rank, direction, _sounded_pause(left, right), left_idx))
 
             if not candidates:
                 # Only worth reporting when the cue is stranded outright. A direction the

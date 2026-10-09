@@ -27,4 +27,4 @@ def test_version():
 def test_no_input_is_a_usage_error():
     out = _cli()
     assert out.returncode == 2
-    assert "provide at least one audio file or --input_dir" in out.stderr
+    assert "provide at least one audio file, --input_dir, or --proofread_input" in out.stderr

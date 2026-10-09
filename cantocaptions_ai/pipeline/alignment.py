@@ -871,6 +871,18 @@ def _align_segment(
         else (t2 - t1) / max(trellis.size(0) - 1, 1)
     )
     char_segments = merge_repeats(path, text_clean)
+    # Each character's *peak*: the highest probability its own token reached on any frame
+    # the path gave it. merge_repeats' score is the mean over the span, and backtrack
+    # records the blank's probability on every frame a token is merely held, so a character
+    # followed by a pause scores high on the silence -- a character the model heard as
+    # something else entirely can still report 0.9. The peak asks the question a reader of
+    # the score means: did the model hear this character here? For a token mapped to blank
+    # (punctuation), it is the blank's peak and says nothing.
+    peaks = [0.0] * len(tokens)
+    for point in path:
+        prob = float(emission[point.time_index, tokens[point.token_index]].exp())
+        if prob > peaks[point.token_index]:
+            peaks[point.token_index] = prob
     _reseat_dwelling_chars(char_segments, emission, tokens, blank_id, seconds_per_frame)
     if frame_times is not None and len(frame_times):
         # merge_repeats reports an *exclusive* end, so the map needs one entry past the last
@@ -891,13 +903,16 @@ def _align_segment(
     char_segments_arr = []
     word_idx = 0
     for cdx, char in enumerate(text):
-        start, end, score = None, None, None
+        start, end, score, peak = None, None, None, None
         if cdx in seg_data["clean_cdx"]:
-            char_seg = char_segments[seg_data["clean_cdx"].index(cdx)]
+            k = seg_data["clean_cdx"].index(cdx)
+            char_seg = char_segments[k]
             start = round(_at(char_seg.start), 3)
             end = round(_at(char_seg.end), 3)
             score = round(char_seg.score, 3)
-        char_segments_arr.append({"char": char, "start": start, "end": end, "score": score, "word-idx": word_idx})
+            peak = round(peaks[k], 3)
+        char_segments_arr.append({"char": char, "start": start, "end": end, "score": score,
+                                  "peak": peak, "word-idx": word_idx})
         if not _spaced(model_lang, script):
             word_idx += 1
         elif cdx == len(text) - 1 or text[cdx + 1] == " ":
@@ -935,6 +950,9 @@ def _align_segment(
             word_start = word_chars["start"].min()
             word_end = word_chars["end"].max()
             word_score = round(word_chars["score"].mean(), 3)
+            # A word's peak is its weakest character's: one character the model did not hear
+            # is what makes a word doubtful.
+            word_peak = word_chars["peak"].min()
             word_segment = {"word": word_text}
             if not np.isnan(word_start):
                 word_segment["start"] = word_start
@@ -942,6 +960,8 @@ def _align_segment(
                 word_segment["end"] = word_end
             if not np.isnan(word_score):
                 word_segment["score"] = word_score
+            if word_peak is not None and not np.isnan(word_peak):
+                word_segment["peak"] = round(float(word_peak), 3)
             sentence_words.append(word_segment)
 
         subsegment = {
@@ -962,7 +982,7 @@ def _align_segment(
         aligned_subsegments.append(subsegment)
 
         if return_char_alignments:
-            chars_out = curr_chars[["char", "start", "end", "score"]].copy()
+            chars_out = curr_chars[["char", "start", "end", "score", "peak"]].copy()
             chars_out.fillna(-1, inplace=True)
             aligned_subsegments[-1]["chars"] = [
                 {k: v for k, v in row.items() if v != -1}
