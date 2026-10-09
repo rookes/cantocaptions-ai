@@ -91,10 +91,13 @@ class CleaningSpec:
     ``rules_dir`` holds the manifests and rule files; ``manifest`` is the one a model with
     no convention of its own gets. ``builtin_steps`` is a zero-argument loader for the coded
     steps a manifest may name -- deferred because they tend to pull in the language's NLP
-    libraries. ``noise_tokens`` are lines dropped as pure interjection.
+    libraries. ``noise_tokens`` are lines dropped as pure interjection. ``basic_manifest``
+    is the essential, content-preserving subset (punctuation, character variants) applied
+    to a finished subtitle before it is proofread; None means the language has none.
     """
     rules_dir: Path
     manifest: str = DEFAULT_CLEANING.manifest
+    basic_manifest: Optional[str] = None
     builtin_steps: Callable[[], Mapping[str, Callable[[str], str]]] = _no_builtins
     noise_tokens: Tuple[str, ...] = ()
 

@@ -199,9 +199,19 @@ def _format_duration(seconds: float, unit: str) -> str:
 class TranscriptionSummary:
     """Accumulates per-stage timing records and prints a formatted summary table."""
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = True, title: str = "Transcription complete") -> None:
         self.enabled = enabled
+        self.title = title
         self._stages: list[tuple[str, Optional[float], float, Optional[float]]] = []
+        self._amounts: dict[str, tuple[float, str]] = {}
+
+    def add_amount(self, label: str, amount: float, fmt: str = "{:.3f}") -> None:
+        """Add to a running total printed under the table (e.g. a paid stage's cost); one
+        line per label, summed over files."""
+        if not self.enabled or amount is None:
+            return
+        total, _ = self._amounts.get(label, (0.0, fmt))
+        self._amounts[label] = (total + float(amount), fmt)
 
     def record(self, label: str, load_time: Optional[float], run_time: float, vram_peak_mb: Optional[float] = None) -> None:
         """Add a stage's timings. A stage that runs again (once per file group) is folded
@@ -232,7 +242,7 @@ class TranscriptionSummary:
         eq = "═" * width
         dash = "─" * width
         print(f"\n{eq}", file=sys.__stdout__)
-        print(" Transcription complete", file=sys.__stdout__)
+        print(f" {self.title}", file=sys.__stdout__)
         print(eq, file=sys.__stdout__)
         vram_header = "Peak VRAM".center(10) if show_vram else ""
         print(
@@ -245,8 +255,11 @@ class TranscriptionSummary:
             total_str = f"{_format_duration(stage_total, unit):>11}"
             vram_str  = f"  {vram_mb / 1000:>5.1f} GB" if vram_mb is not None else ""
             print(f" {label:<{col_w}}{load_str}{run_str}{total_str}{vram_str}", file=sys.__stdout__)
-        if process_elapsed is not None:
+        if process_elapsed is not None or self._amounts:
             print(dash, file=sys.__stdout__)
+        for label, (total, fmt) in self._amounts.items():
+            print(f" {label:<20} {fmt.format(total)}", file=sys.__stdout__)
+        if process_elapsed is not None:
             print(f" Total Process Time   {_format_duration(process_elapsed, unit)}", file=sys.__stdout__)
         print(f"{eq}\n", file=sys.__stdout__)
 
@@ -326,10 +339,14 @@ class StageTimer:
         label: str,
         summary: TranscriptionSummary,
         progress: "Optional[ProgressSink]" = None,
+        track_vram: bool = True,
     ) -> None:
         self._label = label
         self._summary = summary
         self._progress = progress
+        # False for a stage that uses no GPU (proofreading is a network call), whose row
+        # would otherwise show whatever the previous stage left allocated.
+        self._track_vram = track_vram
         self._start: float = 0.0
         self._load_end: Optional[float] = None
         self._bar: "Optional[_TqdmBar]" = None
@@ -405,7 +422,7 @@ class StageTimer:
         end = time.perf_counter()
         vram_peak_mb = (
             torch.cuda.max_memory_allocated() / 1e6
-            if self._summary.enabled and torch.cuda.is_available()
+            if self._summary.enabled and self._track_vram and torch.cuda.is_available()
             else None
         )
         self._spinner_stop.set()

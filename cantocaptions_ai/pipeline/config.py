@@ -269,8 +269,9 @@ class PipelineConfig:
     reference_offset: float = 0.0
     # Under --realign, which timeline the reference follows: 'subtitle' (the --realign
     # input's own timings) or 'media' (the audio/video's). Decides whether proofreading
-    # runs before realign, on the input, or after it, on the realigned cues.
-    reference_timing: Optional[str] = None
+    # runs before realign, on the input, or after it, on the realigned cues. 'media' by
+    # default, the same timeline a reference has in every non-realign run.
+    reference_timing: Optional[str] = "media"
 
     # Reference subtitle as ASR context (experimental). Routes the same
     # --reference_subtitle file into Qwen3-ASR's context-biasing system prompt and,
@@ -310,13 +311,14 @@ class PipelineConfig:
     # Edits below this confidence become flags for review instead of being applied.
     proofread_min_confidence: str = "low"
     proofread_particles: str = "protect"
+    proofread_preclean: bool = True
     # Refuse a request whose estimated cost (US dollars) exceeds this. None: no ceiling.
     # A whole episode measured around a tenth of this on the default model.
     proofread_max_cost: Optional[float] = 1.0
     # Write each request (and its token and cost estimate) without sending it.
     proofread_dry_run: bool = False
     # Seconds before a request is abandoned and retried once.
-    proofread_timeout: float = 1800.0
+    proofread_timeout: float = 1200.0
     # Cues per request; 0 sends each file whole, which is what lets the model reconcile
     # names across it. Set only for inputs too long for one request.
     proofread_chunk_cues: int = 0
@@ -474,7 +476,7 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     "proofreading": (
         "proofread", "proofread_model", "proofread_effort", "proofread_standard",
         "proofread_conventions", "proofread_prompt", "proofread_context",
-        "proofread_min_confidence", "proofread_particles", "proofread_max_cost", "proofread_dry_run",
+        "proofread_min_confidence", "proofread_particles", "proofread_preclean", "proofread_max_cost", "proofread_dry_run",
         "proofread_timeout", "proofread_chunk_cues", "proofread_chunk_context", "proofread_parallel",
     ),
 })

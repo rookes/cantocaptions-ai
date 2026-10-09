@@ -205,7 +205,7 @@ enable it per run with `--proofread gemini`, or make it your own default in `con
 proofread = gemini
 ```
 
-It needs the client libraries (`uv sync --extra proofread`) and an API key in the environment,
+It needs the client libraries (`uv sync --inexact --extra proofread`; `--inexact` keeps whatever other extras you installed) and an API key in the environment,
 `GEMINI_API_KEY` or `ANTHROPIC_API_KEY`. Keys are read from the environment only; do not put them in a
 config file.
 
@@ -251,6 +251,9 @@ Useful settings:
 
 * `proofread_max_cost` (default 1.0 USD) — refuse any request estimated above this. `None` removes it.
 * `proofread_dry_run = True` — write the exact request and its cost estimate, send nothing.
+* `proofread_preclean` (default True) — before proofreading an existing subtitle, apply only the basic cleaning:
+  punctuation and the standard character variants, nothing that rewrites words or layout. The lines it changed go to
+  `precleaned.srt` beside the review files.
 * `proofread_chunk_cues N` — split a file into requests of N cues (0, the default, sends it whole), each shown
   `proofread_chunk_context` (6) read-only cues of its neighbours. The first chunk goes alone and the rest
   `proofread_parallel` (4) at a time, sharing one cached copy of the system prompt; a chunk whose request fails
@@ -261,10 +264,17 @@ Useful settings:
   conventions ship at `cantocaptions_ai/languages/yue/proofread/cantocaptions.md`.
 
 Every answer is saved, since it was paid for: under `debug_dir` when one is set (`{debug_dir}/{name}/proofread/`),
-otherwise beside the output in `{output_dir}/{name}.proofread/`. There, `changes.srt` shows each edited cue with its
-previous text, `flags.srt` lists lines the model doubted but did not change (and particle or register changes it
+otherwise beside the output in `{output_dir}/{name}.proofread/`. There, `changes.srt` shows each edited cue over a
+`[was]` line with its previous text, the changed characters coloured in both, `flags.srt` lists lines the model doubted but did not change (and particle or register changes it
 was not allowed to make), for checking against the audio, and `summary.json` holds the edits, names and cost. A
 `load_debug_dir` replay reuses a saved answer whenever the request is unchanged, so it is never billed twice.
+
+Beside the proofread subtitle itself goes a Subtitle Edit bookmarks file (`episode.proofread.srt.SE.bookmarks`),
+which Subtitle Edit loads on its own when it opens the subtitle: every changed line is bookmarked with
+`[was] <old text>`, every flagged line with `[flag] <note>`. An existing bookmarks file is never overwritten; the
+new one is named `episode.proofread (1).srt.SE.bookmarks` instead (rename the subtitle to match to load it). The bookmarks always
+match the subtitle they sit beside: after a realign that proofread first, they are carried onto the realigned
+output's own lines, whatever cues realign split, merged or dropped.
 
 ### Debugging
 
@@ -347,7 +357,7 @@ uv run cantocaptions_ai bluray.mkv --realign episode.srt --proofread gemini     
 uv run cantocaptions_ai bluray.mkv --realign episode.srt --proofread gemini     --reference_subtitle bluray.chi.srt --reference_timing media
 ```
 
-The run refuses to start without `--reference_timing` when all three are combined. With `subtitle`, the
+`--reference_timing` defaults to `media`, so the second form needs no flag. With `subtitle`, the
 corrected copy is also written as `episode.proofread.srt`, and its review files go to `episode.proofread/`
 (or the debug dir). Without a reference, proofreading runs first. Add `--proofread_min_confidence medium` (or
 `high`) to apply only the model's confident changes and list the rest as flags.

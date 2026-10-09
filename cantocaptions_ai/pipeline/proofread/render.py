@@ -189,30 +189,41 @@ def user_message(cues: Sequence[Cue], reference: Sequence[dict], title: str = ""
 
 
 AGREEMENT_TOLERANCE = 0.5   # seconds between a reference start and the nearest cue start
-# Share of reference starts within the tolerance of a cue start. Measured: a reference on the
-# cues' own timeline scores 86-94 %; the same reference shifted by a second or more, or one
-# timed to a different release, falls to the 33-46 % chance level of dense dialogue.
+# Below this agreement (see reference_agreement) the reference is refused. Measured: 83-94 %
+# on a shared timeline; 17-46 %, the chance level of dense dialogue, shifted by a second or
+# more or timed to a different release.
 MIN_AGREEMENT = 0.6
 
 
+def _share_near(points: Sequence[float], targets: Sequence[float]) -> float:
+    import bisect
+    targets = sorted(targets)
+    hit = 0
+    for t in points:
+        i = bisect.bisect_left(targets, t)
+        near = min(abs(targets[j] - t) for j in (i - 1, i) if 0 <= j < len(targets))
+        hit += near <= AGREEMENT_TOLERANCE
+    return hit / len(points)
+
+
 def reference_agreement(cues: Sequence[Cue], reference: Sequence[dict], shift: float = 0.0) -> float:
-    """Share of reference cues starting within ``AGREEMENT_TOLERANCE`` of a cue start.
+    """How well the reference's cue starts line up with the cues', 0-1.
 
     The check that the reference and the cues share a timeline, which the stream's
     interleaving silently assumes. Start times, not overlap: dialogue is dense enough that
     a reference shifted by half a minute still overlaps some cue ~80 % of the time.
+
+    Measured both ways -- the share of reference starts near a cue start, and of cue starts
+    near a reference start -- and the better one kept, so extra cues on one side (a
+    reference that subtitles the opening song, splits lines finer, or a draft with lines the
+    reference lacks) do not read as a different timeline. On five real pairs: 83-94 % on a
+    shared timeline, 17-46 % shifted by a second or more or timed to another release.
     """
-    import bisect
-    starts = sorted(c.start for c in cues)
-    if not starts or not reference:
+    starts = [c.start for c in cues]
+    ref = [float(r["start"]) + shift for r in reference]
+    if not starts or not ref:
         return 0.0
-    hit = 0
-    for r in reference:
-        t = float(r["start"]) + shift
-        i = bisect.bisect_left(starts, t)
-        near = min(abs(starts[j] - t) for j in (i - 1, i) if 0 <= j < len(starts))
-        hit += near <= AGREEMENT_TOLERANCE
-    return hit / len(reference)
+    return max(_share_near(ref, starts), _share_near(starts, ref))
 
 
 def best_reference_shift(cues: Sequence[Cue], reference: Sequence[dict],

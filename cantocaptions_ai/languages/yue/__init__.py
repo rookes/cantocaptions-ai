@@ -105,6 +105,7 @@ YUE = LanguagePack(
     cleaning=CleaningSpec(
         rules_dir=RULES_DIR,
         manifest="pipeline.toml",
+        basic_manifest="pipeline_basic.toml",
         builtin_steps=_builtin_steps,
         noise_tokens=tuple(REMOVE_STANDALONE_CHARS),
     ),

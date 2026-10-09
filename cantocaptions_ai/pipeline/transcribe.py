@@ -11,7 +11,7 @@ from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE
 from cantocaptions_ai.utils.schema import ProcessingItem, item_name
 from typing import Callable, Dict, List, Optional
 from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer, writer_args as build_writer_args
-from cantocaptions_ai.utils.log_utils import ProgressSink, TranscriptionSummary, get_logger
+from cantocaptions_ai.utils.log_utils import ProgressSink, StageTimer, TranscriptionSummary, get_logger
 from cantocaptions_ai.text_profiles import (
     DEFAULT_PUNCTUATION,
     DEFAULT_SCRIPT,
@@ -20,6 +20,7 @@ from cantocaptions_ai.text_profiles import (
 from cantocaptions_ai.pipeline.reference_context import CONTEXT_TEMPLATES
 from cantocaptions_ai.pipeline.segmentation import assemble_cues
 from cantocaptions_ai.utils.debug import (
+    _stage_dir,
     write_precleaning_debug,
 )
 
@@ -93,6 +94,11 @@ def _merge_and_write(
     reference_cues: Optional[list] = None,
     load_debug_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
+    output_format: str = "srt",
+    carried_marks: Optional[tuple] = None,
+    precleaner=None,
+    summary=None,
+    progress=None,
 ) -> List[ProcessingItem]:
     """Assemble cues, clean, offset, then write (unless writer is None) and/or return results.
 
@@ -193,12 +199,28 @@ def _merge_and_write(
         # Map clip-relative times back onto the source-media timeline before output.
         _offset_result_times(result, audio_start_offset)
 
+        marks = []
         if proofreader is not None and result["segments"]:
-            _proofread(proofreader, name, result, reference_cues, cleaner, layout,
-                       debug_dir, load_debug_dir, output_dir=output_dir if writer else None)
+            marks = _proofread(proofreader, name, result, reference_cues, cleaner, layout,
+                               debug_dir, load_debug_dir,
+                               output_dir=output_dir if writer else None,
+                               precleaner=precleaner, summary=summary, progress=progress)
 
+        if carried_marks:
+            # Proofread before realign: its bookmarks were on the copy's cues, which realign
+            # may have dropped, split or merged. Carry them onto these cues by their text.
+            from cantocaptions_ai.pipeline.proofread.review import remap_marks
+            source_texts, source_marks = carried_marks
+            moved = remap_marks(source_texts, source_marks,
+                                [s.get("text", "") for s in result["segments"]])
+            joined: dict = {}
+            for idx, note in moved + marks:
+                joined.setdefault(idx, []).append(note)
+            marks = sorted((idx, "\n".join(notes)) for idx, notes in joined.items())
         if writer is not None:
             writer(result, name, writer_args)
+            if marks and output_dir:
+                _write_bookmarks(output_dir, name, output_format, marks)
         if collect:
             finalized.append({'audio_path': audio_path, 'name': name, 'result': result})
     return finalized
@@ -240,7 +262,8 @@ def proofreads_before_realign(cfg) -> bool:
     return not cfg.reference_subtitle or cfg.reference_timing == "subtitle"
 
 
-def _proofread_realign_input(cfg, collect: bool = False):
+def _proofread_realign_input(cfg, proofreader, precleaner=None, collect: bool = False,
+                             summary=None, progress=None):
     """Proofread the ``--realign`` input on its own timeline; return *cfg* realigning the copy.
 
     The corrected copy is written as ``{input stem}.proofread.srt`` (to ``output_dir``, or a
@@ -248,30 +271,100 @@ def _proofread_realign_input(cfg, collect: bool = False):
     ``--proofread_input`` would write it, and the returned config points ``realign`` at it
     with proofreading switched off so the realigned result is not proofread twice. No text
     cleaning here: the realign run cleans (or, for a finished subtitle, deliberately does
-    not clean) the whole file afterwards.
+    not clean) the whole file afterwards -- only the basic cleaning (*precleaner*), as for any
+    finished subtitle going into proofreading.
     """
     import tempfile
-    from cantocaptions_ai.languages import get_language_pack
-    from cantocaptions_ai.pipeline.proofread import load_proofreader
     from cantocaptions_ai.utils.output import WriteSRT
     from cantocaptions_ai.utils.subtitles import read_subtitle_cues
 
     src = cfg.realign
     stem = os.path.splitext(os.path.basename(src))[0]
-    pack = get_language_pack(cfg.language)
-    proofreader = load_proofreader(cfg, pack, pack.resolve(cfg.model))
     segments = [{"start": c.start, "end": c.end, "text": c.text} for c in read_subtitle_cues(src)]
     result = {"segments": segments, "language": cfg.language}
     logger.info("Proofreading the realign input before realigning it (%d cues): %s",
                 len(segments), src)
     out_dir = tempfile.mkdtemp(prefix="cantocaptions-proofread-") if collect else cfg.output_dir
     os.makedirs(out_dir, exist_ok=True)
-    _proofread(proofreader, stem, result, _load_reference(cfg), None, None,
-               cfg.debug_dir, cfg.load_debug_dir, output_dir=out_dir)
+    marks = _proofread(proofreader, stem, result, _load_reference(cfg), None, None,
+                       cfg.debug_dir, cfg.load_debug_dir, output_dir=out_dir,
+                       precleaner=precleaner, summary=summary, progress=progress)
     WriteSRT(out_dir)(result, f"{stem}.proofread", build_writer_args(cfg))
+    _write_bookmarks(out_dir, f"{stem}.proofread", "srt", marks)
     path = os.path.join(out_dir, f"{stem}.proofread.srt")
     logger.info("Realigning the proofread copy: %s", path)
-    return dataclasses.replace(cfg, realign=path, proofread="none")
+    # The copy's text and its marks, for _merge_and_write to carry onto the realigned output.
+    carried = ([s["text"] for s in result["segments"]], marks) if marks else None
+    return dataclasses.replace(cfg, realign=path, proofread="none"), carried
+
+
+def _build_precleaner(cfg, pack, profile):
+    """The language's basic cleaner for text going into proofreading, or None.
+
+    Only for text this run does not clean in full (an existing subtitle under
+    ``--proofread_input`` or ``--realign``): punctuation and the standard character variants,
+    from ``CleaningSpec.basic_manifest``. Off with ``proofread_preclean = False``, with
+    ``--no_clean_text``, and for a language with no basic manifest.
+    """
+    spec = pack.cleaning
+    if (cfg.proofread == "none" or not cfg.proofread_preclean or cfg.no_clean_text
+            or spec is None or not spec.basic_manifest):
+        return None
+    from cantocaptions_ai.cleaning import SubtitleCleaner
+    return SubtitleCleaner(
+        rules_dir=cfg.clean_rules_dir or spec.rules_dir, manifest=spec.basic_manifest,
+        builtin_steps=spec.builtin_steps(), noise_tokens=spec.noise_tokens,
+        layout=profile.script.layout, max_line_count=None,
+    )
+
+
+def _preclean_text(precleaner, text: str) -> str:
+    """*text* through the basic cleaner one display line at a time, so a cue's line breaks
+    (often a change of speaker) survive. A line it would empty is kept as it was."""
+    lines = []
+    for line in str(text).split("\n"):
+        cleaned = precleaner.clean(line)
+        lines.append(cleaned if cleaned.strip() else line)
+    return "\n".join(lines)
+
+
+def _describe_run(cfg, ctx, stage_list, proofreader, cleaner, layout, precleaner,
+                  proofread_first: bool) -> str:
+    """The whole run in one line, before anything is computed: the stages, and what happens
+    around them -- proofreading on whichever side of realign it runs, cleaning, writing."""
+    from cantocaptions_ai.pipeline.stages import describe_plan
+
+    def proofread_step(what: str) -> str:
+        s = proofreader.settings
+        if not cfg.reference_subtitle:
+            ref = "no reference"
+        elif cfg.realign:
+            ref = f"reference {os.path.basename(cfg.reference_subtitle)}, {cfg.reference_timing}-timed"
+        else:
+            ref = f"reference {os.path.basename(cfg.reference_subtitle)}"
+        dry = ", DRY RUN" if s.dry_run else ""
+        return f"Proofread {what} [{s.provider} {s.model}, {s.effort}; {ref}{dry}]"
+
+    steps = []
+    if proofread_first:
+        if precleaner is not None:
+            steps.append("Basic cleaning (realign input)")
+        steps.append(proofread_step(f"realign input {os.path.basename(cfg.realign)}"))
+    steps.append(describe_plan(ctx, stage_list))
+    steps.append("Cue assembly")
+    if cleaner is not None:
+        steps.append("Text cleaning")
+    elif layout is not None:
+        steps.append("Line layout")
+    if proofreader is not None and not proofread_first:
+        if precleaner is not None:
+            steps.append("Basic cleaning")
+        steps.append(proofread_step("output"))
+    writes = f"Write {cfg.output_format}"
+    if proofreader is not None and cfg.output_format in ("srt", "vtt", "all"):
+        writes += " + Subtitle Edit bookmarks"
+    steps.append(writes)
+    return " → ".join(steps)
 
 
 def _build_cleaner(cfg, pack, profile):
@@ -351,8 +444,11 @@ def proofread_files(paths: List[str], cfg, names: Optional[Dict[str, str]] = Non
     pack = get_language_pack(cfg.language)
     profile = pack.resolve(cfg.model)
     cleaner, layout = _build_cleaner(cfg, pack, profile)
+    precleaner = _build_precleaner(cfg, pack, profile)
     proofreader = load_proofreader(cfg, pack, profile)
     names = names or output_names(paths)
+    summary = TranscriptionSummary(enabled=cfg.print_progress, title="Proofreading complete")
+    started = time.perf_counter()
 
     reference_cues = _load_reference(cfg)
     if reference_cues is None:
@@ -369,16 +465,42 @@ def proofread_files(paths: List[str], cfg, names: Optional[Dict[str, str]] = Non
                     for c in read_subtitle_cues(path)]
         result = {"segments": segments, "language": cfg.language}
         logger.info("Proofreading %s (%d cues)", path, len(segments))
-        _proofread(proofreader, name, result, reference_cues, cleaner, layout,
-                   cfg.debug_dir, cfg.load_debug_dir, output_dir=cfg.output_dir)
+        marks = _proofread(proofreader, name, result, reference_cues, cleaner, layout,
+                           cfg.debug_dir, cfg.load_debug_dir, output_dir=cfg.output_dir,
+                           precleaner=precleaner, summary=summary)
         if not cfg.proofread_dry_run:
             writer(result, f"{name}.proofread", writer_args)
+            _write_bookmarks(cfg.output_dir, f"{name}.proofread", cfg.output_format, marks)
         done.append({"path": path, "name": name, "result": result})
+    summary.print_summary(process_elapsed=time.perf_counter() - started)
     return done
 
 
+def _preclean(precleaner, name: str, segments: List[dict], review_dir: Optional[str]) -> None:
+    """Basic cleaning on *segments* in place, before they are proofread (see _build_precleaner).
+
+    What it changed is logged and, with somewhere to put it, written as ``precleaned.srt``
+    (new over ``[was]`` old) beside the proofreading review files, so a rewrite of the
+    user's own text is never silent.
+    """
+    changed = []
+    for seg in segments:
+        before = str(seg.get("text", ""))
+        after = _preclean_text(precleaner, before)
+        if after != before:
+            seg["text"] = after
+            changed.append((float(seg["start"]), float(seg["end"]), after, before))
+    logger.info("Basic cleaning before proofreading %s: %d of %d cue(s) changed",
+                name, len(changed), len(segments))
+    if changed and review_dir:
+        from cantocaptions_ai.pipeline.proofread.review import write_changes_srt
+        os.makedirs(review_dir, exist_ok=True)
+        write_changes_srt(os.path.join(review_dir, "precleaned.srt"), changed)
+
+
 def _proofread(proofreader, name, result, reference_cues, cleaner, layout,
-               debug_dir, load_debug_dir, output_dir: Optional[str] = None) -> None:
+               debug_dir, load_debug_dir, output_dir: Optional[str] = None,
+               precleaner=None, summary=None, progress=None) -> list:
     """Stage 9: proofread one file's finished cues in place. A failure costs only itself.
 
     A request that fails or would exceed ``proofread_max_cost`` leaves the file exactly as
@@ -390,38 +512,83 @@ def _proofread(proofreader, name, result, reference_cues, cleaner, layout,
     The model's answers and the review files (``changes.srt``, ``flags.srt``,
     ``summary.json``) are kept whatever the settings, since they were paid for: in the debug
     stage dir when there is one, else in ``{output_dir}/{name}.proofread/``.
+
+    Returns Subtitle Edit bookmarks for the cues as they will be written -- ``(0-based index,
+    note)`` for each changed cue (``[was] <old text>``) and each flagged one -- for
+    :func:`_write_bookmarks`; empty when nothing was proofread.
     """
     from cantocaptions_ai.pipeline.proofread.providers import ProviderError
+    from cantocaptions_ai.pipeline.proofread.review import bookmark_marks
 
     segments = result["segments"]
     save_dir = None
     if not debug_dir and output_dir:
         save_dir = os.path.join(output_dir, *f"{name}.proofread".split("/"))
+    from contextlib import nullcontext
+    # A row in the end-of-run duration table, like any stage (no VRAM: it is a network call).
+    timer = (StageTimer("Proofreading", summary, progress=progress, track_vram=False)
+             if summary is not None else nullcontext())
     try:
-        done = proofreader.run(name, segments, reference=reference_cues or [],
-                               debug_dir=debug_dir, load_debug_dir=load_debug_dir,
-                               save_dir=save_dir)
+        with timer:
+            if precleaner is not None:
+                _preclean(precleaner, name, segments, save_dir or (
+                    _stage_dir(name, "proofread", debug_dir) if debug_dir else None))
+            done = proofreader.run(name, segments, reference=reference_cues or [],
+                                   debug_dir=debug_dir, load_debug_dir=load_debug_dir,
+                                   save_dir=save_dir)
     except ProviderError as e:
         spent = e.usage.get("cost_usd") if getattr(e, "usage", None) else None
+        if summary is not None and spent:
+            summary.add_amount("Proofreading cost", spent, "${:.3f}")
         logger.warning("Proofreading skipped for %s: %s%s", name, e,
                        f" (the attempt cost ${spent:.3f})" if spent else "")
-        return
+        return []
+    # Notes keyed by the segment object, so they survive the re-clean dropping a cue below.
+    notes: dict = {}
+    for cid, old in done.before.items():
+        notes.setdefault(id(segments[cid - 1]), []).append(
+            "[was] " + old.replace("\n", " / "))
+    for flag in done.flags:
+        if 1 <= flag.get("id", 0) <= len(segments):
+            notes.setdefault(id(segments[flag["id"] - 1]), []).append(
+                "[flag] " + str(flag.get("note", "")))
     edited = {e["id"] for e in done.edits}
-    if cleaner is not None or layout is not None:
-        kept = []
-        for k, segment in enumerate(segments, 1):
-            if k in edited:
+    kept = []
+    for k, segment in enumerate(segments, 1):
+        if k in edited:
+            if cleaner is not None or layout is not None:
                 text = cleaner.clean(segment["text"]) if cleaner is not None else layout(segment["text"])
                 if cleaner is not None and cleaner.is_noise(text):
                     continue
                 segment["text"] = text
-            kept.append(segment)
-        result["segments"] = kept
+            # An edit that empties a cue removes it: written, it would be a blank cue that
+            # some editors skip, putting every later bookmark one line out.
+            if not str(segment["text"]).strip():
+                continue
+        kept.append(segment)
+    result["segments"] = kept
     cost = done.usage.get("cost_usd")
+    if summary is not None and cost:
+        summary.add_amount("Proofreading cost", cost, "${:.3f}")
     logger.info(
         "Proofreading %s: %d cue(s) edited, %d flagged for review%s%s", name, len(edited),
         len(done.flags), f", {done.replayed} answer(s) replayed" if done.replayed else "",
         f", ${cost:.3f}" if cost else "")
+    return bookmark_marks(result["segments"], notes)
+
+
+def _write_bookmarks(output_dir: str, name: str, output_format: str, marks: list) -> None:
+    """Subtitle Edit bookmarks beside each SRT/VTT just written for *name* (see proofread/review.py)."""
+    from cantocaptions_ai.pipeline.proofread.review import write_bookmarks
+    if not marks:
+        return
+    exts = ("srt", "vtt") if output_format == "all" else (output_format,)
+    for ext in exts:
+        if ext not in ("srt", "vtt"):
+            continue
+        path = write_bookmarks(os.path.join(output_dir, *name.split("/")) + "." + ext, marks)
+        if path:
+            logger.info("Subtitle Edit bookmarks for %d proofread cue(s): %s", len(marks), path)
 
 
 def _validate_language_support(cfg) -> None:
@@ -559,14 +726,16 @@ def validate_config(cfg) -> None:
         warnings.warn("reference_offset has no effect without reference_subtitle")
     if cfg.reference_timing not in (None, "subtitle", "media"):
         raise ConfigError(f"reference_timing must be 'subtitle' or 'media', got {cfg.reference_timing!r}")
-    if cfg.reference_timing and not (cfg.realign and cfg.reference_subtitle):
-        warnings.warn("reference_timing has no effect without realign and reference_subtitle "
-                      "(without realign, a reference always follows the media's timeline)")
+    if cfg.reference_timing == "subtitle" and not (cfg.realign and cfg.reference_subtitle):
+        warnings.warn("reference_timing 'subtitle' has no effect without realign and "
+                      "reference_subtitle (without realign, a reference always follows the "
+                      "media's timeline)")
     if cfg.realign and cfg.reference_subtitle and cfg.proofread != "none":
         from cantocaptions_ai.utils.subtitles import subtitle_has_timings
         if cfg.reference_timing is None:
             raise ConfigError(
-                "realign with proofread and reference_subtitle needs reference_timing: "
+                "realign with proofread and reference_subtitle needs reference_timing "
+                "(it was set to None): "
                 "'subtitle' if the reference is timed like the --realign input (proofreading then "
                 "runs first, on the input), or 'media' if it is timed to this audio/video "
                 "(proofreading then runs after realign, on the realigned cues)")
@@ -833,12 +1002,6 @@ def _execute_pipeline(
         names = output_names(originals)
     name_of = {p: names[orig] for p, orig in zip(audio_paths, originals)}
 
-    # --realign with proofreading, on an input with timings: proofread the input on its own
-    # timeline first and realign the corrected copy (see proofreads_before_realign). Done
-    # before anything reads cfg.realign, so every stage and checkpoint sees the copy.
-    if proofreads_before_realign(cfg):
-        cfg = _proofread_realign_input(cfg, collect=collect)
-
     # The settings each stage's debug checkpoint must have been made with to be replayed;
     # carried on every item so the stages can check what they read (utils/checkpoints.py).
     from cantocaptions_ai.utils.checkpoints import checkpoint_settings
@@ -948,11 +1111,30 @@ def _execute_pipeline(
     stage_list = build_stages(ctx)
     if stages is not None:
         stage_list = list(stages(ctx, stage_list))
-    logger.info("Pipeline: %s", describe_plan(ctx, stage_list))
+    # --realign with proofreading, on an input with timings and no media-timed reference:
+    # proofread the input on its own timeline first (see proofreads_before_realign). Text
+    # this run will not clean in full -- that input, or a sync/adjust realign's output --
+    # gets the language's basic cleaning before it is proofread.
+    proofread_first = proofreader is not None and proofreads_before_realign(cfg)
+    precleaner = (_build_precleaner(cfg, pack, profile)
+                  if proofreader is not None and (proofread_first or cleaner is None) else None)
+    logger.info("Pipeline: %s", _describe_run(cfg, ctx, stage_list, proofreader, cleaner,
+                                              layout, precleaner, proofread_first))
     # A sink that wants the whole plan up front (a UI's stage list) says so with plan().
     send_plan = getattr(progress, "plan", None)
     if callable(send_plan):
         send_plan(plan_entries(ctx, stage_list))
+
+    # Only now, once the plan is out: every stage then reads the corrected copy, and the
+    # end-of-run proofreading is off so nothing is proofread twice. No checkpoint setting
+    # depends on the realign path, so the swap invalidates nothing.
+    carried_marks = None
+    if proofread_first:
+        cfg, carried_marks = _proofread_realign_input(cfg, proofreader, precleaner,
+                                                      collect=collect, summary=summary,
+                                                      progress=progress)
+        ctx = dataclasses.replace(ctx, cfg=cfg)
+        proofreader = None
 
     # Every stage runs over all of a group's files before the next stage starts, and each
     # file's decoded audio is held from VAD until its subtitles are written. Taken all at
@@ -997,6 +1179,8 @@ def _execute_pipeline(
             order_cues=bool(cfg.realign),
             collect=collect, audio_start_offset=audio_start_offset, display_paths=display_paths,
             proofreader=proofreader, reference_cues=reference_cues, output_dir=cfg.output_dir,
+            output_format=cfg.output_format, carried_marks=carried_marks,
+            precleaner=precleaner, summary=summary, progress=progress,
             load_debug_dir=cfg.load_debug_dir,
         )
         del items

@@ -116,10 +116,12 @@ collected from every chunk and applied file-wide at the end, as for a single req
 
 The stream interleaves each reference line after the cue it overlaps, so the reference and
 the cues **must share a timeline**. Under `--realign` there are two (the input subtitle's and
-the media's), and `reference_timing` says which one the reference follows. It is required
-whenever `--realign`, `--proofread` and `--reference_subtitle` are combined; validation
-refuses the run otherwise, because the wrong guess pairs every line with the wrong one and is
-billed in full.
+the media's), and `reference_timing` says which one the reference follows. It defaults to
+`media`, the timeline a reference has in every non-realign run; a reference timed like the
+input subtitle needs `subtitle`. A wrong choice pairs every line with the wrong one, which is
+why every proofread checks the pairing before it sends anything (below). Setting it to `None`
+in a cfg brings back the old requirement to choose explicitly: validation then refuses the
+combination.
 
 | `reference_timing` | proofreading runs | on |
 |---|---|---|
@@ -137,9 +139,75 @@ pair a reference with, so `subtitle` is refused for one.
 
 **Every proofread checks the pairing before it spends anything** (`Proofreader.
 _check_reference_timing`): the share of reference cues starting within 0.5 s of a cue start.
-Measured: a reference on the cues' own timeline scores 86-94 %; shifted by a second or more,
-or timed to a different release, 33-46 %, the chance level of dense dialogue. Below 60 % the
+Measured both ways (reference starts near a cue start, and cue starts near a reference start)
+and the better kept, so a reference that also subtitles the opening song or splits lines finer
+is not mistaken for a different timeline: 83-94 % on a shared timeline over five real pairs,
+17-46 % (the chance level of dense dialogue) shifted by a second or more or timed to another
+release. One-way, a correct reference with 44 song-lyric cues the draft lacked scored 68 %. Below 60 % the
 request is refused (`ProviderError`, so the file is left unproofread with a warning), and the
 error names the constant shift within ±10 s that would line it up, for `--reference_offset`.
 Overlap is the wrong test and was measured: dialogue is dense enough that a reference 30 s
 out still overlaps some cue 76-89 % of the time.
+
+## Review output: `changes.srt` and Subtitle Edit bookmarks (`proofread/review.py`)
+
+`changes.srt` (in the review folder) holds each edited cue as two lines -- the new text, then
+`[was]` and the old text -- with the changed characters in `<font color>` (green new, red old),
+character-level, so a one-character fix lights up one character.
+
+Every written SRT/VTT that was proofread gets a Subtitle Edit bookmarks sidecar,
+`<subtitle file>.SE.bookmarks`, in the same folder (the name SE loads automatically). Format
+from `libse/Common/BookmarkPersistence.cs`: UTF-8 **with** BOM, `{"bookmarks":[` CRLF, then
+`{"idx":N,"txt":"..."}` entries joined by commas, `]}` CRLF. `idx` is the cue's **0-based**
+position in the file, one less than its SRT number; `txt` escapes `\` and `"` and writes line
+breaks as `<br />`. Notes are `[was] <old text>` for a changed cue and `[flag] <note>` per flag,
+joined by line breaks when a cue has both.
+
+The indices come from the cue list *as written*: `_proofread` keys each note by the segment
+object, not its position, because re-cleaning can drop an edited cue (reduced to noise) and
+shift every later index (`review.bookmark_marks`). An existing bookmarks file is never
+overwritten: the next free `<stem> (N)<ext>.SE.bookmarks` is used instead.
+
+**Bookmarks always describe the file they sit beside.** In an ASR run, or `--realign` with
+`reference_timing media`, proofreading is the last thing before the writer -- after cue
+assembly's splits and merges, cleaning and the time offset -- so its indices are the written
+file's. With `reference_timing subtitle` proofreading runs *before* realign, on the input's
+cues, which realign may then drop (cut policy, noise drop, cleaning), split or merge: neither
+index nor timing survives, but the text and its order do. `review.remap_marks` therefore
+carries each note across by aligning the two texts character by character (letters and digits
+only, so cleaning and punctuation changes do not matter): a note lands on the output cue
+holding the first surviving character of its source cue, a cue none of whose text survived
+lands on the cue holding the text just before it, and notes meeting on one cue are joined.
+The corrected copy (`{stem}.proofread.srt`) keeps its own bookmarks too. Checked on a whole
+episode realigned onto a different release, with 40 cues dropped and a pair merged on top:
+57 of 57 notes on the expected cue.
+
+An edit that empties a cue removes the cue (`_proofread`): written, a blank cue is one some
+editors skip, which would put every later bookmark one line out.
+
+## Basic cleaning before proofreading (`proofread_preclean`, default on)
+
+Text this run does not clean in full -- an existing subtitle under `--proofread_input` or
+`--realign` (proofread first), or a sync/adjust realign's output (which keeps the subtitle's
+own text) -- is put through the language's **basic** cleaning before it is proofread:
+`CleaningSpec.basic_manifest`, for Cantonese `rules/pipeline_basic.toml` = `punctuation.toml`
+(full-width marks, spacing, ellipses, no space after a dialogue dash) + `chars_hk.toml` (the
+standard character variants) + `trim` (no stray comma at either end of a line). Nothing that
+rewrites words or layout: no clause commas, numerals, interjection/repeat removal or line
+breaking, since in a finished subtitle those are the editor's decisions.
+
+It runs on each display line separately (`transcribe._preclean_text`): `punctuation.toml`'s
+first rule folds line breaks into spaces, which on a whole cue would merge a two-speaker
+cue's lines. A line it would empty is left as it was. ASR output is already fully cleaned and
+is not cleaned twice. Off with `proofread_preclean = False` or `--no_clean_text`. What it
+changed goes to `precleaned.srt` (new over `[was]` old) beside the review files.
+
+## The run plan
+
+`Pipeline:` is logged once, before anything runs, and covers the whole run
+(`transcribe._describe_run`): the proofread-first step if there is one, the stages, cue
+assembly and cleaning, the end-of-run proofread if that is where it runs, and the write. Each
+proofread step names its provider, model, effort and reference -- `no reference`, or the
+file and which timeline it was declared on -- so a run that will proofread without the
+reference it was meant to have says so before it spends anything. The proofread-first step
+itself runs only after the plan is logged.

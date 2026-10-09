@@ -74,7 +74,7 @@ class ProofreadSettings:
     particles: str = "protect"            # protect | allow
     max_cost: Optional[float] = None      # USD per request; None: no ceiling
     dry_run: bool = False
-    timeout: float = 1800.0
+    timeout: float = 1200.0
     chunk_cues: int = 0                   # 0: the whole file in one request
     chunk_context: int = 6                # read-only cues either side of a chunk
     parallel: int = 4                     # chunk requests in flight at once
@@ -113,6 +113,7 @@ class FileResult:
     usage: Dict[str, float] = field(default_factory=dict)
     requests: int = 0
     replayed: int = 0
+    before: Dict[int, str] = field(default_factory=dict)   # changed cue id -> its old text
 
 
 class Proofreader:
@@ -242,6 +243,7 @@ class Proofreader:
             if texts[c.id] != c.text:
                 seg = segments[c.id - 1]
                 seg["text"] = texts[c.id]
+                result.before[c.id] = c.text
                 kinds = sorted({e.get("type", "other") for e in result.edits if e["id"] == c.id})
                 add_note(seg, "proofread:" + ",".join(kinds or ["edit"]))
         if save_dir and not s.dry_run:
@@ -259,7 +261,7 @@ class Proofreader:
         shift that would line it up is named, for ``--reference_offset``.
         """
         share = reference_agreement(cues, reference)
-        logger.info("Proofreading %s: %.0f%% of reference cues start within %.1fs of a cue",
+        logger.info("Proofreading %s: reference timing agreement %.0f%% (cue starts within %.1fs)",
                     name, 100 * share, AGREEMENT_TOLERANCE)
         if share >= MIN_AGREEMENT:
             return
@@ -270,14 +272,16 @@ class Proofreader:
                 "; no constant shift within 10 s fixes it, so it is probably timed to a "
                 "different release (under --realign, check --reference_timing)")
         raise providers.ProviderError(
-            f"the reference subtitle does not match these cues' timing: only {share:.0%} of "
-            f"its cues start near one (a matching reference scores ~85-95%){hint}. Nothing "
-            "was sent.")
+            f"the reference subtitle does not match these cues' timing: timing agreement "
+            f"{share:.0%} (a matching reference scores ~83-94%){hint}. Nothing was sent.")
 
     def _send_all(self, name: str, pending: list, n_chunks: int, save_dir: Optional[str],
                   result: FileResult) -> None:
-        """Send every pending request, filling in each plan's record (None if it failed)."""
-        from concurrent.futures import ThreadPoolExecutor
+        """Send every pending request, filling in each plan's record (None if it failed).
+
+        Each answer is saved the moment it arrives, so stopping the run (Ctrl+C) loses none
+        that were already paid for; see :func:`_in_background` for why Ctrl+C works at all.
+        """
         from cantocaptions_ai.utils import debug
 
         s = self.settings
@@ -294,16 +298,29 @@ class Proofreader:
                 reply = providers.send(s.provider, s.model, req, s.effort, s.timeout, cache=cache)
             except providers.ProviderError as e:
                 return plan, None, e
+            except Exception as e:      # an SDK surprise must not take the other chunks with it
+                return plan, None, providers.ProviderError(f"{type(e).__name__}: {e}")
+            if save_dir:
+                record = {"request_hash": key, "provider": s.provider, "model": s.model,
+                          "effort": s.effort, "answer": reply.answer, "raw": reply.raw,
+                          "usage": reply.usage, "seconds": reply.seconds}
+                debug.write_proofread_record(
+                    save_dir, k, record, f"# system\n\n{req.system}\n\n# user\n\n{req.user}\n")
             return plan, reply, None
 
         try:
             first, rest = pending[:1], pending[1:]
             # The first request goes alone: it is what fills an implicit cache (and, for
             # Anthropic, writes the cache_control breakpoint) that the others then read.
-            outcomes = [one(p) for p in first]
+            outcomes = _in_background(one, first, 1)
             if rest:
-                with ThreadPoolExecutor(max_workers=max(1, s.parallel)) as pool:
-                    outcomes += list(pool.map(one, rest))
+                outcomes += _in_background(one, rest, max(1, s.parallel))
+        except KeyboardInterrupt:
+            logger.warning(
+                "Proofreading %s interrupted. Answers already received are saved%s; a request "
+                "still in flight may be billed by the provider even though it is abandoned.",
+                name, f" in {save_dir}" if save_dir else " nowhere (no output or debug dir)")
+            raise
         finally:
             if cache is not None:
                 providers.close_cache(s.provider, cache)
@@ -324,9 +341,6 @@ class Proofreader:
             plan[4] = record
             logger.info("Proofreading %s: chunk %d/%d answered in %.0fs, $%s", name, k + 1,
                         n_chunks, reply.seconds, reply.usage.get("cost_usd"))
-            if save_dir:
-                debug.write_proofread_record(
-                    save_dir, k, record, f"# system\n\n{req.system}\n\n# user\n\n{req.user}\n")
         if failed and len(failed) == len(outcomes) and result.replayed == 0:
             k, error = failed[0]
             raise providers.ProviderError(
@@ -359,12 +373,11 @@ class Proofreader:
 
     def _write_review(self, save_dir: str, cues: List[Cue], texts: Dict[int, str],
                       result: FileResult) -> None:
+        from cantocaptions_ai.pipeline.proofread.review import write_changes_srt
         from cantocaptions_ai.utils.debug import write_labelled_srt
         os.makedirs(save_dir, exist_ok=True)
-        changed = [c for c in cues if texts[c.id] != c.text]
-        write_labelled_srt(os.path.join(save_dir, "changes.srt"), (
-            (c.start, c.end, [], texts[c.id].replace("\n", " / ")
-             + "\n[was] " + c.text.replace("\n", " / ")) for c in changed))
+        write_changes_srt(os.path.join(save_dir, "changes.srt"), (
+            (c.start, c.end, texts[c.id], c.text) for c in cues if texts[c.id] != c.text))
         by_id = {c.id: c for c in cues}
         write_labelled_srt(os.path.join(save_dir, "flags.srt"), (
             (by_id[f["id"]].start, by_id[f["id"]].end, [f.get("note", "")], texts[f["id"]])
@@ -376,6 +389,45 @@ class Proofreader:
                       f, ensure_ascii=False, indent=1)
         logger.info("Proofreading review files (changes.srt, flags.srt, summary.json) and the "
                     "model's answers: %s", save_dir)
+
+
+POLL_SECONDS = 0.2
+
+
+def _in_background(fn, items: list, workers: int) -> list:
+    """``[fn(item) for item in items]``, *workers* at a time on daemon threads, in order.
+
+    Why not on the main thread, or a ThreadPoolExecutor: a request is one blocking network
+    read lasting minutes, and on Windows Ctrl+C does not interrupt a blocking read -- Python
+    raises KeyboardInterrupt only once the main thread runs bytecode again, i.e. after the
+    answer arrives. An executor's threads are joined at interpreter exit, so even a delivered
+    interrupt then waits for every request in flight. Here the main thread only ever waits in
+    ``POLL_SECONDS`` slices, so Ctrl+C lands within a fraction of a second, and daemon threads
+    do not hold the process open once it does. *fn* must not raise.
+    """
+    import threading
+
+    results: list = [None] * len(items)
+    queue = iter(enumerate(items))
+    lock = threading.Lock()
+
+    def worker():
+        while True:
+            with lock:
+                nxt = next(queue, None)
+            if nxt is None:
+                return
+            k, item = nxt
+            results[k] = fn(item)
+
+    threads = [threading.Thread(target=worker, daemon=True, name=f"proofread-{i}")
+               for i in range(min(workers, len(items)))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        while t.is_alive():
+            t.join(POLL_SECONDS)
+    return results
 
 
 def load_proofreader(cfg, pack, profile) -> Optional[Proofreader]:

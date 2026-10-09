@@ -72,7 +72,8 @@ def preflight(provider: str) -> Optional[str]:
         found = False
     if not found:
         return (f"the {package} package is not installed; install the proofreading extra: "
-                "pip install 'cantocaptions_ai[proofread]'")
+                "`uv sync --inexact --extra proofread` in a checkout (--inexact keeps the "
+                "packages other extras installed), or pip install 'cantocaptions_ai[proofread]'")
     if not any(os.environ.get(v) for v in env):
         return f"no API key for {provider}: set {' or '.join(env)} in the environment"
     return None
@@ -124,7 +125,7 @@ def count_tokens(provider: str, model: str, req: Request) -> Optional[int]:
 
 
 def send(provider: str, model: str, req: Request, effort: str = "medium",
-         timeout_s: float = 1800.0, cache: Optional[str] = None) -> Reply:
+         timeout_s: float = 1200.0, cache: Optional[str] = None) -> Reply:
     """One request. ``cache`` is an :func:`open_cache` handle holding ``req.system``."""
     if provider == "gemini":
         return _gemini(model, req, effort, timeout_s, cache)

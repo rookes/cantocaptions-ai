@@ -1,0 +1,21 @@
+# Basic cleaning: the essential, content-preserving steps, for text that is already a
+# finished subtitle (a human-made file going into proofreading, a realigned subtitle).
+#
+# Only presentation conventions with a single right answer: full-width punctuation and
+# spacing, the Hong Kong character variants, and no stray comma at either end of a line.
+# Nothing that rewrites what was said or how it is laid out -- no clause commas, numeral
+# conversion, interjection or repeat removal, and no line breaking -- since in a finished
+# subtitle those are the editor's decisions, not errors. The engine applies this to each
+# display line on its own, so a two-line (two-speaker) cue keeps its line break.
+
+[[steps]]
+type = "rules"
+file = "punctuation.toml"
+
+[[steps]]
+type = "rules"
+file = "chars_hk.toml"
+
+[[steps]]
+type = "builtin"
+name = "trim"

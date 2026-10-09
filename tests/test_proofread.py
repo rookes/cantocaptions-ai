@@ -335,7 +335,10 @@ class TestProofreader(unittest.TestCase):
         for f in ("chunk_00.json", "chunk_00.request.md", "changes.srt", "flags.srt",
                   "summary.json"):
             self.assertTrue((stage / f).is_file(), f)
-        self.assertIn("[was] 你返嚟喇", (stage / "changes.srt").read_text(encoding="utf-8"))
+        changes = (stage / "changes.srt").read_text(encoding="utf-8")
+        # new text over its own [was] line, the changed characters coloured in each
+        self.assertIn('\n<font color="#66ff66">佢</font>返嚟喇<font color="#66ff66">？</font>\n'
+                      '[was] <font color="#ff6666">你</font>返嚟喇\n', changes)
 
     def test_replay_does_not_pay_again_but_a_changed_draft_does(self):
         self._run(segments(), FakeProvider(ANSWER))
@@ -598,6 +601,219 @@ class TestProofreadInput(unittest.TestCase):
         self.assertTrue((self.tmp / "debug" / "ep" / "proofread" / "ep.proofread.request.md").is_file())
 
 
+class TestBasicCleaning(unittest.TestCase):
+    """Finished subtitles get only the language's basic cleaning before proofreading."""
+
+    def _pc(self, **kw):
+        from cantocaptions_ai.pipeline.transcribe import _build_precleaner
+        pack = get_language_pack("yue")
+        return _build_precleaner(PipelineConfig(device="cpu", proofread="gemini", **kw),
+                                 pack, pack.resolve(None))
+
+    def test_punctuation_and_variants_only(self):
+        from cantocaptions_ai.pipeline.transcribe import _preclean_text
+        pc = self._pc()
+        self.assertEqual(_preclean_text(pc, "你好嗎?我好好,多謝"), "你好嗎？我好好，多謝")
+        self.assertEqual(_preclean_text(pc, "爲咗佢 , 我咩都肯做..."), "為咗佢，我咩都肯做…")
+        self.assertEqual(_preclean_text(pc, "咁樣都得,"), "咁樣都得")         # end comma only
+        self.assertEqual(_preclean_text(pc, "八點三十分見"), "八點三十分見")    # no numerals
+        # line by line: a two-speaker cue keeps its break; the dash loses its space
+        self.assertEqual(_preclean_text(pc, "- 你去邊呀?\n- 返屋企"), "-你去邊呀？\n-返屋企")
+
+    def test_off_switches(self):
+        self.assertIsNone(self._pc(proofread_preclean=False))
+        self.assertIsNone(self._pc(no_clean_text=True))
+        from cantocaptions_ai.pipeline.transcribe import _build_precleaner
+        fr = get_language_pack("fr")
+        self.assertIsNone(_build_precleaner(PipelineConfig(device="cpu", proofread="gemini"),
+                                            fr, fr.resolve(None)))
+
+    def test_a_proofread_input_is_cleaned_before_it_is_sent(self):
+        from cantocaptions_ai.pipeline.transcribe import proofread_files
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "ep.srt"
+            src.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好嗎?\n", encoding="utf-8")
+            fake = FakeProvider({"names": [], "edits": [], "flags": []})
+            cfg = PipelineConfig(device="cpu", proofread="gemini",
+                                 output_dir=str(Path(tmp) / "out"), debug_dir="")
+            with mock.patch.object(providers, "send", fake), \
+                    mock.patch.object(providers, "count_tokens", return_value=None):
+                proofread_files([str(src)], cfg)
+            self.assertIn("1|你好嗎？", fake.requests[0].user)
+            pre = (Path(tmp) / "out" / "ep.proofread" / "precleaned.srt").read_text(encoding="utf-8")
+            self.assertIn("[was] 你好嗎", pre)
+
+
+class TestDurationReport(unittest.TestCase):
+    def test_proofreading_is_a_row_with_its_cost(self):
+        from cantocaptions_ai.pipeline.transcribe import _proofread
+        from cantocaptions_ai.utils.log_utils import TranscriptionSummary
+        summary = TranscriptionSummary(enabled=True)
+        result = {"segments": segments()}
+        with mock.patch.object(providers, "send", FakeProvider(ANSWER)), \
+                mock.patch.object(providers, "count_tokens", return_value=None):
+            _proofread(Proofreader(settings()), "ep", result, REFERENCE, None, None, None, None,
+                       summary=summary)
+        (label, load, run, vram), = summary._stages
+        self.assertEqual(label, "Proofreading")
+        self.assertIsNone(vram)                      # a network call: no VRAM column
+        self.assertGreaterEqual(run, 0.0)
+        self.assertAlmostEqual(summary._amounts["Proofreading cost"][0], 0.01)
+
+
+class TestRunPlan(unittest.TestCase):
+    """The whole run is described before anything runs, proofreading included."""
+
+    def _describe(self, **kw):
+        from cantocaptions_ai.pipeline.transcribe import _describe_run
+        stage = mock.Mock()
+        stage.describe.return_value = "VAD [compute] → Transcript realignment"
+        cfg = PipelineConfig(device="cpu", proofread="gemini", realign="in.srt", **kw)
+        return _describe_run(cfg, None, [stage], Proofreader(settings()), None, None,
+                             object(), False)
+
+    def test_media_timed_reference_proofreads_the_output(self):
+        line = self._describe(reference_subtitle="ref.srt", reference_timing="media")
+        self.assertTrue(line.startswith("VAD [compute]"))
+        self.assertIn("Basic cleaning → Proofread output [gemini gemini-3.7-flash, medium; "
+                      "reference ref.srt, media-timed]", line)
+        self.assertTrue(line.endswith("Write srt + Subtitle Edit bookmarks"))
+
+    def test_proofread_first_comes_first(self):
+        from cantocaptions_ai.pipeline.transcribe import _describe_run
+        stage = mock.Mock()
+        stage.describe.return_value = "VAD [compute]"
+        cfg = PipelineConfig(device="cpu", proofread="gemini", realign="in.srt")
+        line = _describe_run(cfg, None, [stage], Proofreader(settings()), None, None,
+                             object(), True)
+        self.assertTrue(line.startswith("Basic cleaning (realign input) → Proofread realign "
+                                        "input in.srt [gemini gemini-3.7-flash, medium; no reference]"))
+        self.assertEqual(line.count("Proofread"), 1)
+
+
+class TestInterrupt(unittest.TestCase):
+    """Ctrl+C must stop a run even while a request is blocked on the network."""
+
+    def test_results_come_back_in_order(self):
+        from cantocaptions_ai.pipeline.proofread import _in_background
+        import time
+        self.assertEqual(_in_background(lambda x: (time.sleep(0.05 * (5 - x)), x)[1],
+                                        list(range(5)), 3), [0, 1, 2, 3, 4])
+
+    def test_ctrl_c_lands_while_a_request_is_still_blocked(self):
+        import _thread
+        import threading
+        import time
+        from cantocaptions_ai.pipeline.proofread import _in_background
+        release = threading.Event()
+        threading.Timer(0.3, _thread.interrupt_main).start()      # what Ctrl+C does
+        t0 = time.time()
+        with self.assertRaises(KeyboardInterrupt):
+            _in_background(lambda _: release.wait(30), [1, 2], 2)
+        self.assertLess(time.time() - t0, 3)       # not the 30 s the "request" would take
+        release.set()
+
+    def test_answers_received_before_the_interrupt_are_saved(self):
+        import _thread
+        import threading
+        segs = [{"start": float(i), "end": i + 0.9, "text": f"第{i}句"} for i in range(8)]
+        release = threading.Event()
+
+        def send(provider, model, req, effort="medium", timeout_s=0, cache=None):
+            if "\n5|" in req.user:                  # the second chunk hangs
+                threading.Timer(0.3, _thread.interrupt_main).start()
+                release.wait(30)
+            return reply({"names": [], "edits": [], "flags": []})
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(out, ignore_errors=True))
+        with mock.patch.object(providers, "send", send), \
+                mock.patch.object(providers, "count_tokens", return_value=None), \
+                mock.patch.object(providers, "open_cache", return_value=None), \
+                self.assertRaises(KeyboardInterrupt):
+            Proofreader(settings(chunk_cues=4)).run("ep", segs, save_dir=str(out))
+        release.set()
+        self.assertTrue((out / "chunk_00.json").is_file())          # paid for, so kept
+        self.assertFalse((out / "chunk_01.json").exists())
+
+
+class TestBookmarks(unittest.TestCase):
+    """Subtitle Edit bookmarks for the proofread SRT (format of libse BookmarkPersistence)."""
+
+    def test_the_file_is_what_subtitle_edit_writes(self):
+        from cantocaptions_ai.pipeline.proofread.review import write_bookmarks
+        with tempfile.TemporaryDirectory() as tmp:
+            srt = os.path.join(tmp, "ep.srt")
+            path = write_bookmarks(srt, [(3, '[was] 你"好"\n[flag] a\\b'), (0, "x")])
+            self.assertEqual(path, srt + ".SE.bookmarks")
+            raw = Path(path).read_bytes()
+            self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+            self.assertEqual(raw[3:].decode("utf-8"),
+                             '{"bookmarks":[\r\n{"idx":0,"txt":"x"},'
+                             '{"idx":3,"txt":"[was] 你\\"好\\"<br />[flag] a\\\\b"}]}\r\n')
+            self.assertIsNone(write_bookmarks(srt, []))
+
+    def test_an_existing_file_is_never_overwritten(self):
+        from cantocaptions_ai.pipeline.proofread.review import write_bookmarks
+        with tempfile.TemporaryDirectory() as tmp:
+            srt = os.path.join(tmp, "ep.proofread.srt")
+            first = write_bookmarks(srt, [(0, "a")])
+            second = write_bookmarks(srt, [(0, "b")])
+            third = write_bookmarks(srt, [(0, "c")])
+            self.assertEqual(Path(first).name, "ep.proofread.srt.SE.bookmarks")
+            self.assertEqual(Path(second).name, "ep.proofread (1).srt.SE.bookmarks")
+            self.assertEqual(Path(third).name, "ep.proofread (2).srt.SE.bookmarks")
+            self.assertIn('"txt":"a"', Path(first).read_text(encoding="utf-8-sig"))
+
+    def test_indices_follow_the_cues_actually_written(self):
+        from cantocaptions_ai.pipeline.proofread.review import bookmark_marks
+        a, b, c = {"text": "a"}, {"text": "b"}, {"text": "c"}
+        notes = {id(a): ["[was] x"], id(c): ["[was] y", "[flag] check"]}
+        self.assertEqual(bookmark_marks([a, b, c], notes),
+                         [(0, "[was] x"), (2, "[was] y\n[flag] check")])
+        # b dropped by re-cleaning: c moves up to index 1
+        self.assertEqual(bookmark_marks([a, c], notes), [(0, "[was] x"), (1, "[was] y\n[flag] check")])
+
+    def test_marks_follow_the_text_through_realign(self):
+        from cantocaptions_ai.pipeline.proofread.review import remap_marks
+        source = ["你返嚟喇", "我哋去食飯啦，好唔好？", "嗯", "我個名叫做帕克", "帕克唔喺度", "再見"]
+        marks = [(0, "a"), (1, "b"), (2, "c"), (3, "d"), (5, "f")]
+        # unchanged: one to one
+        self.assertEqual(remap_marks(source, marks, source),
+                         [(0, "a"), (1, "b"), (2, "c"), (3, "d"), (5, "f")])
+        target = [
+            "你返嚟喇",                     # 0
+            "我哋去食飯啦，",                # 1  cue 1 split in two...
+            "好唔好？",                      # 2
+            # cue 2 (嗯) dropped as noise
+            "我個名叫做帕克 帕克唔喺度",      # 3  cues 3 and 4 merged
+            "再見！",                        # 4  cleaned
+        ]
+        # b: on the first half of its split; c: its cue is gone, so on the cue holding the
+        # text just before where it was; d: on the merged cue; f: through the cleaning
+        self.assertEqual(remap_marks(source, marks, target),
+                         [(0, "a"), (1, "b"), (2, "c"), (3, "d"), (4, "f")])
+        merged = ["你返嚟喇 我哋去食飯啦，好唔好？", "嗯 我個名叫做帕克 帕克唔喺度 再見"]
+        self.assertEqual(remap_marks(source, marks, merged), [(0, "a\nb"), (1, "c\nd\nf")])
+        self.assertEqual(remap_marks(source, marks, []), [])
+
+    def test_a_proofread_input_gets_bookmarks_beside_its_srt(self):
+        from cantocaptions_ai.pipeline.transcribe import proofread_files
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "ep.srt"
+            src.write_text(SRT, encoding="utf-8")
+            answer = {"names": [], "flags": [{"id": 3, "note": "name unclear"}],
+                      "edits": [{"id": 2, "text": "- 我哋去食飯囉\n- 好啊", "confidence": "high"}]}
+            cfg = PipelineConfig(device="cpu", proofread="gemini", proofread_particles="allow",
+                                 no_clean_text=True, output_dir=str(Path(tmp) / "out"),
+                                 debug_dir="")
+            with mock.patch.object(providers, "send", FakeProvider(answer)), \
+                    mock.patch.object(providers, "count_tokens", return_value=None):
+                proofread_files([str(src)], cfg)
+            marks = (Path(tmp) / "out" / "ep.proofread.srt.SE.bookmarks").read_text(encoding="utf-8-sig")
+            self.assertIn('{"idx":1,"txt":"[was] - 我哋去食飯啦 / - 好啊"}', marks)
+            self.assertIn('{"idx":2,"txt":"[flag] name unclear"}', marks)
+
+
 def _cues(starts):
     return [Cue(i + 1, s, s + 1.5, f"第{i}句") for i, s in enumerate(starts)]
 
@@ -641,8 +857,10 @@ class TestReferenceTiming(unittest.TestCase):
         from cantocaptions_ai.pipeline.transcribe import validate_config
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(providers, "preflight", return_value=None):
+            self.assertEqual(self._cfg(tmp).reference_timing, "media")   # the default
+            validate_config(self._cfg(tmp))
             with self.assertRaisesRegex(ConfigError, "needs reference_timing"):
-                validate_config(self._cfg(tmp))
+                validate_config(self._cfg(tmp, reference_timing=None))
             validate_config(self._cfg(tmp, reference_timing="subtitle"))
             bare = Path(tmp) / "lines.txt"
             bare.write_text("你好\n", encoding="utf-8")
@@ -666,8 +884,13 @@ class TestReferenceTiming(unittest.TestCase):
                 mock.patch.object(providers, "send", fake), \
                 mock.patch.object(providers, "count_tokens", return_value=None):
             cfg = self._cfg(tmp, reference_timing="subtitle")
-            new = _proofread_realign_input(cfg)
+            pack = get_language_pack("yue")
+            new, carried = _proofread_realign_input(
+                cfg, load_proofreader(cfg, pack, pack.resolve(None)))
             self.assertEqual(new.proofread, "none")                 # not proofread twice
+            texts, marks = carried                                   # for the realigned output
+            self.assertEqual(texts[0], "佢返嚟喇")
+            self.assertEqual(marks, [(0, "[was] 你返嚟喇")])
             self.assertTrue(new.realign.endswith("sub.proofread.srt"))
             self.assertEqual(read_subtitle_cues(new.realign)[0].text, "佢返嚟喇")
             self.assertIn("R 你回來了", fake.requests[0].user)       # paired on the input's timeline
