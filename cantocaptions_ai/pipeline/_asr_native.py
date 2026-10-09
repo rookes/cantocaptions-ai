@@ -271,12 +271,12 @@ def load_model_native(
 
     if compute_type == "default":
         compute_type = "float16" if device == "cuda" else "float32"
-        logger.info("Compute type defaulting to %s for device %s", compute_type, device)
+        logger.debug("Compute type defaulting to %s for device %s", compute_type, device)
 
     device_map = resolve_device(device, device_index)
     pipeline_device = device_index if device == "cuda" else device
 
-    logger.info("Loading ASR model %r (native backend, attn=%s)", model_id, attn_implementation)
+    logger.info("ASR model: %s (native backend, %s attention)", model_id, attn_implementation)
 
     hf_model = model
     if hf_model is None:

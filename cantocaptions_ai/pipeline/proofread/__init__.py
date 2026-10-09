@@ -158,7 +158,7 @@ class Proofreader:
                 logger.warning("No price known for %s, so proofread_max_cost cannot be "
                                "enforced for it", s.model)
             return
-        logger.info("Proofreading request: ~%d input tokens, estimated $%.3f", n_in, estimate)
+        logger.info("Request: ~%d input tokens, estimated $%.3f", n_in, estimate)
         if s.max_cost is not None and estimate > s.max_cost:
             raise providers.ProviderError(
                 f"estimated cost ${estimate:.3f} is over proofread_max_cost ${s.max_cost:.2f}")
@@ -167,7 +167,7 @@ class Proofreader:
 
     def run(self, name: str, segments: List[dict], reference: Sequence[dict] = (),
             debug_dir: Optional[str] = None, load_debug_dir: Optional[str] = None,
-            title: str = "", save_dir: Optional[str] = None) -> FileResult:
+            title: str = "", save_dir: Optional[str] = None, progress=None) -> FileResult:
         """Proofread *segments* in place (their ``text``) and return what was done.
 
         ``save_dir`` is where each paid answer and the review files go; by default the debug
@@ -178,6 +178,9 @@ class Proofreader:
         ``proofread_parallel`` at a time, behind one explicit prompt cache where the provider
         has one. A chunk whose request fails is skipped with a warning and the others still
         apply; only when every request fails does this raise ``ProviderError``.
+
+        ``progress`` (a ProgressReporter) shows what is being waited on: a status for one
+        request, a bar of chunks for several.
         """
         from cantocaptions_ai.utils import debug
 
@@ -208,7 +211,7 @@ class Proofreader:
         elif pending:
             for p in pending:          # refuse before anything is sent, not halfway through
                 self._guard_cost(p[2])
-            self._send_all(name, pending, len(chunks), save_dir, result)
+            self._send_all(name, pending, len(chunks), save_dir, result, progress)
 
         texts: Dict[int, str] = {c.id: c.text for c in cues}
         names: List[dict] = []
@@ -249,7 +252,7 @@ class Proofreader:
         if save_dir and not s.dry_run:
             self._write_review(save_dir, cues, texts, result)
         if result.invalid:
-            logger.info("Proofreading: %d proposal(s) were invalid and ignored", result.invalid)
+            logger.info("%d proposal(s) were invalid and ignored", result.invalid)
         return result
 
     def _check_reference_timing(self, name: str, cues: List[Cue], reference: Sequence[dict]) -> None:
@@ -261,8 +264,8 @@ class Proofreader:
         shift that would line it up is named, for ``--reference_offset``.
         """
         share = reference_agreement(cues, reference)
-        logger.info("Proofreading %s: reference timing agreement %.0f%% (cue starts within %.1fs)",
-                    name, 100 * share, AGREEMENT_TOLERANCE)
+        logger.info("Reference timing agreement %.0f%% (cue starts within %.1fs)",
+                    100 * share, AGREEMENT_TOLERANCE)
         if share >= MIN_AGREEMENT:
             return
         shift, best = best_reference_shift(cues, reference)
@@ -276,7 +279,7 @@ class Proofreader:
             f"{share:.0%} (a matching reference scores ~83-94%){hint}. Nothing was sent.")
 
     def _send_all(self, name: str, pending: list, n_chunks: int, save_dir: Optional[str],
-                  result: FileResult) -> None:
+                  result: FileResult, progress=None) -> None:
         """Send every pending request, filling in each plan's record (None if it failed).
 
         Each answer is saved the moment it arrives, so stopping the run (Ctrl+C) loses none
@@ -289,11 +292,19 @@ class Proofreader:
         if len(pending) > 1:
             cache = providers.open_cache(s.provider, s.model, self.system, s.timeout)
 
+        if progress is not None:
+            if len(pending) > 1:
+                progress.set_total(len(pending), unit="chunk")
+                progress.status(f"waiting for {s.model}")
+            else:
+                n_edit = sum(c.editable for c in pending[0][1])
+                progress.status(f"waiting for {s.model} ({n_edit} cues)")
+
         def one(plan):
             k, chunk, req, key, _ = plan
             label = f"chunk {k + 1}/{n_chunks}" if n_chunks > 1 else "request"
             n_edit = sum(c.editable for c in chunk)
-            logger.info("Proofreading %s: %s (%d cues)", name, label, n_edit)
+            logger.debug("Proofreading %s: %s (%d cues)", name, label, n_edit)
             try:
                 reply = providers.send(s.provider, s.model, req, s.effort, s.timeout, cache=cache)
             except providers.ProviderError as e:
@@ -312,9 +323,10 @@ class Proofreader:
             first, rest = pending[:1], pending[1:]
             # The first request goes alone: it is what fills an implicit cache (and, for
             # Anthropic, writes the cache_control breakpoint) that the others then read.
-            outcomes = _in_background(one, first, 1)
+            advance = progress.advance if progress is not None and len(pending) > 1 else None
+            outcomes = _in_background(one, first, 1, on_done=advance)
             if rest:
-                outcomes += _in_background(one, rest, max(1, s.parallel))
+                outcomes += _in_background(one, rest, max(1, s.parallel), on_done=advance)
         except KeyboardInterrupt:
             logger.warning(
                 "Proofreading %s interrupted. Answers already received are saved%s; a request "
@@ -339,8 +351,8 @@ class Proofreader:
                       "effort": s.effort, "answer": reply.answer, "raw": reply.raw,
                       "usage": reply.usage, "seconds": reply.seconds}
             plan[4] = record
-            logger.info("Proofreading %s: chunk %d/%d answered in %.0fs, $%s", name, k + 1,
-                        n_chunks, reply.seconds, reply.usage.get("cost_usd"))
+            logger.debug("Proofreading %s: chunk %d/%d answered in %.0fs, $%s", name, k + 1,
+                         n_chunks, reply.seconds, reply.usage.get("cost_usd"))
         if failed and len(failed) == len(outcomes) and result.replayed == 0:
             k, error = failed[0]
             raise providers.ProviderError(
@@ -387,14 +399,14 @@ class Proofreader:
                        "invalid": result.invalid, "usage": result.usage,
                        "requests": result.requests, "replayed": result.replayed},
                       f, ensure_ascii=False, indent=1)
-        logger.info("Proofreading review files (changes.srt, flags.srt, summary.json) and the "
-                    "model's answers: %s", save_dir)
+        logger.info("Review files (changes.srt, flags.srt, summary.json): %s",
+                    os.path.normpath(save_dir))
 
 
 POLL_SECONDS = 0.2
 
 
-def _in_background(fn, items: list, workers: int) -> list:
+def _in_background(fn, items: list, workers: int, on_done=None) -> list:
     """``[fn(item) for item in items]``, *workers* at a time on daemon threads, in order.
 
     Why not on the main thread, or a ThreadPoolExecutor: a request is one blocking network
@@ -404,12 +416,16 @@ def _in_background(fn, items: list, workers: int) -> list:
     interrupt then waits for every request in flight. Here the main thread only ever waits in
     ``POLL_SECONDS`` slices, so Ctrl+C lands within a fraction of a second, and daemon threads
     do not hold the process open once it does. *fn* must not raise.
+
+    ``on_done(n)`` is called on the main thread with how many more items have finished since
+    the last call, for a progress bar: the console is only ever drawn from one thread.
     """
     import threading
 
     results: list = [None] * len(items)
     queue = iter(enumerate(items))
     lock = threading.Lock()
+    finished = [0]
 
     def worker():
         while True:
@@ -419,14 +435,27 @@ def _in_background(fn, items: list, workers: int) -> list:
                 return
             k, item = nxt
             results[k] = fn(item)
+            with lock:
+                finished[0] += 1
 
     threads = [threading.Thread(target=worker, daemon=True, name=f"proofread-{i}")
                for i in range(min(workers, len(items)))]
     for t in threads:
         t.start()
+    reported = 0
+
+    def report():
+        nonlocal reported
+        done = finished[0]
+        if on_done is not None and done > reported:
+            on_done(done - reported)
+            reported = done
+
     for t in threads:
         while t.is_alive():
             t.join(POLL_SECONDS)
+            report()
+    report()
     return results
 
 
@@ -439,7 +468,7 @@ def load_proofreader(cfg, pack, profile) -> Optional[Proofreader]:
         logger.warning(
             "No proofreading standard for language '%s': proofreading for meaning only. "
             "Pass --proofread_conventions FILE to give it conventions.", pack.code)
-    logger.info("Proofreading enabled: %s %s (%s effort), standard '%s'%s",
+    logger.debug("Proofreading enabled: %s %s (%s effort), standard '%s'%s",
                 settings.provider, settings.model, settings.effort, settings.standard.name,
                 " -- DRY RUN, nothing will be sent" if settings.dry_run else "")
     return Proofreader(settings)

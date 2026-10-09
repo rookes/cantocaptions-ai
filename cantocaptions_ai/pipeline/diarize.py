@@ -168,7 +168,8 @@ class FileDiarization(_BaseDiarization):
                 for index, speaker in enumerate(output.speaker_diarization.labels())
             }
 
-        logger.info(f"Diarization found {len(speakers)} speaker(s): {', '.join(speakers)}")
+        logger.info("Found %d speaker(s)", len(speakers))
+        logger.debug("Speakers: %s", ", ".join(speakers))
         return result
 
 
@@ -282,7 +283,7 @@ class SegmentDiarization(_BaseDiarization):
 
         multi = sum(1 for entry in breakdown if len(entry["speakers"]) > 1)
         logger.info(
-            "Diarization: %d/%d VAD segments diarized (%d skipped as shorter than %.2gs), "
+            "%d/%d VAD segments diarized (%d skipped as shorter than %.2gs), "
             "%d with more than one speaker",
             len(breakdown), len(input), skipped, MIN_SEGMENT_DURATION, multi,
         )
@@ -356,7 +357,7 @@ def load_diarization(
     # speechbrain and onnxruntime. Same reasoning as vads/pyannote.py.
     from pyannote.audio.core.pipeline import Pipeline
 
-    logger.info(f"Loading diarization model: {model_name} (scope: {scope})")
+    logger.debug(f"Loading diarization model: {model_name} (scope: {scope})")
     pipeline = Pipeline.from_pretrained(model_name, token=token, cache_dir=model_dir)
     if pipeline is None:
         raise RuntimeError(
@@ -370,7 +371,7 @@ def load_diarization(
     if batch_size is not None:
         pipeline.segmentation_batch_size = batch_size
         pipeline.embedding_batch_size = batch_size
-        logger.info(f"Diarization batch size set to {batch_size}")
+        logger.debug(f"Diarization batch size set to {batch_size}")
 
     pipeline.to(torch.device(resolve_device(device, device_index)))
 

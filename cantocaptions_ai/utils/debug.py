@@ -111,7 +111,7 @@ def write_vad_debug(name: str, segments: List[VadAudioSegment], debug_dir: str) 
     stage_dir = _stage_dir(name, "vad", debug_dir)
     segment_records = _write_audio_segments(segments, stage_dir)
     _write_segments_json(name, segment_records, stage_dir)
-    logger.info(f"VAD debug output written to {stage_dir} ({len(segments)} segments)")
+    logger.debug(f"VAD debug output written to {stage_dir} ({len(segments)} segments)")
 
 
 def write_isolation_debug(name: str, segments: List[VadAudioSegment], debug_dir: str) -> None:
@@ -119,7 +119,7 @@ def write_isolation_debug(name: str, segments: List[VadAudioSegment], debug_dir:
     stage_dir = _stage_dir(name, "vocal_isolation", debug_dir)
     segment_records = _write_audio_segments(segments, stage_dir)
     _write_segments_json(name, segment_records, stage_dir)
-    logger.info(f"Vocal isolation debug output written to {stage_dir} ({len(segments)} segments)")
+    logger.debug(f"Vocal isolation debug output written to {stage_dir} ({len(segments)} segments)")
 
 
 def write_transcription_debug(name: str, result: TranscriptionResult, debug_dir: str) -> None:
@@ -133,7 +133,7 @@ def write_transcription_debug(name: str, result: TranscriptionResult, debug_dir:
     json_path = os.path.join(stage_dir, "result.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
-    logger.info(f"Transcription debug output written to {json_path} ({len(result['segments'])} segments)")
+    logger.debug(f"Transcription debug output written to {json_path} ({len(result['segments'])} segments)")
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ def load_vad_debug(name: str, debug_dir: str) -> Optional[List[VadAudioSegment]]
     stage_dir = os.path.join(debug_dir, stem, "vad")
     segments = _load_audio_segments(stage_dir)
     if segments is not None:
-        logger.info(f"Loaded {len(segments)} VAD segments from {stage_dir}")
+        logger.debug(f"Loaded {len(segments)} VAD segments from {stage_dir}")
     return segments
 
 
@@ -195,7 +195,7 @@ def load_isolation_debug(name: str, debug_dir: str) -> Optional[List[VadAudioSeg
     stage_dir = os.path.join(debug_dir, stem, "vocal_isolation")
     segments = _load_audio_segments(stage_dir)
     if segments is not None:
-        logger.info(f"Loaded {len(segments)} vocal isolation segments from {stage_dir}")
+        logger.debug(f"Loaded {len(segments)} vocal isolation segments from {stage_dir}")
     return segments
 
 
@@ -208,7 +208,7 @@ def load_transcription_debug(name: str, debug_dir: str) -> Optional[Transcriptio
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
     result: TranscriptionResult = {"segments": data["segments"], "language": data.get("language")}
-    logger.info(f"Loaded transcription ({len(result['segments'])} segments) from {json_path}")
+    logger.debug(f"Loaded transcription ({len(result['segments'])} segments) from {json_path}")
     return result
 
 
@@ -219,7 +219,7 @@ def write_ensemble_debug(name: str, texts: List[str], debug_dir: str) -> None:
     data = {"name": name, "texts": texts}
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    logger.info(f"Ensemble debug output written to {json_path} ({len(texts)} segments)")
+    logger.debug(f"Ensemble debug output written to {json_path} ({len(texts)} segments)")
 
 
 def load_ensemble_debug(name: str, debug_dir: str) -> Optional[List[str]]:
@@ -230,7 +230,7 @@ def load_ensemble_debug(name: str, debug_dir: str) -> Optional[List[str]]:
         return None
     with open(json_path, encoding="utf-8") as f:
         texts = json.load(f)["texts"]
-    logger.info(f"Loaded ensemble texts ({len(texts)} segments) from {json_path}")
+    logger.debug(f"Loaded ensemble texts ({len(texts)} segments) from {json_path}")
     return texts
 
 
@@ -245,7 +245,7 @@ def write_llm_correction_debug(name: str, result: TranscriptionResult, debug_dir
     json_path = os.path.join(stage_dir, "result.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
-    logger.info(f"LLM correction debug output written to {json_path} ({len(result['segments'])} segments)")
+    logger.debug(f"LLM correction debug output written to {json_path} ({len(result['segments'])} segments)")
 
 
 def write_precleaning_debug(
@@ -271,7 +271,7 @@ def write_precleaning_debug(
     json_path = os.path.join(stage_dir, "result.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
-    logger.info(f"Pre-cleaning debug output written to {stage_dir} ({len(result['segments'])} segments)")
+    logger.debug(f"Pre-cleaning debug output written to {stage_dir} ({len(result['segments'])} segments)")
 
 
 def load_llm_correction_debug(name: str, debug_dir: str) -> Optional[TranscriptionResult]:
@@ -283,7 +283,7 @@ def load_llm_correction_debug(name: str, debug_dir: str) -> Optional[Transcripti
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
     result: TranscriptionResult = {"segments": data["segments"], "language": data.get("language")}
-    logger.info(f"Loaded LLM correction ({len(result['segments'])} segments) from {json_path}")
+    logger.debug(f"Loaded LLM correction ({len(result['segments'])} segments) from {json_path}")
     return result
 
 
@@ -313,7 +313,7 @@ def write_diarization_debug(name: str, result: DiarizationResult, debug_dir: str
     json_path = os.path.join(stage_dir, "result.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
-    logger.info(
+    logger.debug(
         f"Diarization debug output written to {json_path} "
         f"({output[count_key]} {count_key.removeprefix('num_')}, {len(result['turns'])} turns)"
     )
@@ -337,7 +337,7 @@ def load_diarization_debug(name: str, debug_dir: str) -> Optional[DiarizationRes
     for key in ("scope", "segment_speakers", "embeddings"):
         if data.get(key) is not None:
             result[key] = data[key]
-    logger.info(
+    logger.debug(
         f"Loaded diarization ({len(result['speakers'])} speaker labels, "
         f"{len(result['turns'])} turns, scope: {result.get('scope', 'file')}) from {json_path}"
     )
@@ -381,7 +381,7 @@ def write_realign_debug(
     json_path = os.path.join(stage_dir, "result.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
-    logger.info(
+    logger.debug(
         f"Realign debug output written to {json_path} "
         f"({output['num_lines']} lines, {output['num_unplaced']} unplaced)"
     )
@@ -511,7 +511,7 @@ def write_realign_transform(
 
     srt_path = os.path.join(stage_dir, "changes.srt")
     count = write_labelled_srt(srt_path, rows)
-    logger.info(
+    (logger.info if count else logger.debug)(
         "Realign transform written to %s (%d piece(s), %d break(s)); %d notable change(s) "
         "in %s", json_path, len(transform.pieces), len(transform.breaks), count, srt_path,
     )
@@ -569,8 +569,8 @@ def write_realign_suspects(
     )
     if suspects:
         logger.info(
-            "realign: %d cue(s) worth checking written to %s (%s)",
-            len(suspects), path,
+            "%d cue(s) worth checking written to %s (%s)",
+            len(suspects), os.path.normpath(path),
             ", ".join(sorted({s["realign_reason"] for s in suspects})),
         )
     return len(suspects)
@@ -596,7 +596,7 @@ def write_segment_notes(
     )
     kinds = Counter(note.split(":", 1)[0] for s in annotated for note in s["notes"])
     logger.info(
-        "%d annotated cue(s) written to %s (%s)", len(annotated), path,
+        "%d annotated cue(s) written to %s (%s)", len(annotated), os.path.normpath(path),
         ", ".join(f"{n} {kind}" for kind, n in kinds.most_common()),
     )
     return len(annotated)
@@ -683,7 +683,7 @@ def load_realign_debug(name: str, transcript_path: str, debug_dir: str) -> Optio
         )
         for row in data["lines"]
     ]
-    logger.info(f"Loaded {len(timings)} realign line placement(s) from {json_path}")
+    logger.debug(f"Loaded {len(timings)} realign line placement(s) from {json_path}")
     return timings
 
 
@@ -755,7 +755,7 @@ def write_speaker_assignment_debug(
     WriteSRT(stage_dir)(shadow, _leaf(name), {})
 
     flagged = sum(1 for a in assignments if a["conflict"])
-    logger.info(
+    logger.debug(
         f"Speaker assignment debug output written to {stage_dir} "
         f"({len(assignments)} subsegments, {flagged} flagged multi-speaker)"
     )

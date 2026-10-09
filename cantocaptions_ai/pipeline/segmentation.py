@@ -152,7 +152,7 @@ class _MergeVetoLog:
                 source = "Speaker change" + (f" (p={change:.2f})" if change is not None else "")
             else:
                 source = "Diarization"
-            logger.info(
+            logger.debug(
                 "%s held a cue boundary at %s: %s | %s",
                 source,
                 format_timestamp(boundary, always_include_hours=True, decimal_marker=","),

@@ -8,6 +8,10 @@ What `--debug_dir` writes and what `--load_debug_dir` reloads.
 
 Stage checkpoints: `vad`, `isolation`, `transcription`, `ensemble`, `llm_correction`, `diarization`, `realign`, `proofread`.
 
+Each run's log (`{output_dir}/logs/`, or `--log_file`) is the place to read what a replay did: it
+has every DEBUG line, so every checkpoint loaded or written, and why a stale one was recomputed.
+The console only says `↺ Stage: loaded from DIR`.
+
 `realign/` holds two files. `suspect.srt` is a *snapshot*, not a checkpoint: only the cues
 carrying a reason, on their final timings, prefixed with that reason, for watching against the
 film. `result.json` holds the coarse line placements (start, end, per-line CTC score, reason,

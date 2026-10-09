@@ -11,6 +11,7 @@ import unittest
 import numpy as np
 from pyannote.core import SlidingWindow, SlidingWindowFeature
 
+from cantocaptions_ai.pipeline.vads.curve import CurveVad
 from cantocaptions_ai.pipeline.vads.pyannote import Binarize, Pyannote
 
 FRAME = 0.02  # seconds per score frame
@@ -339,3 +340,49 @@ class TestNoSpeech(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestChunksStayInsideTheAudio(unittest.TestCase):
+    """The score curve's frame grid can end past the audio (pyannote's last window reaches up
+    to ~60 ms beyond the final sample), and Binarize pads speech out to the grid's end. A
+    chunk whose end passed the audio got a shorter slice than its timestamps said, and
+    alignment, spacing emission frames over end - start, stretched its timings late."""
+
+    SR = 16000
+    DURATION = 10.0
+
+    class _GridPastTheEnd(CurveVad):
+        def __init__(self):
+            super().__init__(0.5)
+
+        @staticmethod
+        def preprocess_audio(audio):
+            return audio
+
+        def __call__(self, audio, hook=None, **kwargs):
+            window, step = 0.062, 0.017
+            # As pyannote does: frames until one ends past the audio.
+            n = int(np.ceil((TestChunksStayInsideTheAudio.DURATION - window) / step)) + 2
+            starts = np.arange(n) * step
+            data = np.where(starts >= 6.0, 0.9, 0.05).astype(np.float32)[:, None]
+            return SlidingWindowFeature(data, SlidingWindow(start=0.0, duration=window, step=step))
+
+    def _process(self, **kwargs):
+        from cantocaptions_ai.pipeline.vad import VadProcessor
+        audio = np.zeros(int(self.DURATION * self.SR), dtype=np.float32)
+        processor = VadProcessor(self._GridPastTheEnd(), vad_onset=0.5, vad_offset=0.3,
+                                 chunk_size=28, vad_pad_onset=0.25, vad_pad_offset=0.2,
+                                 **kwargs)
+        return processor.process(audio)
+
+    def test_the_grid_does_end_past_the_audio(self):
+        scores = self._GridPastTheEnd()(None)
+        self.assertGreater(scores.sliding_window[len(scores.data) - 1].end, self.DURATION)
+
+    def test_speech_to_the_end_stops_at_the_last_sample(self):
+        segments = self._process()
+        self.assertEqual(len(segments), 1)
+        seg = segments[0]
+        self.assertAlmostEqual(seg["end"], self.DURATION)
+        self.assertAlmostEqual(len(seg["audio"]) / self.SR, seg["end"] - seg["start"],
+                               delta=1 / self.SR)

@@ -287,7 +287,16 @@ the log names the settings that differ.
 
 Note that `debug_dir` also outputs segmented audio, so it can grow large quickly.
 
-`--log_file FILE` keeps the console output brief and writes the full log to a file.
+### Console output and the log file
+
+The console shows one section per stage: a header with the time it started, a spinner or progress bar
+that says what the stage is doing right now, and a line with its duration when it finishes. Every run
+also writes a detailed log, with timestamps, every step's debug lines and the warnings that libraries
+print, to `{output_dir}/logs/{input}-{date}.log`. The last console line gives its path.
+
+- `--verbose` shows that detail on the console too.
+- `--log_file FILE` writes the log somewhere else; `--log_file none` writes none.
+- `--log_level warning` keeps the console to warnings and errors.
 
 ### HuggingFace access token
 

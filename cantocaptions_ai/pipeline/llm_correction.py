@@ -126,7 +126,7 @@ class LLMCorrector(PipelineStage["dict", "TranscriptionResult"]):
 
     def process(self, input: dict, *, progress_callback: ProgressCallback = None) -> TranscriptionResult:
         """input = {'result': TranscriptionResult, 'ensemble_texts': Optional[List[str]], 'reference_texts': Optional[List[str]]}"""
-        logger.info("Running LLM correction...")
+        logger.debug("Running LLM correction...")
         segments = input['result']['segments']
         ensemble_texts = input.get('ensemble_texts')
         reference_texts = input.get('reference_texts')
@@ -335,7 +335,7 @@ def load_llm(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     use_4bit, reason = _detect_quantization()
-    logger.info(f"Loading LLM ({model_id}), quantization: {reason}, attn_implementation={attn_implementation}")
+    logger.debug(f"Loading LLM ({model_id}), quantization: {reason}, attn_implementation={attn_implementation}")
 
     model_path = model_dir if model_dir else model_id
     load_kwargs: dict = dict(
@@ -371,7 +371,7 @@ def load_llm(
         from cantocaptions_ai.utils.model_utils import vram_stats
         stats = vram_stats()
         if stats:
-            logger.info(
+            logger.debug(
                 f"LLM loaded: {stats['allocated_mb']:.0f} MB allocated "
                 f"({stats['free_mb']:.0f} MB free / {stats['total_mb']:.0f} MB total)"
             )

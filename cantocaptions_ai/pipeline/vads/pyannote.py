@@ -52,7 +52,7 @@ def load_vad_model(device, token=None, model_fp=None):
 class Pyannote(CurveVad):
 
     def __init__(self, device, token=None, model_fp=None, **kwargs):
-        logger.info("Performing voice activity detection using Pyannote...")
+        logger.info("Selected Pyannote for voice activity detection")
         super().__init__(kwargs['vad_onset'])
         self.vad_pipeline = load_vad_model(device, token=token, model_fp=model_fp)
 

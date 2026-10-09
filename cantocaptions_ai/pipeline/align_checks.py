@@ -427,20 +427,21 @@ def warn_on_silent_starts(
 
     from cantocaptions_ai.utils.output import format_timestamp
 
+    examples = [
+        f"  silent cue start at "
+        f"{format_timestamp(hit.time, always_include_hours=True, decimal_marker=',')}: "
+        f"{hit.gap:.2f}s of silence before {hit.text[:30]!r} "
+        f"({hit.dbfs:.0f} dBFS, floor {hit.floor_dbfs:.0f})"
+        for hit in hits[:max_examples]
+    ]
+    if len(hits) > max_examples:
+        examples.append(f"  ...and {len(hits) - max_examples} more")
     logger.warning(
         "Alignment placed %d cue %s on silence — the audio there is at the segment's noise "
-        "floor with no sound within %.2fs. Timings for %s are not trustworthy.",
+        "floor with no sound within %.2fs. Timings for %s are not trustworthy.\n%s",
         len(hits), "start" if len(hits) == 1 else "starts",
-        max(h.gap for h in hits), "it" if len(hits) == 1 else "them",
+        max(h.gap for h in hits), "it" if len(hits) == 1 else "them", "\n".join(examples),
     )
-    for hit in hits[:max_examples]:
-        logger.info(
-            "  silent cue start at %s: %.2fs of silence before %r (%.0f dBFS, floor %.0f)",
-            format_timestamp(hit.time, always_include_hours=True, decimal_marker=","),
-            hit.gap, hit.text[:30], hit.dbfs, hit.floor_dbfs,
-        )
-    if len(hits) > max_examples:
-        logger.info("  ...and %d more", len(hits) - max_examples)
     return hits
 
 

@@ -284,13 +284,19 @@ def _log_report(report: RepairReport) -> None:
     if not report.occurrences:
         return
     kinds = report.by_kind()
+    unresolved = ""
+    if report.unresolved:
+        unresolved = "; no substitute for " + " ".join(
+            f"{c}x{n}" if n > 1 else c for c, n in report.unresolved.most_common())
     logger.info(
-        "Align vocabulary: %d character(s) over %d occurrence(s) have no token; "
-        "substituted %d (%s), %d left unresolved (%d occurrence(s))",
-        len(report.occurrences), sum(report.occurrences.values()),
-        len(report.substitutions),
-        ", ".join(f"{n} {kind}" for kind, n in kinds.most_common()) or "none",
-        len(report.unresolved), report.unresolved_occurrences,
+        "Align vocabulary: %d of %d character(s) the align model has no token for were "
+        "substituted (%s)%s",
+        len(report.substitutions), len(report.occurrences),
+        ", ".join(f"{n} {kind}" for kind, n in kinds.most_common()) or "none", unresolved,
+    )
+    logger.debug(
+        "Align vocabulary: %d occurrence(s) without a token, %d left unresolved",
+        sum(report.occurrences.values()), report.unresolved_occurrences,
     )
     for char, substitution in sorted(
         report.substitutions.items(), key=lambda kv: -report.occurrences[kv[0]]
@@ -298,11 +304,6 @@ def _log_report(report: RepairReport) -> None:
         logger.debug(
             "  %s -> %s (%s, %s) x%d", char, substitution.replacement, substitution.kind,
             substitution.reading or "no reading", report.occurrences[char],
-        )
-    if report.unresolved:
-        logger.info(
-            "  no substitute found for: %s",
-            " ".join(f"{c}x{n}" for c, n in report.unresolved.most_common()),
         )
 
 
@@ -340,7 +341,7 @@ def load_substitution_overrides(path: str) -> Dict[str, str]:
                 f"{original!r} -> {replacement!r}"
             )
         overrides[original] = replacement
-    logger.info("Loaded %d substitution override(s) from %s", len(overrides), path)
+    logger.debug("Loaded %d substitution override(s) from %s", len(overrides), path)
     return overrides
 
 

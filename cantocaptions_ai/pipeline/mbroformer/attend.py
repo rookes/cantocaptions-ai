@@ -1,3 +1,4 @@
+import warnings
 from functools import wraps, lru_cache
 from packaging import version
 from collections import namedtuple
@@ -7,6 +8,10 @@ from torch import nn, einsum
 import torch.nn.functional as F
 
 from einops import rearrange, reduce
+
+from cantocaptions_ai.utils.log_utils import get_logger
+
+logger = get_logger(__name__)
 
 try:  # torch >= 2.1
     from torch.nn.attention import SDPBackend as _SDPBackend, sdpa_kernel as _sdpa_kernel
@@ -47,14 +52,24 @@ def _flash_attention_usable(device_index: int) -> bool:
     `sdpa_kernel` to restrict to a backend that doesn't exist, and it raises
     "No available kernel" instead of silently falling back. Cached per device
     since the answer never changes for a given process.
+
+    The probe's failure is the expected answer on those builds, but torch explains it with
+    one UserWarning per kernel it passed over (six of them), which read as a broken install;
+    they are silenced here and the answer is logged instead.
     """
     try:
         q = torch.zeros(1, 1, 8, 8, device=f'cuda:{device_index}', dtype=torch.float16)
-        with _sdpa_backends(FlashAttentionConfig(True, False, False)):
-            F.scaled_dot_product_attention(q, q, q)
-        return True
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with _sdpa_backends(FlashAttentionConfig(True, False, False)):
+                F.scaled_dot_product_attention(q, q, q)
+        usable = True
     except RuntimeError:
-        return False
+        usable = False
+    logger.debug("Flash attention %s for vocal isolation on cuda:%d",
+                 "available" if usable else "not in this torch build; using the other SDPA kernels",
+                 device_index)
+    return usable
 
 # helpers
 

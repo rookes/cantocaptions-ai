@@ -37,7 +37,7 @@ class Silero(CurveVad):
     VRAM from the stages that need it."""
 
     def __init__(self, **kwargs):
-        logger.info("Performing voice activity detection using Silero v6...")
+        logger.info("Selected Silero v6 for voice activity detection")
         super().__init__(kwargs["vad_onset"])
         self.model = torch.jit.load(MODEL_PATH, map_location="cpu").eval()
 

@@ -1,11 +1,21 @@
 import io
 import logging
+import os
 import sys
 
 import pytest
 
+# Imported before conftest's fixture swaps it out of the module for the duration of a test.
+from cantocaptions_ai.__main__ import _resolve_log_file
 from cantocaptions_ai.utils import log_utils
 from cantocaptions_ai.utils.log_utils import StageTimer, TranscriptionSummary
+
+
+class _Tty(io.StringIO):
+    """A console that says it is a terminal, so StageTimer animates."""
+
+    def isatty(self):
+        return True
 
 
 class _Sink:
@@ -19,7 +29,7 @@ class _Sink:
 
 
 def test_partial_progress_moves_the_bar_but_never_reaches_a_sink(monkeypatch):
-    console = io.StringIO()
+    console = _Tty()
     monkeypatch.setattr(sys, "__stdout__", console)
     sink = _Sink()
     with StageTimer("VAD", TranscriptionSummary(), progress=sink) as timer:
@@ -38,7 +48,7 @@ def test_partial_progress_moves_the_bar_but_never_reaches_a_sink(monkeypatch):
 
 
 def test_advance_after_partial_counts_whole_units(monkeypatch):
-    monkeypatch.setattr(sys, "__stdout__", io.StringIO())
+    monkeypatch.setattr(sys, "__stdout__", _Tty())
     with StageTimer("VAD", TranscriptionSummary()) as timer:
         timer.reporter.set_total(3, unit="file")
         for _ in range(3):
@@ -131,3 +141,131 @@ def test_stages_without_a_load_or_vram_stay_without_one():
     summary.record("Speaker assignment", None, 0.2)
     ((label, load, run, vram),) = summary._stages
     assert (label, load, round(run, 3), vram) == ("Speaker assignment", None, 0.3, None)
+
+
+# --- the console and the log file ----------------------------------------------------------
+
+@pytest.fixture
+def logs(tmp_path, monkeypatch):
+    """setup_logging against a fake console and a log file; logging is reset afterwards."""
+    console = io.StringIO()
+    monkeypatch.setattr(sys, "__stdout__", console)
+    log_file = tmp_path / "run.log"
+
+    def setup(level="info"):
+        log_utils.setup_logging(level=level, log_file=str(log_file))
+        return console, log_file
+
+    yield setup
+    log_utils.setup_logging()
+
+
+def test_console_lines_carry_no_timestamp_or_logger_name(logs):
+    console, log_file = logs()
+    logging.getLogger("cantocaptions_ai.pipeline.vad").info("68 chunks")
+    logging.getLogger("cantocaptions_ai.pipeline.vad").debug("Performing VAD...")
+    assert console.getvalue() == "  68 chunks\n"
+    text = log_file.read_text(encoding="utf-8")
+    assert "cantocaptions_ai.pipeline.vad - INFO - 68 chunks" in text
+    assert "DEBUG - Performing VAD..." in text
+
+
+def test_verbose_console_shows_detail_with_times(logs):
+    console, _ = logs("debug")
+    logging.getLogger("cantocaptions_ai.pipeline.vad").debug("Performing VAD...")
+    line = console.getvalue()
+    assert "pipeline.vad" in line and "DEBUG" in line and "Performing VAD..." in line
+
+
+def test_warnings_are_labelled_and_lists_stay_indented(logs):
+    console, _ = logs()
+    logging.getLogger("cantocaptions_ai").warning("2 lines need review:\n  1  a\n  1  b")
+    lines = console.getvalue().splitlines()
+    assert lines[0].endswith("Warning: 2 lines need review:")
+    assert lines[1:] == ["    1  a", "    1  b"]
+
+
+def test_our_warnings_reach_the_console_and_library_ones_only_the_file(logs):
+    import warnings
+    from cantocaptions_ai.errors import CantocaptionsWarning
+    console, log_file = logs()
+    warnings.warn("speaker_labels has no effect without diarize", CantocaptionsWarning)
+    warnings.warn("TensorFloat-32 (TF32) has been disabled", UserWarning)
+    shown = console.getvalue()
+    assert "Warning: speaker_labels has no effect without diarize" in shown
+    assert "TF32" not in shown
+    assert "TF32" in log_file.read_text(encoding="utf-8")
+
+
+def test_verbose_shows_library_warnings_too(logs):
+    import warnings
+    console, _ = logs("debug")
+    warnings.warn("TensorFloat-32 (TF32) has been disabled", UserWarning)
+    assert "TF32" in console.getvalue()
+
+
+class _StatusSink(_Sink):
+    def __init__(self):
+        super().__init__()
+        self.statuses = []
+
+    def status(self, text):
+        self.statuses.append(text)
+
+
+def test_a_stage_is_a_section_with_a_completion_line(monkeypatch):
+    console = io.StringIO()   # not a terminal: plain lines, no animation
+    monkeypatch.setattr(sys, "__stdout__", console)
+    sink = _StatusSink()
+    with StageTimer("Vocal isolation", TranscriptionSummary(), progress=sink) as timer:
+        timer.status("compiling model")
+        timer.reporter.set_total(378, unit="chunk")
+        timer.reporter.advance(378)
+        timer.reporter.note("compile 3:09")
+    text = console.getvalue()
+    lines = [line for line in text.splitlines() if line]
+    assert lines[0].startswith("-- Vocal isolation ") or lines[0].startswith("── Vocal isolation ")
+    assert "Vocal isolation: compiling model" in lines[1]
+    assert "Vocal isolation: 378 chunks, compile 3:09 in" in lines[-1]
+    assert "\r" not in text
+    assert sink.statuses == ["compiling model", ""]
+
+
+def test_a_failed_stage_says_so(monkeypatch):
+    console = io.StringIO()
+    monkeypatch.setattr(sys, "__stdout__", console)
+    with pytest.raises(ValueError):
+        with StageTimer("Diarization", TranscriptionSummary()):
+            raise ValueError("gated")
+    assert "Diarization failed after" in console.getvalue()
+
+
+def test_no_console_output_with_progress_off(monkeypatch):
+    console = io.StringIO()
+    monkeypatch.setattr(sys, "__stdout__", console)
+    sink = _StatusSink()
+    with StageTimer("VAD", TranscriptionSummary(enabled=False), progress=sink) as timer:
+        timer.status("loading model")
+    assert console.getvalue() == ""
+    assert sink.statuses == ["loading model", ""]
+
+
+def test_a_title_changes_the_console_not_the_summary_row(monkeypatch):
+    console = io.StringIO()
+    monkeypatch.setattr(sys, "__stdout__", console)
+    summary = TranscriptionSummary()
+    with StageTimer("Proofreading", summary, title="Proofreading (realign input)"):
+        pass
+    assert "Proofreading (realign input) in" in console.getvalue()
+    assert [row[0] for row in summary._stages] == ["Proofreading"]
+
+
+
+def test_log_file_resolution():
+    merged = {"output_dir": "out", "audio": [os.path.join("media", "Season 1", "02.mkv")]}
+    path = _resolve_log_file(None, merged)
+    assert os.path.dirname(path) == os.path.join("out", "logs")
+    assert os.path.basename(path).startswith("02-") and path.endswith(".log")
+    assert _resolve_log_file("none", merged) is None
+    assert _resolve_log_file("mine.log", merged) == "mine.log"
+    assert _resolve_log_file(None, {"output_dir": "out"}) is None   # no input: about to be refused

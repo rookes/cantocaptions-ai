@@ -438,7 +438,8 @@ class TestSpeakerVetoLogging(unittest.TestCase):
     LOGGER = "cantocaptions_ai.pipeline.segmentation"
 
     def veto_lines(self, segments, **kwargs):
-        with self.assertLogs(self.LOGGER, level="INFO") as captured:
+        # Each held boundary is a DEBUG line (the log file's); the count is the INFO one.
+        with self.assertLogs(self.LOGGER, level="DEBUG") as captured:
             # A log record of our own guarantees assertLogs never fails on an empty run.
             logging.getLogger(self.LOGGER).info("probe")
             assemble_cues(segments, **kwargs)
@@ -592,7 +593,7 @@ class TestSpeakerBreakGate(unittest.TestCase):
 
     def test_veto_log_names_the_speaker_change(self):
         logger_name = "cantocaptions_ai.pipeline.segmentation"
-        with self.assertLogs(logger_name, level="INFO") as captured:
+        with self.assertLogs(logger_name, level="DEBUG") as captured:
             assemble_cues(
                 [seg(0.0, 2.0, "你好嗎，"), seg(2.04, 4.0, "幾好呀，", speaker_break=True,
                                                   speaker_change=0.93)],

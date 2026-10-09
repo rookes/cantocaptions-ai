@@ -221,7 +221,7 @@ class BatchedAsrStage(AsrStage):
         Segments from every to-compute file are flattened into one job stream, so
         batches pack work from different files (no half-empty tail batch per file).
         """
-        logger.info("Performing transcription (%s backend)...", self.backend_label)
+        logger.debug("Performing transcription (%s backend)...", self.backend_label)
         language = self._backend_language(self.preset_language)
         cached, to_compute = partition_by_cache(items, self, load_debug_dir)
 
@@ -395,7 +395,7 @@ def load_model(
             "it is a base dependency, so update the install (`uv sync`, or "
             "`pip install -U 'transformers>=5.13'`)"
         )
-    logger.info("ASR backend: %s", backend.name)
+    logger.debug("ASR backend: %s", backend.name)
     kwargs = dict(
         model_name=model_name, device=device, device_index=device_index,
         compute_type=compute_type, attn_implementation=attn_implementation,

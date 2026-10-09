@@ -391,14 +391,18 @@ class TestSpans(unittest.TestCase):
 
 class _FakeCompiled:
     """Stands in for torch.compile's output: records the batch sizes it is fed, and can
-    raise once to act out a failed compile or an OOM."""
+    raise once to act out a failed compile or an OOM -- on its first call (the warm-up batch
+    that compiles it), or on call *fail_at*."""
 
-    def __init__(self, model, fail=None):
-        self.model, self.fail, self.batches = model, fail, []
+    def __init__(self, model, fail=None, fail_at=0, on_call=None):
+        self.model, self.fail, self.fail_at, self.batches = model, fail, fail_at, []
+        self.on_call = on_call
 
     def __call__(self, batch_t):
         self.batches.append(batch_t.shape[0])
-        if self.fail is not None:
+        if self.on_call is not None:
+            self.on_call()
+        if self.fail is not None and len(self.batches) > self.fail_at:
             error, self.fail = self.fail, None
             raise error
         return self.model(batch_t)
@@ -419,9 +423,9 @@ class TestCompiledChunks(unittest.TestCase):
 
     tearDown = setUp
 
-    def _compile(self, fail=None):
+    def _compile(self, fail=None, fail_at=0, on_call=None):
         def compile_model(model):
-            self.compiled.append(_FakeCompiled(model, fail))
+            self.compiled.append(_FakeCompiled(model, fail, fail_at, on_call))
             return self.compiled[-1]
         return mock.patch.object(vi, "_compile_model", side_effect=compile_model)
 
@@ -491,8 +495,9 @@ class TestCompiledChunks(unittest.TestCase):
             np.testing.assert_array_equal(sa["audio"], sb["audio"])
 
     def _status(self, proc, items):
-        """The one line a run logs about which model it used."""
-        with self.assertLogs(vi.logger, "INFO") as logs:
+        """The one line a run logs about which model it used (at DEBUG unless it compiles:
+        the log file has it, the console need not)."""
+        with self.assertLogs(vi.logger, "DEBUG") as logs:
             proc.run(items, debug_dir=None, load_debug_dir=None)
         lines = [line for line in logs.output
                  if "Vocal isolation: " in line or "Compiling the vocal" in line]
@@ -505,7 +510,7 @@ class TestCompiledChunks(unittest.TestCase):
             with mock.patch.object(vi, "_can_compile", return_value=True):
                 self.assertRegex(self._status(self._proc("auto"), _make_items(2, 4)),
                                  r"auto: \d+ chunks, under the 100")
-                self.assertIn("Compiling the vocal isolation model for 3-chunk",
+                self.assertIn("Compiling the vocal isolation model for this GPU",
                               self._status(self._proc("auto"), _make_items(3, 4)))
                 self.assertIn("using the compiled model (compiled earlier in this process",
                               self._status(self._proc("auto"), _make_items(1, 1)))
@@ -520,7 +525,7 @@ class TestCompiledChunks(unittest.TestCase):
         proc = self._proc("auto")
         proc.device = torch.device("cuda")
         with mock.patch.object(vi, "_can_compile", return_value=False), \
-                self.assertLogs(vi.logger, "INFO") as logs:
+                self.assertLogs(vi.logger, "DEBUG") as logs:
             self.assertIsNone(proc._choose_forward(500))
         self.assertIn("no working Triton; on Windows, install the `compile` extra",
                       logs.output[0])
@@ -534,12 +539,42 @@ class TestCompiledChunks(unittest.TestCase):
 
     def test_padding_follows_an_oom_retry_down(self):
         # Padding a retried half batch back up to full size would run out of memory again.
-        with self._compile(fail=torch.cuda.OutOfMemoryError("CUDA out of memory")):
+        # Call 0 is the warm-up that compiles; the OOM is on the first real batch.
+        with self._compile(fail=torch.cuda.OutOfMemoryError("CUDA out of memory"), fail_at=1):
             self._proc("on", batch_size=4).run(_make_items(1, 4), debug_dir=None,
                                                load_debug_dir=None)
         batches = self.compiled[0].batches
-        self.assertEqual(batches[0], 4)
-        self.assertEqual(set(batches[1:]), {2})
+        self.assertEqual(batches[:2], [4, 4])
+        self.assertEqual(set(batches[2:]), {2})
+
+    def test_compiling_happens_before_the_progress_bar(self):
+        """A first compile takes minutes; a bar stuck at 0 all that while looks like a hang,
+        so the compile runs under the spinner's "compiling model" status first."""
+        events = []
+
+        class Reporter:
+            def set_total(self, total, unit="it"): events.append("set_total")
+            def advance(self, n=1): pass
+            def status(self, text=""): events.append(f"status:{text}")
+            def note(self, text): events.append(f"note:{text.split()[0]}")
+
+        with self._compile(on_call=lambda: events.append("compiled call")):
+            self._proc("on").run(_make_items(1, 4), debug_dir=None, load_debug_dir=None,
+                                 progress_callback=Reporter())
+        first = events.index("set_total")
+        self.assertEqual(events[:first], ["status:compiling model", "compiled call",
+                                          "status:", "note:compile"])
+
+    def test_a_warm_up_oom_compiles_on_the_first_batch_instead(self):
+        with self._compile(fail=torch.cuda.OutOfMemoryError("CUDA out of memory")):
+            out = self._proc("on", batch_size=4).run(self._noisy_items(1), debug_dir=None,
+                                                     load_debug_dir=None)
+        self.assertFalse(vi._COMPILE_FAILED)
+        self.assertEqual(self.compiled[0].batches[0], 4)    # the warm-up that ran out
+        self.assertGreater(len(self.compiled[0].batches), 1)
+        eager = self._proc("off").run(self._noisy_items(1), debug_dir=None, load_debug_dir=None)
+        for sa, sb in zip(eager[0]["vad_segments"], out[0]["vad_segments"]):
+            np.testing.assert_array_equal(sa["audio"], sb["audio"])
 
 
 if __name__ == "__main__":

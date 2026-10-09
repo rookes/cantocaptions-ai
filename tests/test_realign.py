@@ -988,6 +988,20 @@ class TestEmissionTimeline(unittest.TestCase):
         by = {c["start"]: e for c, e in zip(chunks, ems)}
         return EmissionTimeline(chunks, lambda segs: [by[s["start"]] for s in segs])
 
+    def test_each_chunk_encoded_is_reported_once(self):
+        chunks, by = [], {}
+        for start in (0.0, 10.0, 20.0):
+            chunks.append({"start": start, "end": start + 10.0,
+                           "audio": np.zeros(4, dtype=np.float32)})
+            by[start] = (torch.zeros((250, len(VOCAB))), 25.0)
+        counts = []
+        tl = EmissionTimeline(chunks, lambda segs: [by[s["start"]] for s in segs],
+                              on_computed=counts.append)
+        tl.slice(2.0, 12.0)        # encodes the first two chunks
+        tl.slice(5.0, 8.0)         # nothing new
+        tl.slice(25.0, 26.0)
+        self.assertEqual(counts, [2, 1])
+
     def test_a_slice_inside_one_chunk_is_exact(self):
         tl = self._timeline([(0.0, 10.0, 250)])
         emission, times = tl.slice(2.0, 4.0)

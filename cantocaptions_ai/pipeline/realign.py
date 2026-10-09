@@ -1129,8 +1129,8 @@ def _finalise(
             out[i].reason = REASON_NO_VOCABULARY
 
     flag_unconstrained(out, lines, timeline.file_end, stats)
-    logger.info(
-        "realign: %d anchor(s) kept (%d dropped on review), %d line(s) filled between them; "
+    logger.debug(
+        "%d anchor(s) kept (%d dropped on review), %d line(s) filled between them; "
         "%d blind window(s), %d split(s)",
         anchors, stats["dropped"], len(lines) - anchors, stats["blind"], stats["splits"],
     )
@@ -1162,9 +1162,9 @@ def _fit_for_lines(
             slope_penalty=slope_penalty,
         )
     except timefit.TransformError as exc:
-        logger.warning("realign: %s", exc)
+        logger.warning("%s", exc)
         logger.warning(
-            "realign: falling back to the subtitle's own timings, unchanged (fitted from "
+            "Falling back to the subtitle's own timings, unchanged (fitted from "
             "%d anchor(s))", len(pairs),
         )
         return timefit.identity_transform()
@@ -1266,8 +1266,8 @@ def assign_lines_sync(
             min_anchors_per_piece=min_anchors_per_piece,
         )
         if len(transform.xs) < before:
-            logger.info(
-                "realign: %d of %d anchors kept for direct use (~%.1f/minute); the rest are "
+            logger.debug(
+                "%d of %d anchors kept for direct use (~%.1f/minute); the rest are "
                 "interpolated between whichever of those survive nearby",
                 len(transform.xs), before, target_anchors_per_minute,
             )
@@ -1330,7 +1330,7 @@ def assign_lines_adjust(
     leash = max(tolerance, 3.0 * report.residual_p90)
     if leash > tolerance:
         logger.info(
-            "realign: widening the adjust tolerance to %.1fs, since the transform only fits "
+            "Widening the adjust tolerance to %.1fs, since the transform only fits "
             "its anchors to %.2fs", leash, report.residual_p90,
         )
 
@@ -1342,7 +1342,7 @@ def assign_lines_adjust(
     reverted = clamp_to_prior(out, prior, leash, stats)
     if reverted:
         logger.info(
-            "realign: %d cue(s) were re-timed further than %.1fs from the transform and were "
+            "%d cue(s) were re-timed further than %.1fs from the transform and were "
             "reverted to it", reverted, leash,
         )
     timings = _finalise(out, lines, tokens_per_line, blank_id, timeline, stats, len(chain))
@@ -1473,8 +1473,8 @@ def _report(timings: Sequence[LineTiming], lines: Sequence[TranscriptLine]) -> N
     """Summarise by reason. One count would hide the only case worth stopping for."""
     scored = [t.score for t in timings if not math.isnan(t.score)]
     if scored:
-        logger.info(
-            "realign: placed %d line(s); mean path score %.3f (p10 %.3f)",
+        logger.debug(
+            "Placed %d line(s); mean path score %.3f (p10 %.3f)",
             len(timings), float(np.mean(scored)), float(np.percentile(scored, 10)),
         )
     counts: Dict[str, int] = {}
@@ -1484,13 +1484,14 @@ def _report(timings: Sequence[LineTiming], lines: Sequence[TranscriptLine]) -> N
     if not counts:
         return
     suspect = sum(n for r, n in counts.items() if r not in BENIGN_REASONS)
-    logger.warning("realign: %d of %d line(s) need review", suspect or sum(counts.values()),
-                   len(timings))
-    for reason, n in sorted(counts.items(), key=lambda kv: -kv[1]):
-        logger.warning("    %4d  %-14s %s", n, reason, REASON_HELP.get(reason, ""))
+    logger.warning(
+        "%d of %d line(s) need review:\n%s", suspect or sum(counts.values()), len(timings),
+        "\n".join(f"  {n:4d}  {reason:<14} {REASON_HELP.get(reason, '')}".rstrip()
+                  for reason, n in sorted(counts.items(), key=lambda kv: -kv[1])),
+    )
     if counts.get(REASON_NO_AUDIO, 0) > max(10, 0.02 * len(timings)):
         logger.warning(
-            "realign: %d line(s) have no audio at all -- the transcript and this recording "
+            "%d line(s) have no audio at all -- the transcript and this recording "
             "are probably not the same content, or the search lost its place badly. Check "
             "before trusting any of the output.", counts[REASON_NO_AUDIO],
         )
@@ -1515,14 +1516,14 @@ def warn_low_confidence(
     weak = [t for t in timings if not math.isnan(t.score) and t.score < min_score]
     if not weak:
         return []
-    logger.warning(
-        "realign: %d line(s) below the confidence floor (%.2f); check these first:",
-        len(weak), min_score,
-    )
-    for t in weak[:10]:
-        logger.warning("  %8.2fs score=%.3f  %r", t.start, t.score, by_index[t.index].text[:48])
+    listed = [f"  {t.start:8.2f}s score={t.score:.3f}  {by_index[t.index].text[:48]!r}"
+              for t in weak[:10]]
     if len(weak) > 10:
-        logger.warning("  ... and %d more", len(weak) - 10)
+        listed.append(f"  ... and {len(weak) - 10} more")
+    logger.warning(
+        "%d line(s) below the confidence floor (%.2f); check these first:\n%s",
+        len(weak), min_score, "\n".join(listed),
+    )
     return weak
 
 
@@ -1647,7 +1648,7 @@ def assign_lines_via_asr(
     hyp, hyp_start, hyp_end = _hypothesis_stream(asr_segments, punctuation, vad_segments)
     text, owners = _transcript_stream(lines, punctuation)
     if not hyp or not text:
-        logger.warning("realign: ASR produced no usable text to match against")
+        logger.warning("ASR produced no usable text to match against")
         return _interpolate_unplaced(lines, {}, asr_segments)
 
     # Character index in the transcript -> character index in the hypothesis.
@@ -1680,7 +1681,7 @@ def assign_lines_via_asr(
         spans[index] = (float(hyp_start[min(hits)]), float(hyp_end[max(hits)]))
 
     logger.info(
-        "realign: matched %d of %d line(s) against the ASR hypothesis (%d of %d characters)",
+        "Matched %d of %d line(s) against the ASR hypothesis (%d of %d characters)",
         len(spans), len(lines), len(matched), len(text),
     )
     return _interpolate_unplaced(lines, spans, asr_segments)
@@ -1741,7 +1742,7 @@ def _interpolate_unplaced(
     unmatched = sum(1 for t in out if not t.placed)
     if unmatched:
         logger.warning(
-            "realign: %d of %d line(s) had no match in the ASR hypothesis and were given "
+            "%d of %d line(s) had no match in the ASR hypothesis and were given "
             "interpolated timings. A run of these in one stretch means the transcript and "
             "the recording have genuinely diverged there.", unmatched, len(out),
         )
@@ -1911,11 +1912,11 @@ def build_align_input(
         # above splits on it otherwise. Worth saying, but it is a warning rather than a
         # failure: _slice_audio already capped the chunk at the budget.
         logger.warning(
-            "realign: %d chunk(s) reached --chunk_size on a single line; the longest is "
+            "%d chunk(s) reached --chunk_size on a single line; the longest is "
             "%.1fs.", len(over), max(c["end"] - c["start"] for c in over),
         )
-    logger.info(
-        "realign: %d line(s) grouped into %d alignment chunk(s)", len(ordered), len(chunks),
+    logger.debug(
+        "%d line(s) grouped into %d alignment chunk(s)", len(ordered), len(chunks),
     )
     return chunks, transcript
 
@@ -1978,8 +1979,8 @@ def tighten_cue_spans(
             seg["start"], seg["end"] = round(start, 3), round(end, 3)
             adjusted += 1
     if adjusted:
-        logger.info(
-            "realign: pulled %d cue edge(s) onto the first/last character actually aligned "
+        logger.debug(
+            "Pulled %d cue edge(s) onto the first/last character actually aligned "
             "there", adjusted,
         )
     return adjusted
@@ -2010,7 +2011,7 @@ def enforce_cue_order(segments: List[dict]) -> int:
             moved += 1
     if moved:
         logger.warning(
-            "realign: %d cue(s) came back before the cue in front of them and were clamped; "
+            "%d cue(s) came back before the cue in front of them and were clamped; "
             "an out-of-order SRT is rejected by strict readers. This only happens where the "
             "placements themselves collapsed, so check the timings around them.", moved,
         )
@@ -2039,7 +2040,7 @@ def ensure_visible_cues(segments: List[dict], min_duration: float = MIN_VISIBLE_
             seg["end"] = round(start + min_duration, 3)
         fixed += 1
     if fixed:
-        logger.info("realign: gave %d cue(s) a displayable duration", fixed)
+        logger.debug("Gave %d cue(s) a displayable duration", fixed)
     return fixed
 
 
@@ -2087,18 +2088,18 @@ def warn_on_implausible_cues(segments: Sequence[dict]) -> List[dict]:
     bad = find_implausible_cues(segments)
     if not bad:
         return []
-    logger.warning(
-        "realign: %d of %d cue(s) cannot be supported by the audio they were aligned "
-        "against -- their line was almost certainly grouped into the wrong chunk:",
-        len(bad), len(segments),
-    )
-    for seg in bad[:10]:
-        logger.warning(
-            "  %8.2f-%8.2fs  %-22s %r",
-            seg["start"], seg["end"], seg.get("realign_detail", ""), seg.get("text", "")[:40],
-        )
+    listed = [
+        f"  {seg['start']:8.2f}-{seg['end']:8.2f}s  {seg.get('realign_detail', ''):<22} "
+        f"{seg.get('text', '')[:40]!r}"
+        for seg in bad[:10]
+    ]
     if len(bad) > 10:
-        logger.warning("  ... and %d more", len(bad) - 10)
+        listed.append(f"  ... and {len(bad) - 10} more")
+    logger.warning(
+        "%d of %d cue(s) cannot be supported by the audio they were aligned against -- "
+        "their line was almost certainly grouped into the wrong chunk:\n%s",
+        len(bad), len(segments), "\n".join(listed),
+    )
     return bad
 
 
@@ -2120,7 +2121,7 @@ def strip_sentinels(segments: List[dict]) -> int:
             seg["text"] = text.replace(REALIGN_SENTINEL, "")
     if fused:
         logger.warning(
-            "realign: %d transcript line(s) shared a timing with their neighbour and were "
+            "%d transcript line(s) shared a timing with their neighbour and were "
             "merged into one cue.", fused,
         )
     return fused

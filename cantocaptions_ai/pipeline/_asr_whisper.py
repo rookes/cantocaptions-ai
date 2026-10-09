@@ -151,7 +151,7 @@ def load_model_whisper(
             logger.warning("Could not download %r: %s — using cached version if available.", model_id, e)
 
     dtype = _whisper_dtype(compute_type, device)
-    logger.info("Loading ASR model %r (whisper backend, %s)", model_id, dtype)
+    logger.info("ASR model: %s (whisper backend, %s)", model_id, dtype)
     if model is None:
         model = guard_model_load(
             "ASR",

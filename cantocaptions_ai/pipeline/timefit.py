@@ -563,8 +563,8 @@ def _shared_slope_refit(
             refined.append((first, last, a_own, b_own, free_own))
 
     if pooled >= 2:
-        logger.info(
-            "realign: %d of %d transform pieces shared one pooled speed (%.6fx) instead of "
+        logger.debug(
+            "%d of %d transform pieces shared one pooled speed (%.6fx) instead of "
             "each fitting its own -- an edit does not change playback speed, so a lone piece "
             "estimating it from a fraction of the file's anchors is the noisier answer",
             pooled, len(refined), a_shared,
@@ -902,7 +902,7 @@ def locate_breaks(
         sums = _Sums(xs, ys, ws)
         scale, offset, free = _fit_range(sums, a_first, b_last, **fit_kwargs)
         logger.warning(
-            "realign: a fitted cut would delete more subtitle time than the anchors around it "
+            "A fitted cut would delete more subtitle time than the anchors around it "
             "leave room for; merging those two transform pieces instead"
         )
         ranges[infeasible:infeasible + 2] = [(a_first, b_last, scale, offset, free)]
@@ -1229,19 +1229,23 @@ def report_transform(report: TransformReport, total_cues: int) -> None:
     """Say what happened, loudly where it was drastic (see --realign_mode in the README)."""
     if report.refused:
         logger.warning(
-            "realign: no usable transform was fitted; timings are unchanged. Check that the "
+            "No usable transform was fitted; timings are unchanged. Check that the "
             "subtitle and this recording are the same content."
         )
         return
 
     logger.info(
-        "realign: %d cue(s) mapped through %d transform piece(s) from %d anchor(s) "
-        "(%d rejected)",
+        "%d cue(s) mapped through %d transform piece(s) from %d anchor(s) (%d rejected); "
+        "cues moved by a median of %+.2fs (largest %+.2fs)",
         total_cues, len(report.pieces), report.anchors_used, report.anchors_rejected,
+        report.median_move, report.max_move,
     )
+    # One piece is the whole file at one speed and offset: detail. Several mean cuts or
+    # insertions, which the user wants to see where.
+    log_piece = logger.info if len(report.pieces) > 1 else logger.debug
     for piece in report.pieces:
-        logger.info(
-            "realign:   [%s-%s] x%.6f %+.3fs  (%d anchors, residual p50 %.2fs p90 %.2fs)",
+        log_piece(
+            "  [%s-%s] x%.6f %+.3fs  (%d anchors, residual p50 %.2fs p90 %.2fs)",
             _clock(piece.x0 if math.isfinite(piece.x0) else 0.0),
             _clock(piece.x1) if math.isfinite(piece.x1) else "end",
             piece.scale, piece.offset, piece.anchors,
@@ -1250,45 +1254,41 @@ def report_transform(report: TransformReport, total_cues: int) -> None:
     if abs(report.scale - 1.0) > 0.0005:
         near = f" (close to a {report.named_ratio} conversion)" if report.named_ratio else ""
         logger.warning(
-            "realign: SPEED CHANGE of %.4fx%s -- the recording runs %.2f%% %s than the "
+            "SPEED CHANGE of %.4fx%s -- the recording runs %.2f%% %s than the "
             "subtitle was timed for",
             report.scale, near, abs(report.scale - 1.0) * 100.0,
             "slower" if report.scale > 1.0 else "faster",
         )
     if report.scale_bound_hit:
         logger.warning(
-            "realign: a candidate speed change exceeded --realign_max_scale and was refused; "
+            "A candidate speed change exceeded --realign_max_scale and was refused; "
             "raise it if the two sources really do differ in speed by that much"
         )
-    logger.info(
-        "realign: cues moved by a median of %+.2fs (largest %+.2fs)",
-        report.median_move, report.max_move,
-    )
     for brk in report.breaks:
         if brk.kind == "insert":
             logger.info(
-                "realign: insertion of %.1fs at source %s -- this recording has audio the "
+                "Insertion of %.1fs at source %s -- this recording has audio the "
                 "subtitle does not cover", brk.seconds, _clock(brk.source_start),
             )
         else:
             logger.warning(
-                "realign: CUT of %.1fs at source %s (%.1fs of the subtitle's timeline) -- "
+                "CUT of %.1fs at source %s (%.1fs of the subtitle's timeline) -- "
                 "%d cue(s) have no audio here",
                 brk.seconds, _clock(brk.source_start), brk.source_seconds,
                 len(brk.cue_indices),
             )
     if report.dropped_cues:
         logger.warning(
-            "realign: %d cue(s) dropped as having no audio in this recording (see "
+            "%d cue(s) dropped as having no audio in this recording (see "
             "realign/transform.json for the full list)", report.dropped_cues,
         )
     if report.residual_p90 > 1.0:
         logger.warning(
-            "realign: the transform fits its anchors only loosely (residual p90 %.2fs); "
+            "The transform fits its anchors only loosely (residual p90 %.2fs); "
             "treat the output as approximate", report.residual_p90,
         )
     if len(report.pieces) > 8:
         logger.warning(
-            "realign: %d transform pieces were needed. A file wanting this many edits is "
+            "%d transform pieces were needed. A file wanting this many edits is "
             "often not the same cut of the content.", len(report.pieces),
         )

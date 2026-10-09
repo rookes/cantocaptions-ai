@@ -64,7 +64,7 @@ class PipelineConfig:
     # Output
     output_dir: str = "output"
     output_format: str = "srt"
-    verbose: bool = True
+    verbose: bool = False
     print_progress: bool = True
     vram_checks: bool = False
     vram_headroom_mb: int = 0

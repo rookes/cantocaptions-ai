@@ -11,7 +11,15 @@ from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE
 from cantocaptions_ai.utils.schema import ProcessingItem, item_name
 from typing import Callable, Dict, List, Optional
 from cantocaptions_ai.utils.output import LANGUAGES, TO_LANGUAGE_CODE, get_writer, writer_args as build_writer_args
-from cantocaptions_ai.utils.log_utils import ProgressSink, StageTimer, TranscriptionSummary, get_logger
+from cantocaptions_ai.utils.log_utils import (
+    ProgressSink,
+    StageTimer,
+    TranscriptionSummary,
+    console_line,
+    get_logger,
+    glyph,
+    section,
+)
 from cantocaptions_ai.text_profiles import (
     DEFAULT_PUNCTUATION,
     DEFAULT_SCRIPT,
@@ -42,6 +50,13 @@ from cantocaptions_ai.pipeline.stages import (  # noqa: E402,F401
     _substitution_overrides,
     _write_realign_checkpoint,
 )
+
+def _advise(message: str) -> None:
+    """An advisory for the user (an option with no effect): a CantocaptionsWarning, which
+    the console shows as a plain warning, where library warnings are kept to the log file."""
+    from cantocaptions_ai.errors import CantocaptionsWarning
+    warnings.warn(message, CantocaptionsWarning, stacklevel=3)
+
 
 def _offset_result_times(result: dict, offset: float) -> None:
     """Shift every timestamp in *result* forward by *offset* seconds, in place.
@@ -128,7 +143,9 @@ def _merge_and_write(
     # before the rescue pass just stops it being glued onto a neighbour first.
     is_noise = (lambda text: cleaner.is_noise(cleaner.clean(text))) if cleaner is not None else None
     finalized: List[ProcessingItem] = []
-    for item in items:
+
+    def finish(item) -> None:
+        """Assemble, clean, proofread and write one file."""
         result = item['result']
         name = item_name(item)
         audio_path = item['audio_path']
@@ -189,12 +206,14 @@ def _merge_and_write(
                 segment["text"] = text
                 cleaned_segments.append(segment)
             dropped = len(new_segments) - len(cleaned_segments)
-            if dropped:
-                logger.info(f"Text cleaning: dropped {dropped} interjection/noise subtitles")
+            logger.info("%d cue(s)%s", len(cleaned_segments),
+                        f"; text cleaning dropped {dropped} interjection/noise cue(s)" if dropped else "")
             result["segments"] = cleaned_segments
-        elif layout is not None:
-            for segment in new_segments:
-                segment["text"] = layout(segment["text"])
+        else:
+            logger.info("%d cue(s)", len(new_segments))
+            if layout is not None:
+                for segment in new_segments:
+                    segment["text"] = layout(segment["text"])
 
         # Map clip-relative times back onto the source-media timeline before output.
         _offset_result_times(result, audio_start_offset)
@@ -204,7 +223,8 @@ def _merge_and_write(
             marks = _proofread(proofreader, name, result, reference_cues, cleaner, layout,
                                debug_dir, load_debug_dir,
                                output_dir=output_dir if writer else None,
-                               precleaner=precleaner, summary=summary, progress=progress)
+                               precleaner=precleaner, summary=summary, progress=progress,
+                               nested=True)
 
         if carried_marks:
             # Proofread before realign: its bookmarks were on the copy's cues, which realign
@@ -219,11 +239,29 @@ def _merge_and_write(
             marks = sorted((idx, "\n".join(notes)) for idx, notes in joined.items())
         if writer is not None:
             writer(result, name, writer_args)
+            if output_dir:
+                logger.info("Wrote %s", _written(output_dir, name, output_format))
             if marks and output_dir:
                 _write_bookmarks(output_dir, name, output_format, marks)
         if collect:
             finalized.append({'audio_path': audio_path, 'name': name, 'result': result})
+
+    console = summary is not None and summary.enabled
+    for item in items:
+        with section(f"Subtitles {glyph('dot')} {item_name(item)}", enabled=console):
+            finish(item)
     return finalized
+
+
+_ALL_FORMATS = ("srt", "vtt", "txt", "tsv", "json")
+
+
+def _written(output_dir: str, name: str, output_format: str) -> str:
+    """The file(s) a writer just wrote for *name*, for the console."""
+    base = os.path.normpath(os.path.join(output_dir, *name.split("/")))
+    if output_format == "all":
+        return f"{base}.{{{','.join(_ALL_FORMATS)}}}"
+    return f"{base}.{output_format}"
 
 
 def _load_reference(cfg) -> Optional[list]:
@@ -231,9 +269,9 @@ def _load_reference(cfg) -> Optional[list]:
     if not cfg.reference_subtitle:
         return None
     from cantocaptions_ai.utils.subtitles import load_subtitle_file
-    logger.info("Loading reference subtitle: %s", cfg.reference_subtitle)
     reference_cues = load_subtitle_file(cfg.reference_subtitle)
-    logger.info("Loaded %d reference subtitle lines.", len(reference_cues))
+    logger.info("Reference subtitle: %s (%d cues)", os.path.basename(cfg.reference_subtitle),
+                len(reference_cues))
     if cfg.reference_offset:
         from cantocaptions_ai.pipeline.reference_context import shift_cues
         before = len(reference_cues)
@@ -282,17 +320,18 @@ def _proofread_realign_input(cfg, proofreader, precleaner=None, collect: bool = 
     stem = os.path.splitext(os.path.basename(src))[0]
     segments = [{"start": c.start, "end": c.end, "text": c.text} for c in read_subtitle_cues(src)]
     result = {"segments": segments, "language": cfg.language}
-    logger.info("Proofreading the realign input before realigning it (%d cues): %s",
-                len(segments), src)
     out_dir = tempfile.mkdtemp(prefix="cantocaptions-proofread-") if collect else cfg.output_dir
     os.makedirs(out_dir, exist_ok=True)
     marks = _proofread(proofreader, stem, result, _load_reference(cfg), None, None,
                        cfg.debug_dir, cfg.load_debug_dir, output_dir=out_dir,
-                       precleaner=precleaner, summary=summary, progress=progress)
+                       precleaner=precleaner, summary=summary, progress=progress,
+                       label="Proofreading (realign input)",
+                       intro=f"{os.path.basename(src)}: {len(segments)} cues, proofread "
+                             "before realigning")
     WriteSRT(out_dir)(result, f"{stem}.proofread", build_writer_args(cfg))
     _write_bookmarks(out_dir, f"{stem}.proofread", "srt", marks)
     path = os.path.join(out_dir, f"{stem}.proofread.srt")
-    logger.info("Realigning the proofread copy: %s", path)
+    logger.info("Corrected copy, realigned below: %s", os.path.normpath(path))
     # The copy's text and its marks, for _merge_and_write to carry onto the realigned output.
     carried = ([s["text"] for s in result["segments"]], marks) if marks else None
     return dataclasses.replace(cfg, realign=path, proofread="none"), carried
@@ -365,6 +404,39 @@ def _describe_run(cfg, ctx, stage_list, proofreader, cleaner, layout, precleaner
         writes += " + Subtitle Edit bookmarks"
     steps.append(writes)
     return " → ".join(steps)
+
+
+def _describe_inputs(paths: List[str]) -> str:
+    if len(paths) == 1:
+        return os.path.basename(paths[0])
+    return f"{len(paths)} files"
+
+
+def _describe_proofreader(proofreader) -> str:
+    s = proofreader.settings
+    dry = " -- DRY RUN, nothing will be sent" if s.dry_run else ""
+    return f"{s.provider} {s.model} ({s.effort} effort), standard '{s.standard.name}'{dry}"
+
+
+def _setup_title(title: str, summary) -> None:
+    """The run's first console line, which the setup rows sit under."""
+    if summary is not None and summary.enabled:
+        console_line(title)
+    else:
+        logger.info("%s", title)
+
+
+def _setup_rows(rows) -> None:
+    """``Key: value`` lines describing the run, aligned; rows with no value are left out."""
+    rows = [(key, value) for key, value in rows if value]
+    width = max((len(key) for key, _ in rows), default=0) + 1
+    for key, value in rows:
+        logger.info("%s %s", f"{key}:".ljust(width), value)
+
+
+def _setup_block(title: str, rows, summary) -> None:
+    _setup_title(title, summary)
+    _setup_rows(rows)
 
 
 def _build_cleaner(cfg, pack, profile):
@@ -450,6 +522,10 @@ def proofread_files(paths: List[str], cfg, names: Optional[Dict[str, str]] = Non
     summary = TranscriptionSummary(enabled=cfg.print_progress, title="Proofreading complete")
     started = time.perf_counter()
 
+    _setup_block(f"cantocaptions {glyph('dot')} proofreading {_describe_inputs(paths)}", [
+        ("Proofreading", _describe_proofreader(proofreader)),
+        ("Output", os.path.normpath(cfg.output_dir)),
+    ], summary)
     reference_cues = _load_reference(cfg)
     if reference_cues is None:
         logger.info("No reference subtitle: proofreading from the text alone")
@@ -464,12 +540,15 @@ def proofread_files(paths: List[str], cfg, names: Optional[Dict[str, str]] = Non
         segments = [{"start": c.start, "end": c.end, "text": c.text}
                     for c in read_subtitle_cues(path)]
         result = {"segments": segments, "language": cfg.language}
-        logger.info("Proofreading %s (%d cues)", path, len(segments))
         marks = _proofread(proofreader, name, result, reference_cues, cleaner, layout,
                            cfg.debug_dir, cfg.load_debug_dir, output_dir=cfg.output_dir,
-                           precleaner=precleaner, summary=summary)
+                           precleaner=precleaner, summary=summary,
+                           label=f"Proofreading {glyph('dot')} {os.path.basename(path)}",
+                           intro=f"{len(segments)} cues")
         if not cfg.proofread_dry_run:
             writer(result, f"{name}.proofread", writer_args)
+            logger.info("Wrote %s", _written(cfg.output_dir, f"{name}.proofread",
+                                             cfg.output_format))
             _write_bookmarks(cfg.output_dir, f"{name}.proofread", cfg.output_format, marks)
         done.append({"path": path, "name": name, "result": result})
     summary.print_summary(process_elapsed=time.perf_counter() - started)
@@ -490,8 +569,7 @@ def _preclean(precleaner, name: str, segments: List[dict], review_dir: Optional[
         if after != before:
             seg["text"] = after
             changed.append((float(seg["start"]), float(seg["end"]), after, before))
-    logger.info("Basic cleaning before proofreading %s: %d of %d cue(s) changed",
-                name, len(changed), len(segments))
+    logger.info("Basic cleaning: %d of %d cue(s) changed", len(changed), len(segments))
     if changed and review_dir:
         from cantocaptions_ai.pipeline.proofread.review import write_changes_srt
         os.makedirs(review_dir, exist_ok=True)
@@ -500,7 +578,8 @@ def _preclean(precleaner, name: str, segments: List[dict], review_dir: Optional[
 
 def _proofread(proofreader, name, result, reference_cues, cleaner, layout,
                debug_dir, load_debug_dir, output_dir: Optional[str] = None,
-               precleaner=None, summary=None, progress=None) -> list:
+               precleaner=None, summary=None, progress=None, nested: bool = False,
+               label: str = "Proofreading", intro: Optional[str] = None) -> list:
     """Stage 9: proofread one file's finished cues in place. A failure costs only itself.
 
     A request that fails or would exceed ``proofread_max_cost`` leaves the file exactly as
@@ -516,6 +595,10 @@ def _proofread(proofreader, name, result, reference_cues, cleaner, layout,
     Returns Subtitle Edit bookmarks for the cues as they will be written -- ``(0-based index,
     note)`` for each changed cue (``[was] <old text>``) and each flagged one -- for
     :func:`_write_bookmarks`; empty when nothing was proofread.
+
+    On the console it is its own section headed *label* (a sub-step when *nested*, inside a
+    file's output section), opening with *intro*. The summary-table row is always
+    "Proofreading", so every file's request adds to one row.
     """
     from cantocaptions_ai.pipeline.proofread.providers import ProviderError
     from cantocaptions_ai.pipeline.proofread.review import bookmark_marks
@@ -526,16 +609,21 @@ def _proofread(proofreader, name, result, reference_cues, cleaner, layout,
         save_dir = os.path.join(output_dir, *f"{name}.proofread".split("/"))
     from contextlib import nullcontext
     # A row in the end-of-run duration table, like any stage (no VRAM: it is a network call).
-    timer = (StageTimer("Proofreading", summary, progress=progress, track_vram=False)
+    timer = (StageTimer("Proofreading", summary, progress=progress, track_vram=False,
+                        nested=nested, title=label)
              if summary is not None else nullcontext())
+    reporter = timer.reporter if summary is not None else None
     try:
         with timer:
+            if intro:
+                logger.info("%s", intro)
             if precleaner is not None:
                 _preclean(precleaner, name, segments, save_dir or (
                     _stage_dir(name, "proofread", debug_dir) if debug_dir else None))
             done = proofreader.run(name, segments, reference=reference_cues or [],
                                    debug_dir=debug_dir, load_debug_dir=load_debug_dir,
-                                   save_dir=save_dir)
+                                   save_dir=save_dir, progress=reporter)
+            _note_proofread(done, reporter, summary)
     except ProviderError as e:
         spent = e.usage.get("cost_usd") if getattr(e, "usage", None) else None
         if summary is not None and spent:
@@ -570,11 +658,24 @@ def _proofread(proofreader, name, result, reference_cues, cleaner, layout,
     cost = done.usage.get("cost_usd")
     if summary is not None and cost:
         summary.add_amount("Proofreading cost", cost, "${:.3f}")
-    logger.info(
-        "Proofreading %s: %d cue(s) edited, %d flagged for review%s%s", name, len(edited),
-        len(done.flags), f", {done.replayed} answer(s) replayed" if done.replayed else "",
-        f", ${cost:.3f}" if cost else "")
     return bookmark_marks(result["segments"], notes)
+
+
+def _note_proofread(done, reporter, summary) -> None:
+    """What proofreading did, on its completion line (or as a log line with no console)."""
+    edited = len({e["id"] for e in done.edits})
+    cost = done.usage.get("cost_usd")
+    parts = [f"{edited} edited", f"{len(done.flags)} flagged"]
+    if done.replayed:
+        parts.append(f"{done.replayed} answer(s) replayed")
+    if cost:
+        parts.append(f"${cost:.3f}")
+    if reporter is not None and summary is not None and summary.enabled:
+        for part in parts:
+            reporter.note(part)
+        logger.debug("Proofreading: %s", ", ".join(parts))
+    else:
+        logger.info("Proofreading: %s", ", ".join(parts))
 
 
 def _write_bookmarks(output_dir: str, name: str, output_format: str, marks: list) -> None:
@@ -588,7 +689,7 @@ def _write_bookmarks(output_dir: str, name: str, output_format: str, marks: list
             continue
         path = write_bookmarks(os.path.join(output_dir, *name.split("/")) + "." + ext, marks)
         if path:
-            logger.info("Subtitle Edit bookmarks for %d proofread cue(s): %s", len(marks), path)
+            logger.info("Subtitle Edit bookmarks (%d cues): %s", len(marks), os.path.normpath(path))
 
 
 def _validate_language_support(cfg) -> None:
@@ -632,7 +733,7 @@ def _validate_language_support(cfg) -> None:
             "to run it anyway, set " + "; ".join(needed)
         )
     if not pack.fully_supported:
-        warnings.warn(
+        _advise(
             f"language '{language}' runs as a raw pipeline: the ASR model's text is timed and "
             f"laid out, but not cleaned or checked against conventions for it"
         )
@@ -650,7 +751,7 @@ def validate_config(cfg) -> None:
 
     for option in ("speaker_embeddings", "flag_speaker_conflicts", "speaker_labels"):
         if getattr(cfg, option) and not cfg.diarize:
-            warnings.warn(f"{option} has no effect without diarize")
+            _advise(f"{option} has no effect without diarize")
     if cfg.min_speakers is not None and cfg.max_speakers is not None:
         if cfg.min_speakers > cfg.max_speakers:
             raise ConfigError(
@@ -685,7 +786,7 @@ def validate_config(cfg) -> None:
                                        or cfg.proofread != "none"):
         raise ConfigError("reference_subtitle requires llm_correction, asr_context or proofread")
     if cfg.reference_correction_semantic and not cfg.reference_subtitle:
-        warnings.warn("reference_correction_semantic has no effect without reference_subtitle")
+        _advise("reference_correction_semantic has no effect without reference_subtitle")
     if cfg.asr_context and not cfg.reference_subtitle:
         raise ConfigError("asr_context requires reference_subtitle")
     if cfg.asr_context:
@@ -723,11 +824,11 @@ def validate_config(cfg) -> None:
             f"asr_context_neighbours must be >= 0, got {cfg.asr_context_neighbours}"
         )
     if cfg.reference_offset and not cfg.reference_subtitle:
-        warnings.warn("reference_offset has no effect without reference_subtitle")
+        _advise("reference_offset has no effect without reference_subtitle")
     if cfg.reference_timing not in (None, "subtitle", "media"):
         raise ConfigError(f"reference_timing must be 'subtitle' or 'media', got {cfg.reference_timing!r}")
     if cfg.reference_timing == "subtitle" and not (cfg.realign and cfg.reference_subtitle):
-        warnings.warn("reference_timing 'subtitle' has no effect without realign and "
+        _advise("reference_timing 'subtitle' has no effect without realign and "
                       "reference_subtitle (without realign, a reference always follows the "
                       "media's timeline)")
     if cfg.realign and cfg.reference_subtitle and cfg.proofread != "none":
@@ -796,7 +897,7 @@ def validate_config(cfg) -> None:
                 "entirely; use realign_anchor 'asr' if you want the ASR pass"
             )
     elif cfg.realign_anchor != "acoustic":
-        warnings.warn("realign_anchor has no effect without realign")
+        _advise("realign_anchor has no effect without realign")
     if cfg.audio_downmix not in ("mix", "center"):
         raise ConfigError(
             f"audio_downmix must be 'mix' or 'center', got {cfg.audio_downmix!r}"
@@ -1031,14 +1132,14 @@ def _execute_pipeline(
         writer = get_writer(cfg.output_format, cfg.output_dir)
     writer_args = build_writer_args(cfg)
 
+    summary = TranscriptionSummary(enabled=cfg.print_progress)
+    process_start = time.perf_counter()
+    _setup_title(f"cantocaptions {glyph('dot')} {_describe_inputs(originals)}", summary)
+
     realign_mode = None
     if cfg.realign:
         from cantocaptions_ai.pipeline.realign import resolve_realign_mode
         realign_mode = resolve_realign_mode(cfg.realign, cfg.realign_mode)
-        if cfg.realign_mode == "auto":
-            logger.info(
-                "realign_mode auto resolved to %r for: %s", realign_mode, cfg.realign,
-            )
 
     # Text cleaning runs on the final merged segments just before writing, apart from the
     # manifest's pre_align steps, which run on the ASR text before alignment (see
@@ -1051,12 +1152,11 @@ def _execute_pipeline(
     # timings.
     cleaner = None
     layout = None
+    cleaning_note = None
     if realign_mode in ("sync", "adjust"):
         if not cfg.no_clean_text:
-            logger.info(
-                "Text cleaning skipped: --realign_mode %s preserves the subtitle's own text "
-                "(it is already a finished subtitle, not a raw transcript)", realign_mode,
-            )
+            cleaning_note = (f"skipped; realign mode {realign_mode} keeps the subtitle's own "
+                             "text (it is a finished subtitle, not a raw transcript)")
     else:
         cleaner, layout = _build_cleaner(cfg, pack, profile)
 
@@ -1085,15 +1185,12 @@ def _execute_pipeline(
     from cantocaptions_ai.pipeline.proofread import load_proofreader
     proofreader = load_proofreader(cfg, pack, profile)
 
-    summary = TranscriptionSummary(enabled=cfg.print_progress)
-    process_start = time.perf_counter()
-
     # Loaded once here because two stages want it: VAD expansion (stage 1) and ASR
     # context (stage 3), plus LLM reference correction (stage 3c) further down.
     reference_cues = _load_reference(cfg)
     if reference_cues is not None:
         if cfg.asr_context and len(audio_paths) > 1:
-            warnings.warn(
+            _advise(
                 f"asr_context is using one reference subtitle for {len(audio_paths)} audio "
                 "files; the cues can only be correct for one of them"
             )
@@ -1118,8 +1215,20 @@ def _execute_pipeline(
     proofread_first = proofreader is not None and proofreads_before_realign(cfg)
     precleaner = (_build_precleaner(cfg, pack, profile)
                   if proofreader is not None and (proofread_first or cleaner is None) else None)
-    logger.info("Pipeline: %s", _describe_run(cfg, ctx, stage_list, proofreader, cleaner,
-                                              layout, precleaner, proofread_first))
+    realign_row = None
+    if cfg.realign:
+        how = " (auto-detected)" if cfg.realign_mode == "auto" else ""
+        realign_row = f"{os.path.basename(cfg.realign)}, {realign_mode} mode{how}"
+    _setup_rows([
+        ("Pipeline", _describe_run(cfg, ctx, stage_list, proofreader, cleaner, layout,
+                                   precleaner, proofread_first)),
+        ("Realign", realign_row),
+        ("Cleaning", cleaning_note),
+        ("Proofreading", _describe_proofreader(proofreader) if proofreader else None),
+        ("Output", None if collect else os.path.normpath(cfg.output_dir)),
+        ("Debug dir", cfg.debug_dir and os.path.normpath(cfg.debug_dir)),
+        ("Replaying", cfg.load_debug_dir and os.path.normpath(cfg.load_debug_dir)),
+    ])
     # A sink that wants the whole plan up front (a UI's stage list) says so with plan().
     send_plan = getattr(progress, "plan", None)
     if callable(send_plan):
@@ -1147,10 +1256,14 @@ def _execute_pipeline(
     for g, group in enumerate(groups, 1):
         if len(groups) > 1:
             first = (g - 1) * group_size + 1
-            logger.info(
-                "File group %d of %d: inputs %d-%d of %d",
-                g, len(groups), first, first + len(group) - 1, len(audio_paths),
-            )
+            banner = (f"Files {first}-{first + len(group) - 1} of {len(audio_paths)} "
+                      f"(group {g} of {len(groups)})")
+            if summary.enabled:
+                rule = glyph("group")
+                console_line()
+                console_line(f"{rule * 2} {banner} {rule * max(3, 60 - len(banner))}")
+            else:
+                logger.info("%s", banner)
         group_ctx = dataclasses.replace(ctx, audio_paths=list(group))
         items: List[dict] = [
             {'audio_path': p, 'name': name_of[p], 'checkpoints': checkpoints} for p in group

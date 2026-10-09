@@ -25,7 +25,7 @@ from cantocaptions_ai.utils.model_utils import (
 )
 from cantocaptions_ai.utils.debug import (_PERSISTED_SEGMENT_KEYS, load_isolation_debug,
                                           write_isolation_debug)
-from cantocaptions_ai.utils.log_utils import get_logger
+from cantocaptions_ai.utils.log_utils import format_clock, get_logger
 
 logger = get_logger(__name__)
 
@@ -239,7 +239,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             self._whole_max = 0
 
     def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
-        logger.info("Performing vocal isolation...")
+        logger.debug("Performing vocal isolation...")
         self.model.eval()
 
         cached, to_compute = partition_by_cache(items, self, load_debug_dir)
@@ -267,9 +267,11 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             for _, item in to_compute
             for span in self._spans(item['vad_segments'])
         )
+        # Compiled before the bar exists: a compile takes minutes the first time, and a bar
+        # sitting at 0/378 all that while looks like a hang. The spinner says what it is.
+        self._compiled = self._choose_forward(total_jobs, progress_callback)
         if progress_callback is not None:
             progress_callback.set_total(total_jobs, unit="chunk")
-        self._compiled = self._choose_forward(total_jobs)
 
         source = None  # (item index, decoded file) for the file being isolated
         for window in self._iter_windows(to_compute):
@@ -501,7 +503,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         first = next(params(), None) if params is not None else None
         return (batch, first.dtype if first is not None else None, str(self.device))
 
-    def _choose_forward(self, n_chunks: int):
+    def _choose_forward(self, n_chunks: int, progress_callback: ProgressCallback = None):
         """The compiled model for this run's chunks, or None to run eagerly.
 
         Only chunked mode compiles: its chunks share one shape, while whole mode's
@@ -511,6 +513,9 @@ class MbRoformerProcessor(VocalIsolationProcessor):
         uncompiled one. A compile reused within the process (a later file group, the
         worker's next job) and an "auto" that declined both used to pass in silence, so a
         log could not say whether compiling was in use at all.
+
+        A cold compile is done here, on one batch of silence (see _warm_up), rather than
+        inside the first real batch, so it happens under its own status line.
         """
         if n_chunks == 0:
             return None
@@ -533,11 +538,14 @@ class MbRoformerProcessor(VocalIsolationProcessor):
                     f"auto: {n_chunks} chunks, under the {_COMPILE_MIN_CHUNKS} that repay "
                     "compiling")
         if warm:
-            logger.info("Vocal isolation: using the compiled model (compiled earlier in this "
-                        "process for %d-chunk batches)", self._pad_to)
+            logger.debug("Vocal isolation: using the compiled model (compiled earlier in this "
+                         "process for %d-chunk batches)", self._pad_to)
         else:
-            logger.info("Compiling the vocal isolation model for %d-chunk batches (once per "
-                        "process; about 10-50 s)...", self._pad_to)
+            logger.info(
+                "Compiling the vocal isolation model for this GPU. The first run on this "
+                "machine can take several minutes; later runs reuse the compile cache and "
+                "take under a minute. Pass --vocal_isolation_compile off to skip it.")
+            logger.debug("Compiling for %d-chunk batches", self._pad_to)
         # The model's rotary embeddings (rotary_embedding_torch) fill a frequency cache on
         # their first call, and the cache's length is part of what a compiled graph assumes,
         # so compiling before that call means compiling twice. One eager pass fills it; a
@@ -546,11 +554,44 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             with torch.no_grad():
                 self.model(torch.zeros((1, 2, self._C), device=self.device))
         self._compile_started = None if warm else time.perf_counter()
-        return _compile_model(self.model)
+        self._compiled = _compile_model(self.model)
+        if not warm:
+            self._warm_up(progress_callback)
+        return self._compiled
 
-    @staticmethod
-    def _uncompiled(reason: str) -> None:
-        logger.info("Vocal isolation: running the model uncompiled (%s)", reason)
+    def _warm_up(self, progress_callback: ProgressCallback = None) -> None:
+        """Compile now, on one batch of silence, under a "compiling model" status.
+
+        torch.compile is lazy: the graph is built inside the first call. Calling it here,
+        through _separate_chunks so the call runs under the same autocast and
+        deterministic settings as every later one, puts the wait before the progress bar
+        instead of inside its first chunk. If the batch runs out of memory, _separate_chunks
+        has already halved the batch size, and compiling happens on the first real batch
+        instead, as it did before.
+        """
+        status = getattr(progress_callback, "status", None)
+        if callable(status):
+            status("compiling model")
+        started = self._compile_started
+        try:
+            self._separate_chunks(torch.zeros((self._pad_to, 2, self._C), device=self.device))
+        except torch.cuda.OutOfMemoryError:
+            logger.debug("Compile warm-up ran out of memory; compiling on the first batch")
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            logger.debug("Compile warm-up ran out of memory; compiling on the first batch")
+        if callable(status):
+            status("")
+        note = getattr(progress_callback, "note", None)
+        if callable(note) and started is not None and self._compile_started is None \
+                and self._compiled is not None:
+            note(f"compile {format_clock(time.perf_counter() - started)}")
+
+    def _uncompiled(self, reason: str) -> None:
+        # Only news when the user asked for compiling; otherwise it is the expected path.
+        log = logger.info if self._compile == "on" else logger.debug
+        log("Vocal isolation: running the model uncompiled (%s)", reason)
         return None
 
     def _separate_chunks(self, batch_t: torch.Tensor) -> torch.Tensor:
@@ -734,7 +775,7 @@ def load_vocal_isolation(
     torch_model = MelBandRoformer(**model_kwargs)
 
     # Download checkpoint from HuggingFace (cached after first download)
-    logger.info("Loading vocal isolation model (MelBandRoformer)...")
+    logger.debug("Loading vocal isolation model (MelBandRoformer)...")
     try:
         ensure_hf_file_downloaded(_HF_REPO_ID, _HF_FILENAME, cache_dir=model_dir, local_files_only=local_files_only)
     except Exception as e:

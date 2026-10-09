@@ -40,6 +40,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from cantocaptions_ai.errors import CantocaptionsWarning
 from cantocaptions_ai.pipeline.config import CONFIG_SECTIONS, PipelineConfig
 from cantocaptions_ai.utils.output import str2bool
 
@@ -194,7 +195,8 @@ def load_cfg_file(path: Path, parser: argparse.ArgumentParser) -> Dict[str, Any]
         if key in REMOVED_KEYS:
             warnings.warn(
                 f"{path}: '{key}' has been removed and is ignored (it never had any "
-                f"effect); delete it from the file to silence this warning"
+                f"effect); delete it from the file to silence this warning",
+                CantocaptionsWarning,
             )
             continue
         action = dest_to_action.get(key)

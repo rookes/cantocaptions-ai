@@ -17,3 +17,9 @@ class ConfigError(CantoCaptionsError, ValueError):
 
 class InputError(CantoCaptionsError, ValueError):
     """The input media file is missing, unreadable, or otherwise unusable."""
+
+
+class CantocaptionsWarning(UserWarning):
+    """An advisory for the user: an option that has no effect, a reference used for several
+    files. Shown on the console as a plain warning, where every other library's warnings
+    are kept to the log file (see ``utils.log_utils._show_warning``)."""

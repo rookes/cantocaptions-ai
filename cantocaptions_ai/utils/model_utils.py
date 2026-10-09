@@ -427,7 +427,7 @@ def cap_cuda_memory(device, headroom_mb: float) -> None:
     )
     idx = device if device is not None else 0
     torch.cuda.set_per_process_memory_fraction(fraction, idx)
-    logger.info(
+    logger.debug(
         "Capped CUDA process memory to %.1f%% of %.0f MB total (~%.0f MB headroom) "
         "so near-OOM triggers adaptive batch halving instead of host-RAM paging.",
         fraction * 100, stats['total_mb'], headroom_mb,
@@ -460,7 +460,7 @@ def check_vram_headroom(
     if stats is None:
         return None
     pct = estimated_mb / stats['total_mb'] * 100
-    logger.info(
+    logger.debug(
         "%s VRAM estimate: %.0f MB (%.0f%% of %.0f MB total, %.0f MB free)",
         stage, estimated_mb, pct, stats['total_mb'], stats['free_mb'],
     )
@@ -559,6 +559,7 @@ class _DownloadProgressLogger(_TqdmBase):
         kwargs["file"] = self._NullWriter()
         super().__init__(*args, **kwargs)
         self._last_log_t = 0.0
+        self._last_status_t = 0.0
 
     def update(self, n=1):
         result = super().update(n)
@@ -572,31 +573,40 @@ class _DownloadProgressLogger(_TqdmBase):
             return result
         now = time.monotonic()
         done = self.total is not None and self.n >= self.total
+        size = self.format_sizeof(self.n) + "B"
+        if self.total:
+            pct = f"{100 * self.n / self.total:.0f}%"
+            progress = f"{size} / {self.format_sizeof(self.total)}B ({pct})"
+        else:
+            progress = size
+        # On a live console the enclosing stage's status line carries the progress; the
+        # periodic line then only needs to reach the log file. Without one (a redirected
+        # console, or no stage) the line is the only sign the transfer is moving.
+        stage = get_active_stage_timer()
+        live = stage is not None and stage.animated
+        if live and (done or now - self._last_status_t >= 0.5):
+            self._last_status_t = now
+            stage.status(f"downloading {progress}")
         if done or now - self._last_log_t >= self._LOG_INTERVAL_S:
             self._last_log_t = now
-            size = self.format_sizeof(self.n) + "B"
-            if self.total:
-                pct = f"{100 * self.n / self.total:.0f}%"
-                total_size = self.format_sizeof(self.total) + "B"
-                logger.info("%s: %s / %s (%s)", self.desc, size, total_size, pct)
-            else:
-                logger.info("%s: %s", self.desc, size)
+            (logger.debug if live else logger.info)("%s: %s", self.desc or "Download", progress)
         return result
 
 
 @contextmanager
-def _quiet_stage_spinner() -> Generator[None, None, None]:
-    """Pause the enclosing StageTimer's cosmetic "<Stage> \\|/-" spinner (if any) for the
-    duration of the block, so a model download's own progress lines don't render
-    interleaved with an unrelated spinner still cycling on the same console/log line."""
+def _stage_status(text: str) -> Generator[None, None, None]:
+    """Show *text* as the enclosing stage's status for the duration of the block (a
+    download, or the Hub round-trip that checks a cached model), then put back the one
+    it replaced."""
     stage = get_active_stage_timer()
+    previous = stage.current_status if stage is not None else ""
     if stage is not None:
-        stage.pause_spinner()
+        stage.status(text)
     try:
         yield
     finally:
         if stage is not None:
-            stage.resume_spinner()
+            stage.status(previous)
 
 
 def ensure_hf_model_downloaded(repo_id: str, cache_dir=None, local_files_only: bool = False) -> None:
@@ -617,7 +627,7 @@ def ensure_hf_model_downloaded(repo_id: str, cache_dir=None, local_files_only: b
         return
     from huggingface_hub import snapshot_download, try_to_load_from_cache
 
-    with _quiet_stage_spinner():
+    with _stage_status("checking model files"):
         if try_to_load_from_cache(repo_id, "config.json", cache_dir=cache_dir) is not None:
             logger.debug("Verifying cached snapshot of %r against HuggingFace Hub", repo_id)
             snapshot_download(repo_id, cache_dir=cache_dir, tqdm_class=_DownloadProgressLogger)
@@ -652,7 +662,7 @@ def ensure_hf_file_downloaded(repo_id: str, filename: str, cache_dir=None, local
     if probe is not None:
         return
 
-    with _quiet_stage_spinner():
+    with _stage_status("downloading"):
         logger.info("Downloading %r from HuggingFace Hub", f"{repo_id}/{filename}")
         hf_hub_download(repo_id=repo_id, filename=filename, cache_dir=cache_dir, tqdm_class=_DownloadProgressLogger)
         logger.info("Download complete: %r", f"{repo_id}/{filename}")

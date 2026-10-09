@@ -7,7 +7,7 @@ from cantocaptions_ai.utils.audio import load_audio, SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.schema import ProgressCallback, SingleSegment, VadAudioSegment
 from cantocaptions_ai.utils.model_utils import PipelineStage
 from cantocaptions_ai.utils.debug import load_vad_debug, write_vad_debug
-from cantocaptions_ai.utils.log_utils import get_logger
+from cantocaptions_ai.utils.log_utils import format_clock, get_logger
 
 # get_logger initializes logging (including flop_counter suppression) before
 # pyannote/lightning are imported below, which would otherwise emit a spurious
@@ -97,7 +97,7 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
         While _compute has set ``_scoring_progress``, a backend that can report how much of
         the file it has scored does so through it (pyannote can; Silero scores in one call).
         """
-        logger.info("Performing voice activity detection...")
+        logger.debug("Performing voice activity detection...")
         on_progress = getattr(self, "_scoring_progress", None)
         score_kwargs = {}
         if issubclass(type(self.vad_model), Vad):
@@ -122,10 +122,6 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
             # Split-only mode: VAD picks the cut points, but nothing is discarded. See
             # Vad.cover_chunks for why --realign cannot use the speech-only timeline.
             merged = cover_chunks(raw_segments, self.chunk_size, duration)
-            logger.info(
-                "Contiguous chunking: %d chunk(s) covering %.1fs (no audio discarded)",
-                len(merged), duration,
-            )
             # Split-only chunks keep every sample, which is the point, but it also means a
             # chunk says nothing about where inside itself anyone is speaking. Record the
             # speech turns separately: nothing is filtered by them, but the ASR anchor needs
@@ -141,8 +137,9 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
             )
             heard = sum(e - s for s, e in speech_spans)
             logger.info(
-                "  ...of which %.1fs (%.0f%%) is speech, across %d region(s)",
-                heard, 100 * heard / duration if duration else 0.0, len(speech_spans),
+                "%d chunk(s) covering %s (no audio discarded); %.0f%% is speech, in %d "
+                "region(s)", len(merged), format_clock(duration),
+                100 * heard / duration if duration else 0.0, len(speech_spans),
             )
         else:
             merged = merge_chunks(
@@ -153,6 +150,12 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
                 pad_onset=self.vad_pad_onset,
                 pad_offset=self.vad_pad_offset,
                 min_duration_off=self.vad_min_duration_off,
+            )
+            merged = _clip_chunks(merged, duration)
+            kept = sum(seg['end'] - seg['start'] for seg in merged)
+            logger.info(
+                "%d speech chunk(s), %s of %s (%.0f%%)", len(merged), format_clock(kept),
+                format_clock(duration), 100 * kept / duration if duration else 0.0,
             )
 
         # Reference-cue expansion runs here -- after the timeline exists, before any
@@ -221,6 +224,37 @@ class VadProcessor(PipelineStage["np.ndarray", "List[VadAudioSegment]"]):
             )
         return segments
 
+def _clip_spans(spans, duration: float) -> list:
+    """*spans* (``[(start, end)]``) cut back to the audio's ``[0, duration]``; any left empty
+    are dropped."""
+    out = []
+    for start, end in spans:
+        start, end = max(0.0, start), min(end, duration)
+        if end > start:
+            out.append((start, end))
+    return out
+
+
+def _clip_chunks(chunks: list, duration: float) -> list:
+    """Speech chunks (``{"start", "end", "segments"}``) cut back to the audio's length.
+
+    Binarize bounds its padding by the score curve's frame grid, not the audio: pyannote's
+    last frame window reaches up to one window (~60 ms) past the final sample. Speech running
+    to the end of a file then gets an ``end`` past it, the audio slice taken below silently
+    comes back shorter than the timestamps say, and alignment -- which spaces a chunk's
+    emission frames evenly over ``end - start`` -- stretches that chunk's character timings
+    late by up to the overshoot.
+    """
+    out = []
+    for chunk in chunks:
+        start, end = max(0.0, chunk["start"]), min(chunk["end"], duration)
+        if end <= start:
+            continue
+        out.append({**chunk, "start": start, "end": end,
+                    "segments": _clip_spans(chunk.get("segments", ()), duration)})
+    return out
+
+
 def load_vad(
     vad_method: str = "pyannote",
     device: str = "cpu",
@@ -239,7 +273,7 @@ def load_vad(
 ) -> VadProcessor:
     """Load a VAD model and return a VadProcessor for audio segmentation."""
     if vad_model is not None:
-        logger.info("Using manually assigned vad_model. vad_method is ignored.")
+        logger.debug("Using manually assigned vad_model. vad_method is ignored.")
     else:
         if vad_method == "pyannote":
             vad_model = Pyannote(

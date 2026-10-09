@@ -1,5 +1,6 @@
 import argparse
 import functools
+import os
 import importlib.metadata
 import platform
 
@@ -9,7 +10,7 @@ from cantocaptions_ai.pipeline.model_profiles import MODEL_PROFILES
 from cantocaptions_ai.pipeline.reference_context import CONTEXT_TEMPLATES
 from cantocaptions_ai.utils.output import (LANGUAGES, TO_LANGUAGE_CODE,
                             optional_float, optional_int, str2bool)
-from cantocaptions_ai.utils.log_utils import setup_logging, get_logger
+from cantocaptions_ai.utils.log_utils import console_line, get_logger, log_file_path, setup_logging
 
 logger = get_logger(__name__)
 
@@ -94,9 +95,9 @@ def build_parser() -> argparse.ArgumentParser:
     output_grp = parser.add_argument_group("output")
     output_grp.add_argument("--output_dir", "-o", type=str, default=argparse.SUPPRESS, help="directory to save the outputs")
     output_grp.add_argument("--output_format", "-f", type=str, default=argparse.SUPPRESS, choices=["all", "srt", "vtt", "txt", "tsv", "json", "aud"], help="format of the output file; if not specified, all available formats will be produced")
-    output_grp.add_argument("--verbose", type=str2bool, default=argparse.SUPPRESS, help="whether to print out the progress and debug messages")
+    output_grp.add_argument("--verbose", type=str2bool, default=argparse.SUPPRESS, help="show detail on the console as well: every step's debug lines, library warnings and timestamps (the log file always has them)")
     output_grp.add_argument("--log_level", type=str, default=argparse.SUPPRESS, choices=["debug", "info", "warning", "error", "critical"], help="logging level (overrides --verbose if set)")
-    output_grp.add_argument("--log_file", type=str, default=argparse.SUPPRESS, help="redirect third-party stdout/stderr to this file; cantocaptions_ai log messages are written to both terminal and file")
+    output_grp.add_argument("--log_file", type=str, default=argparse.SUPPRESS, help="the run's detailed log (every message, with timestamps). Default: {output_dir}/logs/{input}-{date}.log; none for no log file")
     output_grp.add_argument("--print_progress", type=str2bool, default=argparse.SUPPRESS, help="if True, display stage progress bars and a timing summary; also enables per-batch progress in transcribe() and align() methods")
     output_grp.add_argument("--vram_checks", type=str2bool, default=argparse.SUPPRESS, help="if True, proactively estimate and log per-stage/per-batch VRAM headroom before running it (queries torch.cuda.mem_get_info each call); set False for zero per-batch overhead when turnaround time matters more than OOM safety margins")
     output_grp.add_argument("--vram_headroom_mb", type=int, default=argparse.SUPPRESS, help="caps the CUDA allocator this many MB below the device ceiling so a near-OOM raises a catchable error (triggering adaptive batch-size halving) instead of silently paging GPU memory into host RAM (very slow on Windows/WDDM); 0 disables; CUDA-only")
@@ -224,15 +225,37 @@ def cli():
 
     log_level = explicit.get("log_level")
     verbose = merged.get("verbose")
-    log_file = merged.pop("log_file", None)
+    log_file = _resolve_log_file(merged.pop("log_file", None), merged)
 
     if log_level is not None:
         setup_logging(level=log_level, log_file=log_file)
-    elif verbose:
-        setup_logging(level="info", log_file=log_file)
     else:
-        setup_logging(level="warning", log_file=log_file)
+        setup_logging(level="debug" if verbose else "info", log_file=log_file)
+    try:
+        _run(parser, explicit, merged)
+    finally:
+        path = log_file_path()
+        if path:
+            console_line(f"Log: {os.path.normpath(path)}", log=False)
 
+
+def _resolve_log_file(log_file, merged: dict):
+    """``--log_file``, or by default a new timestamped file under ``{output_dir}/logs/``
+    named after the first input; None for ``--log_file none``, or when there is no input
+    (the command line is about to be refused, and should leave nothing behind)."""
+    import time
+    if log_file is not None:
+        return None if str(log_file).strip().lower() in ("none", "") else log_file
+    inputs = (merged.get("proofread_input") or merged.get("audio")
+              or ([merged["input_dir"]] if merged.get("input_dir") else []))
+    if not inputs:
+        return None
+    stem = os.path.splitext(os.path.basename(os.path.normpath(inputs[0])))[0] or "cantocaptions"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return os.path.join(merged.get("output_dir") or "output", "logs", f"{stem}-{stamp}.log")
+
+
+def _run(parser, explicit: dict, merged: dict) -> None:
     logger.debug(
         "Resolved pipeline config (cfg=%s): %s",
         explicit.get("cfg", "default"),

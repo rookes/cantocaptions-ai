@@ -54,7 +54,7 @@ class FasterWhisperEnsemble(PipelineStage["List[VadAudioSegment]", "List[str]"])
         progress_callback: ProgressCallback = None,
     ) -> List[str]:
         """Transcribe each VAD segment, returning one text string per segment."""
-        logger.info("Running ensemble ASR (faster-whisper)...")
+        logger.debug("Running ensemble ASR (faster-whisper)...")
         if not input:
             return []
 
@@ -131,7 +131,7 @@ def load_faster_whisper(
     ct2_path = os.path.join(local_path, model_subfolder)
 
     compute_type = "float16" if device == "cuda" else "int8"
-    logger.info(f"Loading faster-whisper model from {ct2_path} (compute_type={compute_type})...")
+    logger.debug(f"Loading faster-whisper model from {ct2_path} (compute_type={compute_type})...")
     model = WhisperModel(
         ct2_path,
         device=device,

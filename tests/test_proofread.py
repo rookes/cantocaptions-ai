@@ -393,6 +393,30 @@ class TestProofreader(unittest.TestCase):
         self.assertEqual(texts[0], "佢返嚟喇？!")         # edited: cleaned again
         self.assertEqual(texts[1], "我哋去食飯啦")         # untouched: not re-cleaned
 
+    def _run_with_progress(self, segs, fake, **kw):
+        progress = mock.Mock()
+        with mock.patch.object(providers, "send", fake), \
+                mock.patch.object(providers, "count_tokens", return_value=None), \
+                mock.patch.object(providers, "open_cache", return_value=None), \
+                mock.patch.object(providers, "close_cache"):
+            Proofreader(settings(**kw)).run("ep", segs, REFERENCE, debug_dir=self.debug,
+                                            progress=progress)
+        return progress
+
+    def test_one_request_is_a_status_naming_what_is_awaited(self):
+        progress = self._run_with_progress(segments(), FakeProvider(ANSWER))
+        progress.set_total.assert_not_called()
+        status = progress.status.call_args_list[0].args[0]
+        self.assertTrue(status.startswith("waiting for "), status)
+        self.assertIn("(4 cues)", status)
+
+    def test_chunks_are_a_bar_advanced_as_each_is_answered(self):
+        segs = [{"start": float(i), "end": i + 0.9, "text": f"第{i}句"} for i in range(10)]
+        progress = self._run_with_progress(
+            segs, FakeProvider({"names": [], "edits": [], "flags": []}), chunk_cues=4)
+        progress.set_total.assert_called_once_with(3, unit="chunk")
+        self.assertEqual(sum(c.args[0] for c in progress.advance.call_args_list), 3)
+
     def test_chunking_sends_each_window_with_context(self):
         segs = [{"start": float(i), "end": i + 0.9, "text": f"第{i}句"} for i in range(10)]
         fake = FakeProvider({"names": [], "edits": [], "flags": []})

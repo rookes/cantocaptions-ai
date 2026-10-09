@@ -167,7 +167,7 @@ def load_model_ctc(
 
     # Loaded as alignment loads the same models: float32 unless float16 is asked for.
     dtype = resolve_torch_compute_dtype(compute_type, device, "ASR")
-    logger.info("Loading ASR model %r (ctc backend, %s)", model_id, dtype)
+    logger.info("ASR model: %s (ctc backend, %s)", model_id, dtype)
     if model is None:
         model = guard_model_load(
             "ASR",

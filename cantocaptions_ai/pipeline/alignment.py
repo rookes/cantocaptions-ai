@@ -476,7 +476,7 @@ def _compute_vad_emissions(
     if not vad_segments:
         return []
     start = time.perf_counter()
-    logger.info("Computing alignment emissions for %d VAD segments...", len(vad_segments))
+    logger.debug("Computing alignment emissions for %d VAD segments...", len(vad_segments))
 
     # A segment too short for one feature frame gets an empty emission rather than a trip
     # through the feature extractor, which fails outright below 240 samples. VAD should no
@@ -511,7 +511,7 @@ def _compute_vad_emissions(
     results: List[Tuple[torch.Tensor, float]] = [(empty, 0.0)] * len(vad_segments)
     for i, result in zip(usable, computed):
         results[i] = result
-    logger.info("Alignment emissions computed in %.1fs", time.perf_counter() - start)
+    logger.debug("Alignment emissions computed in %.1fs", time.perf_counter() - start)
     return results
 
 
@@ -556,7 +556,10 @@ class EmissionTimeline:
         vad_segments: Sequence[VadAudioSegment],
         compute_fn: Callable[[List[VadAudioSegment]], List[Tuple[torch.Tensor, float]]],
         frame_rate: Optional[float] = None,
+        on_computed: Optional[Callable[[int], None]] = None,
     ):
+        # Called with the number of chunks just encoded, for a progress bar.
+        self._on_computed = on_computed
         self._nominal_rate = frame_rate
         self._segments = list(vad_segments)
         self._compute = compute_fn
@@ -614,6 +617,8 @@ class EmissionTimeline:
             step = (self._ends[i] - self._starts[i]) / n if n else 0.0
             self._times[i] = self._starts[i] + np.arange(n, dtype=np.float64) * step
             self.computed += 1
+        if self._on_computed is not None and len(indices):
+            self._on_computed(len(indices))
 
     def slice(self, t0: float, t1: float) -> Tuple[torch.Tensor, np.ndarray]:
         """(emission[frames, vocab] as float32, absolute start time of each frame)."""

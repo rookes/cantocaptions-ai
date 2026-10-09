@@ -11,7 +11,16 @@ from typing import Any, Dict, List, Optional, Sequence
 from cantocaptions_ai.errors import ConfigError
 from cantocaptions_ai.text_profiles import DEFAULT_PUNCTUATION
 from cantocaptions_ai.utils.debug import write_speaker_assignment_debug
-from cantocaptions_ai.utils.log_utils import ProgressSink, StageTimer, TranscriptionSummary, get_logger
+from cantocaptions_ai.utils.log_utils import (
+    NullReporter,
+    ProgressSink,
+    StageTimer,
+    TranscriptionSummary,
+    console_line,
+    get_logger,
+    glyph,
+    section,
+)
 from cantocaptions_ai.utils.model_utils import flush_vram, load_with_offline_fallback
 from cantocaptions_ai.utils.schema import (
     AlignedTranscriptionResult,
@@ -90,7 +99,10 @@ def _run_alignment(
         # alive through the rest of the batch and every later stage.
         timeline = item.pop('emission_timeline', None)
         if align_model is not None and len(result["segments"]) > 0:
-            logger.info("Performing alignment...")
+            logger.debug("Performing alignment...")
+            if progress_callback is not None:
+                # align() encodes the whole file before the first segment is aligned.
+                progress_callback.status("computing emissions" if timeline is None else "aligning lines")
             aligned_result: AlignedTranscriptionResult = align(
                 result["segments"],
                 align_model,
@@ -160,14 +172,10 @@ def _run_diarization(
     if not need_diarize:
         return load_diarization_cache(items, cfg.load_debug_dir)
 
-    if cfg.hf_token is None:
-        logger.info(
-            "No --hf_token provided; %s is a gated model, so its terms must already be "
-            "accepted and a token cached (huggingface-cli login) or this load will fail.",
-            cfg.diarize_model,
-        )
     with StageTimer("Diarization", summary, progress=progress) as stage:
-        diarizer = load_with_offline_fallback(
+        stage.status("loading model")
+        diarizer = _load_gated(
+            cfg,
             load_diarization,
             device=cfg.device,
             device_index=cfg.device_index,
@@ -192,6 +200,22 @@ def _run_diarization(
     del diarizer
     flush_vram()
     return items
+
+
+def _load_gated(cfg, load_fn, *args, **kwargs):
+    """load_with_offline_fallback for one of pyannote's gated models, naming the likely
+    cause when it fails without --hf_token: the model's terms not yet accepted, or no token
+    cached. Said only then, rather than as a caveat on every run that loads fine."""
+    try:
+        return load_with_offline_fallback(load_fn, *args, **kwargs)
+    except Exception as e:
+        if cfg.hf_token is None:
+            raise RuntimeError(
+                f"Could not load {cfg.diarize_model} ({type(e).__name__}: {e}). It is a gated "
+                "model: accept its terms on huggingface.co and log in (huggingface-cli login) "
+                "or pass --hf_token."
+            ) from e
+        raise
 
 
 def _assign_speakers(
@@ -222,7 +246,7 @@ def _assign_speakers(
             continue
         segments = item['result']["segments"]
         stats = assign_speakers(segments, diarization["turns"], config)
-        logger.info(f"Speaker assignment: {format_stats(stats)}")
+        logger.info(format_stats(stats))
         if debug_dir is not None:
             write_speaker_assignment_debug(item_name(item), segments, debug_dir)
     return items
@@ -248,7 +272,9 @@ def _run_speaker_change(
     from cantocaptions_ai.utils.debug import write_speaker_change_debug
 
     with StageTimer("Speaker change", summary, progress=progress) as stage:
-        scorer = load_with_offline_fallback(
+        stage.status("loading model")
+        scorer = _load_gated(
+            cfg,
             SpeakerChangeScorer.load,
             cfg.diarize_model,
             device=cfg.device,
@@ -264,7 +290,7 @@ def _run_speaker_change(
             records = score_segments(scorer, segments, item["vad_segments"])
             held = mark_breaks(segments, cfg.speaker_change_threshold)
             logger.info(
-                "Speaker change: %d of %d subsegment boundaries scored, %d held "
+                "%d of %d subsegment boundaries scored, %d held as a change of voice "
                 "(threshold %.2f)", len(records), max(0, len(segments) - 1), held,
                 cfg.speaker_change_threshold,
             )
@@ -329,6 +355,7 @@ def _run_realign(
     debug_dir: Optional[str] = None,
     load_debug_dir: Optional[str] = None,
     punctuation=None,
+    progress_callback=None,
 ) -> List[ProcessingItem]:
     """Put a transcript on the timeline and build the next stage's input from it.
 
@@ -356,11 +383,11 @@ def _run_realign(
     punct = {"punctuation": punctuation} if punctuation is not None else {}
     if not normalize:
         logger.info(
-            "realign: punctuation normalization is off, so the text reaches the subtitle "
+            "Punctuation normalization is off, so the text reaches the subtitle "
             "exactly as written. Halfwidth marks are not in the align vocabulary and will be "
             "dropped, so the pauses they stand for go unmodelled."
         )
-    logger.info(f"Loaded {len(lines)} transcript line(s) from: {realign_path}")
+    logger.info("Loaded %d transcript line(s) from %s", len(lines), os.path.basename(realign_path))
     if not lines:
         raise ConfigError(f"realign transcript is empty: {realign_path}")
     if len(items) > 1:
@@ -378,6 +405,11 @@ def _run_realign(
         repair.augment(line.text for line in lines)
 
     profile = align_metadata.get("profile") or DEFAULT_ALIGN_PROFILE
+    # The bar counts chunks encoded: the timeline encodes them as the placement search first
+    # reads them, a few at a time, and the search itself is cheap next to that.
+    reporter = progress_callback or NullReporter()
+    reporter.set_total(sum(len(item["vad_segments"]) for item in items), unit="seg")
+    reporter.status("placing lines")
     result_items: List[ProcessingItem] = []
     for item in items:
         vad_segments = item["vad_segments"]
@@ -396,7 +428,8 @@ def _run_realign(
         # any is aligned, so a batch peaks at the sum of them (~0.5 GB an hour of audio each);
         # _run_alignment frees each one only after the whole batch has been realigned.
         timeline = EmissionTimeline(
-            vad_segments, compute, frame_rate=align_metadata.get("frame_rate"))
+            vad_segments, compute, frame_rate=align_metadata.get("frame_rate"),
+            on_computed=reporter.advance)
 
         common = dict(
             window_seconds=window_seconds, commit_margin=commit_margin,
@@ -478,7 +511,7 @@ def _run_realign_asr(
     )
 
     lines = load_transcript_lines(realign_path, normalize=normalize)
-    logger.info(f"Loaded {len(lines)} transcript line(s) from: {realign_path}")
+    logger.info("Loaded %d transcript line(s) from %s", len(lines), os.path.basename(realign_path))
     if not lines:
         raise ConfigError(f"realign transcript is empty: {realign_path}")
 
@@ -701,7 +734,7 @@ class VadStage(Stage):
             for i in vad_indices
         )
         if len(vad_indices) < len(audio_paths):
-            logger.info(
+            logger.debug(
                 "Skipping VAD for %d of %d file(s) already covered by cached vocal isolation",
                 len(audio_paths) - len(vad_indices), len(audio_paths),
             )
@@ -724,6 +757,7 @@ class VadStage(Stage):
                 ]
                 if need_vad:
                     from cantocaptions_ai.pipeline.vad import load_vad
+                    stage.status("loading model")
                     # A caller (e.g. PipelineService in resident mode) may pass a preloaded
                     # VAD model to reuse across jobs — load_vad reuses it and ignores
                     # vad_method. It stays alive via the caller's reference after the
@@ -785,6 +819,7 @@ class VocalIsolationStage(CachedStage):
         from cantocaptions_ai.pipeline.vocal_isolation import load_vocal_isolation
 
         cfg = ctx.cfg
+        timer.status("loading model")
         processor = load_with_offline_fallback(
             load_vocal_isolation,
             model_name=cfg.vocal_isolation_method,
@@ -834,6 +869,7 @@ class RealignAcousticStage(Stage):
 
         cfg = ctx.cfg
         with StageTimer(self.name, ctx.summary, progress=ctx.progress) as stage:
+            stage.status("loading alignment model")
             align_model, align_metadata = load_with_offline_fallback(
                 load_align_model,
                 ctx.align_language, cfg.device, cfg.device_index,
@@ -862,6 +898,7 @@ class RealignAcousticStage(Stage):
                 debug_dir=cfg.debug_dir,
                 load_debug_dir=cfg.load_debug_dir,
                 punctuation=ctx.realign_punct,
+                progress_callback=stage.reporter,
             )
             # Mode sync's cues are finished: the transform placed them, and the guarantee it
             # makes -- that the subtitle's own proportions survive exactly -- is only true if
@@ -988,6 +1025,7 @@ class TranscriptionStage(_CachedAsrPath):
         from cantocaptions_ai.utils.model_utils import model_scope
 
         cfg = ctx.cfg
+        timer.status("loading model")
         with model_scope(
             load_model,
             ctx.profile.model,
@@ -1034,6 +1072,7 @@ class EnsembleStage(_CachedAsrPath):
         from cantocaptions_ai.utils.model_utils import model_scope
 
         cfg = ctx.cfg
+        timer.status("loading model")
         with model_scope(
             load_faster_whisper,
             device=cfg.device,
@@ -1086,7 +1125,7 @@ class LlmCorrectionStage(_CachedAsrPath):
             from cantocaptions_ai.utils.model_utils import vram_stats
             stats = vram_stats()
             if stats:
-                logger.info(
+                logger.debug(
                     f"VRAM before LLM load: allocated={stats['allocated_mb']:.0f} MB, "
                     f"reserved={stats['reserved_mb']:.0f} MB, "
                     f"free={stats['free_mb']:.0f} MB / {stats['total_mb']:.0f} MB"
@@ -1098,6 +1137,7 @@ class LlmCorrectionStage(_CachedAsrPath):
         from cantocaptions_ai.utils.model_utils import model_scope
 
         cfg = ctx.cfg
+        timer.status("loading model")
         with model_scope(
             load_llm,
             model_id=cfg.llm_model,
@@ -1173,6 +1213,7 @@ class AlignmentStage(_AsrPath):
 
         cfg = ctx.cfg
         with StageTimer(self.name, ctx.summary, progress=ctx.progress) as stage:
+            stage.status("loading alignment model")
             align_model, align_metadata = load_with_offline_fallback(
                 load_align_model,
                 ctx.align_language, cfg.device, cfg.device_index,
@@ -1314,6 +1355,24 @@ def describe_plan(ctx: RunContext, stages: Sequence[Stage]) -> str:
 
 
 def run_stages(ctx: RunContext, stages: Sequence[Stage], items: List[dict]) -> List[dict]:
+    """Run each stage in turn, each its own section on the console.
+
+    A timed stage's StageTimer draws its section; a stage read back from the debug cache is
+    one line; any other stage (speaker assignment, ASR context) gets an untimed section.
+    """
+    enabled = ctx.summary.enabled
     for stage in stages:
-        items = stage.run(ctx, items)
+        if stage.timed_in(ctx):
+            items = stage.run(ctx, items)
+        elif stage.status(ctx) == "cached":
+            message = f"{stage.name}: loaded from {os.path.normpath(ctx.cfg.load_debug_dir)}"
+            if enabled:
+                console_line()
+                console_line(f"{glyph('cached')} {message}")
+            else:
+                logger.info(message)
+            items = stage.run(ctx, items)
+        else:
+            with section(stage.name, enabled=enabled):
+                items = stage.run(ctx, items)
     return items
