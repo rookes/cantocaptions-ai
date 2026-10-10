@@ -59,7 +59,7 @@ import bisect
 import difflib
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -76,6 +76,8 @@ from cantocaptions_ai.pipeline.alignment import (
     _get_blank_id,
     _preprocess_segment,
     backtrack,
+    concurrent_emission,
+    filler_mask,
     get_trellis,
 )
 from cantocaptions_ai.pipeline import timefit
@@ -307,15 +309,25 @@ class TranscriptLine:
     ignores them completely, deliberately, because a search narrowed by the prior would only
     confirm the prior (which is exactly how the old --retime failed). They are the x-axis the
     transform is fitted against, and nothing else.
+
+    ``style`` is the override blocks the cue opened with (``{\\an8}``); see ``top``.
     """
     index: int
     text: str
     source_start: Optional[float] = None
     source_end: Optional[float] = None
+    style: str = ""
 
     @property
     def timed(self) -> bool:
         return self.source_start is not None and self.source_end is not None
+
+    @property
+    def top(self) -> bool:
+        """A cue the input put at the top of the frame: concurrent background speech, as a
+        rule, which is allowed to overlap the main line. See split_tracks."""
+        from cantocaptions_ai.utils.subtitles import is_top_position
+        return is_top_position(self.style)
 
 
 # Why a line's timing is not to be trusted.
@@ -481,13 +493,14 @@ def load_transcript_lines(
     if path.lower().endswith((".srt", ".vtt", ".webvtt")):
         from cantocaptions_ai.utils.subtitles import read_subtitle_cues
         cues = read_subtitle_cues(path)
-        raw = [(cue.text, cue.start, cue.end) for cue in cues]
+        raw = [(cue.text, cue.start, cue.end, cue.style) for cue in cues]
     else:
         with open(path, "rb") as fh:
-            raw = [(line, None, None) for line in fh.read().decode("utf-8-sig").splitlines()]
+            raw = [(line, None, None, "")
+                   for line in fh.read().decode("utf-8-sig").splitlines()]
 
     lines: List[TranscriptLine] = []
-    for text, start, end in raw:
+    for text, start, end, style in raw:
         text = normalize_transcript_text(text.strip(), punctuation=normalize)
         if not text:
             continue
@@ -495,6 +508,7 @@ def load_transcript_lines(
             index=len(lines), text=text,
             source_start=start if keep_timings else None,
             source_end=end if keep_timings else None,
+            style=style,
         ))
     return lines
 
@@ -689,10 +703,16 @@ class _Aligner:
     *free-end* one may stop early, which is the right question while still searching.
     """
 
-    def __init__(self, timeline: EmissionTimeline, tokens_per_line, blank_id: int):
+    def __init__(self, timeline: EmissionTimeline, tokens_per_line, blank_id: int,
+                 concurrent: bool = False):
         self.timeline = timeline
         self.tokens_per_line = tokens_per_line
         self.blank_id = blank_id
+        # Lines spoken over other speech; see alignment.concurrent_emission.
+        self.concurrent = concurrent
+        # ...or only where other speech is known to be (the top-of-screen cues, for the main
+        # track), as (start, end) spans on the audio timeline.
+        self.filler_spans: Sequence[Tuple[float, float]] = ()
         self.trellises = 0
         self.cells = 0
 
@@ -718,6 +738,12 @@ class _Aligner:
         tokens, spans = self.spans(lo, hi)
         if not tokens or emission.size(0) == 0:
             return []
+        if self.concurrent:
+            emission = concurrent_emission(emission, tokens, self.blank_id)
+        elif self.filler_spans:
+            mask = filler_mask(frame_times, self.filler_spans)
+            if mask is not None and len(mask) == emission.size(0):
+                emission = concurrent_emission(emission, tokens, self.blank_id, mask=mask)
         self.trellises += 1
         self.cells += (emission.size(0) + 1) * (len(tokens) + 1)
         trellis = get_trellis(emission, tokens, self.blank_id, free_end=free)
@@ -1208,7 +1234,160 @@ def _apply(
     return timings, frozenset(dropped), effective
 
 
+# --- The top-of-screen track ----------------------------------------------------------
+#
+# A cue the input put at the top of the frame ({\an8}) is, as a rule, background speech
+# running *concurrently* with the main line -- a crowd, a radio, a second conversation. Every
+# piece of this module assumes the opposite of the main line: one ordered stream, each line
+# after the last, no two on screen at once. Fed through that machinery a top cue is a line
+# out of sequence. The anchor search tries to read it in order with its neighbours, forced
+# alignment has to put it before or after the cue it overlaps, and map_cues' overlap trim
+# cuts the main cue short wherever the top one begins.
+#
+# So with a prior to place them by (sync, adjust) top cues are a separate track. The main
+# track is fitted and placed exactly as if they were not there; each top cue is then mapped
+# through the main track's transform on its own and, under adjust, forced-aligned on its own
+# inside the same leash. Under transcript mode there is no prior to place a concurrent line
+# by, so a top cue stays in sequence as before and only its position tag is carried.
+
+
+def split_tracks(lines: Sequence[TranscriptLine]) -> Tuple[List[TranscriptLine], List[TranscriptLine]]:
+    """(main, overlay): the lines in their own order, top-of-screen ones apart."""
+    main = [line for line in lines if not line.top]
+    overlay = [line for line in lines if line.top]
+    return main, overlay
+
+
+def _reindexed(lines: Sequence[TranscriptLine]) -> List[TranscriptLine]:
+    """*lines* numbered from 0, which everything here assumes (``lines[t.index]``)."""
+    return [replace(line, index=k) for k, line in enumerate(lines)]
+
+
+def _restored(
+    timings: Sequence[LineTiming], dropped: frozenset, originals: Sequence[TranscriptLine],
+) -> Tuple[List[LineTiming], frozenset]:
+    """Undo _reindexed: give the timings and drops back their original line indices."""
+    return (
+        [replace(t, index=originals[t.index].index) for t in timings],
+        frozenset(originals[i].index for i in dropped),
+    )
+
+
+def _with_overlay(lines, run_main, place_overlay_track):
+    """Run *run_main* on the main track, then place the top-of-screen track against its fit.
+
+    A file with no top cues goes straight through *run_main* untouched, so nothing about the
+    main path changes for it -- not even its line indices.
+    """
+    main, overlay = split_tracks(lines)
+    if not overlay:
+        return run_main(lines)
+    timings, dropped, transform, report = run_main(_reindexed(main))
+    timings, dropped = _restored(timings, dropped, main)
+    extra, extra_dropped = place_overlay_track(_reindexed(overlay), transform, report)
+    extra, extra_dropped = _restored(extra, extra_dropped, overlay)
+    logger.info(
+        "%d top-of-screen cue(s) were placed on their own, so they may overlap the main "
+        "line", len(overlay),
+    )
+    return (sorted(timings + extra, key=lambda t: t.index), dropped | extra_dropped,
+            transform, report)
+
+
+def _overlay_transform(transform: timefit.Transform, spans: Sequence[Tuple[float, float]]):
+    """*transform*, made safe to map cues that were not part of its fit.
+
+    Both of its per-cue fields index the *main* track's lines: ``ids`` says which line each
+    anchor was found on, and each cut's ``cue_indices`` which lines it swallowed. Read against
+    overlay line numbers either one would match unrelated cues by coincidence of their small
+    integers (see the note on ``Transform.ids`` in docs/realign.md). So ``ids`` is emptied --
+    every overlay cue is interpolated between the anchors around it -- and the cuts are
+    re-derived from where each overlay cue starts.
+    """
+    breaks = tuple(
+        replace(brk, cue_indices=tuple(
+            i for i, (start, _end) in enumerate(spans)
+            if brk.kind == "cut" and brk.source_start <= start < brk.source_end
+        ))
+        for brk in transform.breaks
+    )
+    return replace(transform, ids=(), breaks=breaks)
+
+
+def place_overlay(
+    lines: Sequence[TranscriptLine],
+    transform: timefit.Transform,
+    vad_segments: Sequence[VadAudioSegment],
+    timeline: EmissionTimeline,
+    model_dictionary: dict,
+    model_lang: str,
+    *,
+    leash: Optional[float],
+    blank_id: Optional[int] = None,
+    punctuation: PunctuationConfig = REALIGN_PUNCTUATION,
+    cut_policy: str = "drop",
+    align_padding: float = 0.0,
+) -> Tuple[List[LineTiming], frozenset]:
+    """Place top-of-screen lines through the main track's *transform*, each on its own.
+
+    With ``leash`` None (mode sync) the mapped prior is the answer. Otherwise (mode adjust)
+    each line is forced-aligned alone inside ``+/- leash`` of its prior and clamped back to it
+    exactly as a main-track line is, which is what keeps a top cue from wandering into an
+    empty stretch: the bracket only ever holds the audio around where the input put it.
+    Aligning each line by itself is what lets it overlap the main line -- nothing else is in
+    its trellis to be ordered against.
+    """
+    spans = source_spans(lines)
+    prior, dropped, _effective = _apply(
+        lines, spans, _overlay_transform(transform, spans), timeline, cut_policy,
+        align_padding=align_padding if leash is None else 0.0,
+    )
+    if leash is None:
+        return prior, dropped
+    blank_id, tokens_per_line, aligner, stats = _prepare(
+        lines, vad_segments, timeline, model_dictionary, model_lang, blank_id, punctuation,
+    )
+    aligner.concurrent = True
+    out: List[Optional[LineTiming]] = [None] * len(lines)
+    for i, timing in enumerate(prior):
+        if i in dropped:
+            out[i] = timing
+            continue
+        t0 = max(timeline.file_start, timing.start - leash)
+        t1 = min(timeline.file_end, timing.end + leash)
+        fill(lines, aligner, i, i + 1, t0, max(t1, t0 + 0.1), out, stats)
+    clamp_to_prior(out, prior, leash, stats)
+    for i, timing in enumerate(out):
+        if (timing.reason == REASON_ISOLATED
+                and not any(t != blank_id for t in tokens_per_line[i])):
+            timing.reason = REASON_NO_VOCABULARY
+    return out, dropped
+
+
 def assign_lines_sync(
+    lines: Sequence[TranscriptLine],
+    vad_segments: Sequence[VadAudioSegment],
+    timeline: EmissionTimeline,
+    model_dictionary: dict,
+    model_lang: str,
+    **kwargs,
+) -> Tuple[List[LineTiming], frozenset, timefit.Transform, timefit.TransformReport]:
+    """Mode ``sync``; see _assign_lines_sync. Top-of-screen cues are mapped as their own track."""
+    def place(overlay, transform, _report):
+        return place_overlay(
+            overlay, transform, vad_segments, timeline, model_dictionary, model_lang,
+            leash=None, cut_policy=kwargs.get("cut_policy", "drop"),
+            align_padding=kwargs.get("align_padding", 0.0),
+        )
+    return _with_overlay(
+        lines,
+        lambda main: _assign_lines_sync(
+            main, vad_segments, timeline, model_dictionary, model_lang, **kwargs),
+        place,
+    )
+
+
+def _assign_lines_sync(
     lines: Sequence[TranscriptLine],
     vad_segments: Sequence[VadAudioSegment],
     timeline: EmissionTimeline,
@@ -1280,7 +1459,45 @@ def assign_lines_sync(
     return timings, dropped, transform, report
 
 
+def adjust_leash(tolerance: float, report: timefit.TransformReport) -> float:
+    """How far mode adjust lets alignment move a cue from its prior.
+
+    A loose fit widens its own leash rather than fighting the aligner over a prior it does
+    not itself believe to better than a second.
+    """
+    return max(tolerance, 3.0 * report.residual_p90)
+
+
 def assign_lines_adjust(
+    lines: Sequence[TranscriptLine],
+    vad_segments: Sequence[VadAudioSegment],
+    timeline: EmissionTimeline,
+    model_dictionary: dict,
+    model_lang: str,
+    **kwargs,
+) -> Tuple[List[LineTiming], frozenset, timefit.Transform, timefit.TransformReport]:
+    """Mode ``adjust``; see _assign_lines_adjust. Top-of-screen cues are placed as their own
+    track, under the same leash."""
+    def place(overlay, transform, report):
+        return place_overlay(
+            overlay, transform, vad_segments, timeline, model_dictionary, model_lang,
+            leash=adjust_leash(kwargs.get("tolerance", ADJUST_TOLERANCE), report),
+            blank_id=kwargs.get("blank_id"),
+            punctuation=kwargs.get("punctuation", REALIGN_PUNCTUATION),
+            cut_policy=kwargs.get("cut_policy", "drop"),
+        )
+    _main, overlay = split_tracks(lines)
+    background = [(line.source_start, line.source_end) for line in overlay if line.timed]
+    return _with_overlay(
+        lines,
+        lambda main: _assign_lines_adjust(
+            main, vad_segments, timeline, model_dictionary, model_lang,
+            background=background, **kwargs),
+        place,
+    )
+
+
+def _assign_lines_adjust(
     lines: Sequence[TranscriptLine],
     vad_segments: Sequence[VadAudioSegment],
     timeline: EmissionTimeline,
@@ -1296,6 +1513,7 @@ def assign_lines_adjust(
     slope_penalty: float = timefit.SLOPE_PENALTY,
     cut_policy: str = "drop",
     tolerance: float = ADJUST_TOLERANCE,
+    background: Sequence[Tuple[float, float]] = (),
     progress_callback=None,
 ) -> Tuple[List[LineTiming], frozenset, timefit.Transform, timefit.TransformReport]:
     """Mode ``adjust``: the transform as a prior, then re-time each cue from the audio.
@@ -1325,15 +1543,16 @@ def assign_lines_adjust(
     report = timefit.describe_transform(transform, spans, effective)
     timefit.report_transform(report, len(lines))
 
-    # A loose fit widens its own leash rather than fighting the aligner over a prior it does
-    # not itself believe to better than a second.
-    leash = max(tolerance, 3.0 * report.residual_p90)
+    leash = adjust_leash(tolerance, report)
     if leash > tolerance:
         logger.info(
             "Widening the adjust tolerance to %.1fs, since the transform only fits "
             "its anchors to %.2fs", leash, report.residual_p90,
         )
 
+    # ``background`` is the top-of-screen cues' own source spans (see split_tracks): their
+    # speech is in this audio but not in these lines, so the fill may pass over it.
+    aligner.filler_spans = [transform.map_span(a, b) for a, b in background]
     out: List[Optional[LineTiming]] = [None] * len(lines)
     for lo, hi, t0, t1 in bracket_blocks(prior, leash, timeline.file_start, timeline.file_end):
         fill(lines, aligner, lo, hi, t0, t1, out, stats)
@@ -1437,6 +1656,8 @@ def segments_from_timings(
         }
         if timing.reason:
             segment["realign_reason"] = timing.reason
+        if line.style:
+            segment["style_tags"] = line.style
         segments.append(segment)
     return segments
 
@@ -1809,6 +2030,10 @@ def build_align_input(
     chunk_size: float,
     *,
     pad: float = 0.2,
+    reach: Optional[float] = None,
+    concurrent: bool = False,
+    filler_spans: Sequence[Tuple[float, float]] = (),
+    carry_placements: bool = False,
 ) -> Tuple[List[VadAudioSegment], List[SingleSegment]]:
     """Group placed lines into alignment chunks, re-cut so no line straddles a boundary.
 
@@ -1817,6 +2042,21 @@ def build_align_input(
     chunk. The coarse pass has already said where every line begins, so the boundaries are
     simply moved onto the gaps between lines: each chunk starts and ends midway through a
     silence, and every line lies wholly inside exactly one of them.
+
+    ``reach`` caps how far into a gap a chunk may extend from the line beside it; None leaves
+    the boundary in the middle of the gap however wide it is. Forced alignment must place
+    every token somewhere in its chunk, and on audio it cannot read (music, singing) it
+    scores a line about as well anywhere -- so whatever stretch of nothing a chunk holds
+    beside its line is room for the line to be put in. Mode adjust passes its leash: a cue
+    it has already placed within the leash of the transform must not be handed half an
+    opening theme to re-place itself in. Measured on a ReZero broadcast episode, where one
+    line after the 93 s opening came out 46 s early, inside the theme song.
+
+    ``concurrent`` marks every segment as spoken over other speech (the top-of-screen track;
+    see alignment.concurrent_emission). ``filler_spans`` instead marks only where other
+    speech is known to be (the top-of-screen cues, for the main track). With
+    ``carry_placements`` each cue's placement rides through alignment so hold_to_placement
+    can enforce a leash on it.
 
     Returns (chunks, transcript) ready for align(): one SingleSegment per chunk, carrying its
     lines joined by sentinels and one cue_spans entry per line.
@@ -1831,11 +2071,21 @@ def build_align_input(
     ordered = _sanitize(timings, file_start, file_end)
 
     # Boundary between consecutive lines: the middle of the gap they leave. Clamped to be
-    # non-decreasing so the budget test below is always measuring a real duration.
-    bounds = [max(file_start, ordered[0].start - pad)]
+    # non-decreasing so the budget test below is always measuring a real duration. Each line
+    # has two edges -- lead[i] where a chunk opening on it starts, trail[i] where a chunk
+    # closing on it ends -- which are the same boundary unless ``reach`` holds them apart,
+    # leaving the middle of a wide gap in no chunk at all.
+    lead = [max(file_start, ordered[0].start - pad)]
+    trail: List[float] = []
     for a, b in zip(ordered, ordered[1:]):
-        bounds.append(max(bounds[-1], a.end, min(b.start, (a.end + b.start) / 2)))
-    bounds.append(max(bounds[-1], min(file_end, ordered[-1].end + pad)))
+        boundary = max(lead[-1], a.end, min(b.start, (a.end + b.start) / 2))
+        if reach is None:
+            trail.append(boundary)
+            lead.append(boundary)
+        else:
+            trail.append(max(lead[-1], min(boundary, a.end + reach)))
+            lead.append(max(boundary, b.start - reach))
+    trail.append(max(lead[-1], min(file_end, ordered[-1].end + pad)))
 
     # Two budgets, both hard: the chunk's duration, and the characters its frames can carry.
     # See MAX_CHARS_PER_SECOND for why the second is not optional.
@@ -1854,13 +2104,18 @@ def build_align_input(
         # Budget against the audio the group actually has. Past the end of the recording
         # there is none, and splitting there buys nothing -- the lines have no frames either
         # way -- so fall back to the flat budget rather than emitting a chunk per line.
-        available = (min(bounds[i + 1], file_end) - min(bounds[current[0]], file_end)
+        available = (min(trail[i], file_end) - min(lead[current[0]], file_end)
                      if current else 0.0)
         budget = min(available, chunk_size) if available > MIN_CHUNK_DURATION else chunk_size
         max_chars = max(1, int(budget * MAX_CHARS_PER_SECOND))
-        too_long = current and bounds[i + 1] - bounds[current[0]] > chunk_size
+        too_long = current and trail[i] - lead[current[0]] > chunk_size
         too_much = current and chars + size > max_chars
-        if too_long or too_much:
+        # Under a reach, a gap wider than twice it is never *inside* a chunk either: capping
+        # only the outer edges let two lines either side of one share a chunk with the gap
+        # between them, and forced alignment pulled the later line back into it. This is the
+        # same cut bracket_blocks makes for the placement.
+        gapped = current and reach is not None and lead[i] > trail[i - 1]
+        if too_long or too_much or gapped:
             groups.append(current)
             current, chars = [], 0
         current.append(i)
@@ -1872,8 +2127,8 @@ def build_align_input(
     transcript: List[SingleSegment] = []
     previous_end = file_start
     for group in groups:
-        start = bounds[group[0]]
-        end = max(bounds[group[-1] + 1], start + 0.04)
+        start = lead[group[0]]
+        end = max(trail[group[-1]], start + 0.04)
         text_parts, spans = [], []
         cursor = 0
         for i in group:
@@ -1881,7 +2136,14 @@ def build_align_input(
             text_parts.append(body)
             spans.append((cursor, cursor + len(body) - 1))  # inclusive, sentinel included
             cursor += len(body)
-        end = min(end, start + chunk_size)  # the budget is a hard guarantee, not a target
+        if end - start > chunk_size:
+            # The budget is a hard guarantee, not a target -- but it comes out of the silence
+            # *before* the lines, never out of the lines. Capping from the start alone is what
+            # once handed a line that followed a 93 s gap the chunk [mid-gap, mid-gap + 28 s],
+            # which ended 19 s before the line began: forced alignment then had nothing to
+            # place it on but the theme song.
+            start = max(start, min(ordered[group[0]].start - pad, end - chunk_size))
+            end = min(end, start + chunk_size)
         audio = _slice_audio(vad_segments, start, end)
         if len(audio) < int(MIN_CHUNK_DURATION * SAMPLE_RATE):
             # Reach *backwards* for the missing samples: a chunk this short only happens at
@@ -1898,13 +2160,27 @@ def build_align_input(
             "end": round(end, 3),
             "audio": audio,
         })
-        transcript.append({
+        segment: SingleSegment = {
             "start": round(start, 3),
             "end": round(end, 3),
             "text": "".join(text_parts),
             "cue_spans": spans,
             "cue_reasons": [by_timing[ordered[i].index].reason for i in group],
-        })
+        }
+        styles = [by_index[ordered[i].index].style for i in group]
+        if any(styles):
+            segment["cue_styles"] = styles
+        if concurrent:
+            segment["concurrent"] = True
+        filler = [(a, b) for a, b in filler_spans if b > start and a < end]
+        if filler and not concurrent:
+            segment["filler_spans"] = filler
+        if carry_placements:
+            segment["cue_placements"] = [
+                (by_timing[ordered[i].index].start, by_timing[ordered[i].index].end)
+                for i in group
+            ]
+        transcript.append(segment)
 
     over = [c for c in chunks if c["end"] - c["start"] > chunk_size + 1e-6]
     if over:
@@ -1984,6 +2260,290 @@ def tighten_cue_spans(
             "there", adjusted,
         )
     return adjusted
+
+
+# --- Splitting a cue at a pause --------------------------------------------------------
+#
+# A subtitler often holds two sentences on screen as one cue across the pause between them,
+# sometimes as two lines and sometimes run together on one. Splitting is a bet the way any
+# cue boundary not in the input is (see align_checks.split_gapped_cues), so each cut must be
+# backed by the audio on both sides, and the input's own line break, where it has one, is
+# trusted first. Default on in mode adjust only, whose premise is that the input's own timing
+# is not trusted.
+#
+# Measured on two ReZero broadcast episodes against hand-finished copies; see
+# docs/realign.md. Where to cut is partly editorial, and the two files disagree about pauses
+# of 0.4-0.6 s inside a sentence (one split those run-ons, the other kept them whole), so the
+# defaults sit where both agree.
+
+# The least silence between the last character of one line and the first of the next that
+# makes a line break a cue boundary. On that episode, breaks that wrap one sentence (好啲 /
+# 嘅理由啊) sit at 0.08-0.20 s and every break the checker split by hand at 0.44-0.80 s.
+# --realign_split_gap.
+LINE_SPLIT_GAP = 0.3
+
+# ...and for a boundary with nothing written at it, the least time from one character's onset
+# to the next. That boundary has no pause token, so the trellis folds any silence into the
+# first character's span and the gap between the two spans is always zero; the onset-to-onset
+# interval is what carries the pause. (A blank token inserted there measures the same thing,
+# within a frame or two: tested and no better.) On episode 2 (to 07:59), of the 984 such
+# boundaries the checker kept the median is 0.16 s and 99% are under 0.32 s, and every cut
+# made at 0.4 s or more was one the checker made too (11 of 11). On episode 1 (whole file),
+# 0.4 s made 41 cuts of which the finished file has 9, 0.6 s 15 of which 5, and 0.7 s 2 of
+# 2: from 0.7 s up both files agree on every cut (7 of 7). --realign_pause_gap 0.4 is the
+# more aggressive reading.
+PAUSE_SPLIT_GAP = 0.7
+
+# Each piece of a cut at a bare boundary keeps at least this many timed characters. This is
+# what tells a pause from a drawn-out syllable, which no acoustic measure here could: every
+# bare boundary the checker kept with an onset gap of 0.4 s or more had one or two characters
+# on one side -- a held syllable before a final particle (好痛|啊, 冷淡|㗎) or a short opener
+# (就算|莎緹拉…). Silence in the isolated vocals was tried too, and is often absent at real
+# cuts (a breath, room tone).
+PAUSE_SPLIT_MIN_CHARS = 3
+
+# A piece this short (in timed characters) needs this much more pause to be cut off, at a
+# line break or between words alike. A short exchange is easy to read as one cue, and a
+# subtitler keeps it whole across a pause that would split two full sentences: the three line
+# breaks episode 1's finished file kept whole all had a piece of 3-4 characters and a 0.44 s
+# gap (嚇唔係呀？ / 呢個係最東㗎啦？, 我唔知呀 / 唔講喇, 好痛呀 / 好難受), while every cut either
+# episode's checker made with a piece that short had 0.64 s or more (我冇事啊 / …, 喂 / …).
+SHORT_PIECE_CHARS = 4
+SHORT_PIECE_EXTRA = 0.2
+
+# The median ``peak`` each piece must reach: did the model hear most of that piece's
+# characters where it put them. The path score cannot answer this (it is high on any blank
+# the path dwells on), and a fabricated gap -- one half aligned onto audio that is not it --
+# is exactly the case to refuse. On that episode it refused one line-break candidate (a
+# 2.56 s gap with halves at 0.31 / 0.48), which turned out to hide a line missing from the
+# transcript.
+LINE_SPLIT_MIN_PEAK = 0.5
+
+# A line opening with a dash is one side of a two-speaker exchange; the dashes say the pair
+# belongs in one cue, and splitting it would leave two dangling dashes.
+_DIALOGUE_DASHES = ("-", "－", "—", "–", "─")
+
+SPLIT_MODES = ("off", "lines", "pauses")
+
+
+def split_mode(setting: str, mode: Optional[str]) -> str:
+    """What --realign_split does in a run of realign *mode*: ``off``, ``lines`` or ``pauses``.
+
+    ``auto`` is ``pauses`` in mode adjust and ``off`` otherwise.
+    """
+    if setting == "auto":
+        return "pauses" if mode == "adjust" else "off"
+    return setting
+
+
+@dataclass
+class _Cut:
+    """Where to split a cue: text before ``head_to`` and from ``tail_from``, words likewise."""
+    head_to: int
+    tail_from: int
+    word: int
+    gap: float
+    last: dict
+    first: dict
+    kind: str
+
+
+def _find_cut(
+    segment: Mapping, line_gap: float, pause_gap: Optional[float], split_chars: set,
+) -> Optional[_Cut]:
+    """The best place to split *segment*, or None. A line break wins over a bare pause."""
+    from cantocaptions_ai.pipeline.align_checks import _word_offsets
+
+    text = str(segment.get("text", ""))
+    words = list(segment.get("words") or [])
+    if not words:
+        return None
+    offsets = _word_offsets(text, words)
+    if offsets is None:
+        return None
+
+    def real(ws):
+        return [w for w in ws if w.get("start") is not None and w.get("end") is not None
+                and str(w.get("word", "")).strip() not in split_chars]
+
+    def heard(ws) -> bool:
+        peaks = [w["peak"] for w in ws if w.get("peak") is not None]
+        return bool(peaks) and float(np.median(peaks)) >= LINE_SPLIT_MIN_PEAK
+
+    def acceptable(head, tail, head_text, tail_text) -> bool:
+        if head_text.lstrip().startswith(_DIALOGUE_DASHES) \
+                or tail_text.lstrip().startswith(_DIALOGUE_DASHES):
+            return False
+        if not (heard(head) and heard(tail)):
+            return False
+        # Neither piece may be smeared: longer than its text could be spoken in.
+        if any(float(ws[-1]["end"]) - float(ws[0]["start"]) > _plausible_span(t)
+               for ws, t in ((head, head_text), (tail, tail_text))):
+            return False
+        return float(tail[0]["start"]) < float(segment["end"])
+
+    def needed(base: float, head, tail) -> float:
+        short = min(len(head), len(tail)) <= SHORT_PIECE_CHARS
+        return base + (SHORT_PIECE_EXTRA if short else 0.0)
+
+    for at in (k for k, ch in enumerate(text) if ch == "\n"):
+        cut = next((k for k, (lo, _hi) in enumerate(offsets) if lo > at), len(words))
+        head, tail = real(words[:cut]), real(words[cut:])
+        if not head or not tail:
+            continue
+        gap = float(tail[0]["start"]) - float(head[-1]["end"])
+        if gap < needed(line_gap, head, tail):
+            continue
+        # A run of a character or two sitting far from the rest is what a misplaced token
+        # looks like (MAX_DETACHED_RUN): tighten_cue_spans already declined to trust one
+        # beyond MAX_INTERNAL_GAP, so a cue must not be built around it here either.
+        if min(len(head), len(tail)) <= MAX_DETACHED_RUN and gap > MAX_INTERNAL_GAP:
+            continue
+        if acceptable(head, tail, text[:at], text[at + 1:]):
+            return _Cut(at, at + 1, cut, gap, head[-1], tail[0], "line")
+
+    if pause_gap is None:
+        return None
+    best: Optional[_Cut] = None
+    for i in range(len(words) - 1):
+        p, n = words[i], words[i + 1]
+        # Only two timed characters written directly against each other: anything between
+        # them (punctuation, a space, the line break) is handled above or not at all, and an
+        # untimed character between them would count its own duration as pause.
+        if offsets[i][1] != offsets[i + 1][0] or not real([p]) or not real([n]):
+            continue
+        gap = float(n["start"]) - float(p["start"])
+        if gap < pause_gap or (best is not None and gap <= best.gap):
+            continue
+        head, tail = real(words[:i + 1]), real(words[i + 1:])
+        if min(len(head), len(tail)) < PAUSE_SPLIT_MIN_CHARS:
+            continue
+        if gap < needed(pause_gap, head, tail):
+            continue
+        at = offsets[i + 1][0]
+        if acceptable(head, tail, text[:at], text[at:]):
+            best = _Cut(at, at, i + 1, gap, p, n, "pause")
+    return best
+
+
+def split_at_pauses(
+    segments: Sequence[dict],
+    *,
+    mode: str = "pauses",
+    line_gap: float = LINE_SPLIT_GAP,
+    pause_gap: float = PAUSE_SPLIT_GAP,
+    align_padding: float = 0.04,
+    align_release: float = 0.4,
+    split_chars: Sequence[str] = REALIGN_PUNCTUATION.split_chars,
+) -> Tuple[List[dict], int]:
+    """Split cues where the audio puts a real pause: at line breaks, and with ``mode``
+    ``pauses`` also between two characters written together.
+
+    A line break is always preferred: one that qualifies is cut before any bare boundary is
+    considered, and each piece is then tested again. The tail starts on its own first
+    character, and the head ends the way alignment ends any cue followed by a pause: released
+    ``align_release`` past its last character, and stopping ``align_padding`` short of the
+    tail. Nothing outside the cue moves -- the head keeps the cue's start and the tail its
+    end -- so the non-overlap guarantee survives. A cue carrying a ``realign_reason`` is never
+    split: its timing is already in doubt, and a cut placed on doubtful timings is a second
+    error rather than a repair.
+
+    Returns the new cue list (split cues are copies; others are passed through) and how many
+    cuts were made.
+    """
+    from cantocaptions_ai.utils.schema import add_note
+
+    if mode == "off":
+        return list(segments), 0
+    split = set(split_chars)
+    out: List[dict] = []
+    cuts = {"line": 0, "pause": 0}
+    pending = list(segments)
+    while pending:
+        segment = pending.pop(0)
+        found = None if segment.get("realign_reason") else _find_cut(
+            segment, line_gap, pause_gap if mode == "pauses" else None, split)
+        if found is None:
+            out.append(segment)
+            continue
+        text = str(segment["text"])
+        words = list(segment.get("words") or [])
+        chars = segment.get("chars")
+        chars = list(chars) if chars is not None and len(chars) == len(text) else None
+        tail_start = float(found.first["start"])
+        last_end = float(found.last["end"])
+        # At a bare boundary the last character's span already runs up to the tail (the
+        # trellis folds the pause into it), so the release is capped at the tail either way.
+        head_end = max(min(last_end, tail_start - align_padding),
+                       min(last_end + align_release, tail_start - align_padding))
+        note = f"split_{found.kind}:{found.gap:.1f}s"
+
+        def piece(lo: int, hi: Optional[int], word_lo: int, word_hi: Optional[int],
+                  start: float, end: float) -> dict:
+            out_seg = dict(segment)
+            out_seg["text"] = text[lo:hi].strip()
+            out_seg["words"] = words[word_lo:word_hi]
+            if chars is not None:
+                out_seg["chars"] = chars[lo:hi]
+            elif "chars" in segment:
+                out_seg["chars"] = None
+            out_seg["start"], out_seg["end"] = round(start, 3), round(end, 3)
+            out_seg["notes"] = list(segment.get("notes") or [])
+            add_note(out_seg, note)
+            return out_seg
+
+        # Both pieces go back for another look: each may hold another qualifying cut.
+        pending[:0] = [
+            piece(0, found.head_to, 0, found.word, float(segment["start"]), head_end),
+            piece(found.tail_from, None, found.word, None, tail_start, float(segment["end"])),
+        ]
+        cuts[found.kind] += 1
+    total = cuts["line"] + cuts["pause"]
+    if total:
+        logger.info(
+            "Split %d cue(s) where the audio pauses: %d at a line break, %d between two "
+            "words", total, cuts["line"], cuts["pause"],
+        )
+    return out, total
+
+
+def hold_to_placement(
+    segments: List[dict], tolerance: Optional[float], align_padding: float = 0.04,
+) -> int:
+    """Put back any cue the final alignment moved further than *tolerance* from its placement.
+
+    Mode adjust bounds every cue to a leash around the transform, and the placement honours
+    it (clamp_to_prior). The final alignment re-aligns the same lines in differently-cut
+    chunks with no such bound, and a line at the edge of a chunk can be pulled across a
+    pause into whatever the chunk holds. Measured on a ReZero broadcast episode: the final
+    alignment moves the median cue 0.000 s from its placement, and of the moves over 1 s
+    whose truth is known, the three over 2 s were all wrong (2.1-2.8 s early; the placement
+    was within 0.1 s) while the two under it were corrections. So the leash is the line.
+
+    The cue takes its placement back, ending short of the next cue, and is flagged
+    ``off_prior`` unless it already has a reason. ``realign_placement`` is removed from
+    every cue either way; it is bookkeeping, not output. Returns the number held.
+    """
+    held = 0
+    for k, seg in enumerate(segments):
+        placement = seg.pop("realign_placement", None)
+        if tolerance is None or placement is None:
+            continue
+        start, end = placement
+        if abs(seg["start"] - start) <= tolerance:
+            continue
+        nxt = segments[k + 1]["start"] if k + 1 < len(segments) else None
+        if nxt is not None and end > nxt - align_padding:
+            end = max(start + MIN_VISIBLE_DURATION, nxt - align_padding)
+        seg["start"], seg["end"] = round(start, 3), round(end, 3)
+        seg.setdefault("realign_reason", REASON_OFF_PRIOR)
+        held += 1
+    if held:
+        logger.info(
+            "%d cue(s) were moved further than %.1fs by the final alignment and were put "
+            "back where the placement had them", held, tolerance,
+        )
+    return held
 
 
 def enforce_cue_order(segments: List[dict]) -> int:

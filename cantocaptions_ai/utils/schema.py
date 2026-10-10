@@ -108,6 +108,20 @@ class SingleSegment(TypedDict):
     # it is fine). Carried through alignment onto the finished cue so the reason survives to
     # something the user can watch; see realign.REASON_HELP.
     cue_reasons: NotRequired[List[Optional[str]]]
+    # The subtitle override blocks each of those cues opened with (``{\an8}``), index-aligned
+    # with cue_spans ("" where none). Carried onto the finished cue as ``style_tags``.
+    cue_styles: NotRequired[List[str]]
+    # A cue's leading subtitle override blocks, verbatim (``{\an8}``); see SingleAlignedSegment.
+    style_tags: NotRequired[str]
+    # The text is spoken over other speech (a top-of-screen cue), so alignment may pass over
+    # that speech as filler; see alignment.concurrent_emission.
+    concurrent: NotRequired[bool]
+    # (start, end) spans where speech not in this text is known to be (the top-of-screen
+    # cues, for the main track); alignment may pass over those frames as filler.
+    filler_spans: NotRequired[List[Tuple[float, float]]]
+    # Where --realign placed each cue, index-aligned with cue_spans. Carried onto the cue as
+    # ``realign_placement`` so mode adjust can hold the final alignment to its leash.
+    cue_placements: NotRequired[List[Tuple[float, float]]]
 
 
 class SegmentData(TypedDict):
@@ -154,6 +168,10 @@ class SingleAlignedSegment(TypedDict):
     # debug.write_segment_notes into notes.srt, and deliberately open-ended so a new stage
     # needs no new field. First user: align_vocab's character substitutions.
     notes: NotRequired[List[str]]
+    # The subtitle override blocks this cue opened with in a --realign input (``{\an8}``),
+    # verbatim. Kept out of ``text`` so neither the aligner nor the proofreader ever sees
+    # them; the SRT writer puts them back in front of the text.
+    style_tags: NotRequired[str]
 
 
 class TranscriptionResult(TypedDict):
@@ -223,6 +241,10 @@ class ProcessingItem(TypedDict):
     # reused by alignment so the encoder runs once rather than twice. Not serialisable and
     # never checkpointed; see realign.EmissionTimeline.
     emission_timeline: NotRequired[object]
+    # Finished top-of-screen cues (``{\an8}``) from --realign sync/adjust, kept apart from
+    # ``result`` until the writer: they may overlap the main cues by design, and cue assembly,
+    # diarization and the order/overlap repairs all assume a single non-overlapping track.
+    overlay_segments: NotRequired[List[SingleAlignedSegment]]
 
 
 def item_name(item: dict) -> str:

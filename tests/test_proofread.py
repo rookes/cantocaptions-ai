@@ -755,9 +755,16 @@ class TestInterrupt(unittest.TestCase):
                 mock.patch.object(providers, "open_cache", return_value=None), \
                 self.assertRaises(KeyboardInterrupt):
             Proofreader(settings(chunk_cues=4)).run("ep", segs, save_dir=str(out))
-        release.set()
+        # What is on disk when the interrupt lands. Checked *before* the hung request is
+        # released: the abandoned daemon thread then saves its own answer as soon as it
+        # arrives, and whether that write beats an assertion made after release.set() is up
+        # to the scheduler (it did on a Linux CI runner).
         self.assertTrue((out / "chunk_00.json").is_file())          # paid for, so kept
         self.assertFalse((out / "chunk_01.json").exists())
+        release.set()
+        for t in threading.enumerate():     # let it finish before the temp dir is removed
+            if t.name.startswith("proofread-"):
+                t.join(5)
 
 
 class TestBookmarks(unittest.TestCase):

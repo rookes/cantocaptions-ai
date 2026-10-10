@@ -217,6 +217,20 @@ class PipelineConfig:
     # Mode adjust only: how far forced alignment may move a cue from its transform position
     # before the transform wins. Widened automatically when the transform fits only loosely.
     realign_adjust_tolerance: float = 2.0
+    # Split a cue where the audio pauses inside it (and the aligner heard both sides). A
+    # subtitler often holds two sentences on screen as one cue across the pause between them.
+    #   pauses -- at a line break with realign_split_gap of silence behind it, and between two
+    #             words written together at least realign_pause_gap apart, each piece keeping
+    #             three characters or more. A piece of four characters or fewer needs 0.2 s
+    #             more pause. A line break that qualifies is always cut first.
+    #   lines  -- at line breaks only
+    #   off    -- never
+    #   auto   -- pauses in mode adjust, which already distrusts the input's own timing; off
+    #             otherwise. Mode sync runs no alignment, so nothing is split there.
+    # A dashed two-speaker pair is never split. See realign.split_at_pauses.
+    realign_split: str = "auto"
+    realign_split_gap: float = 0.3
+    realign_pause_gap: float = 0.7
     # Fold the input's punctuation into the forms the aligner can use (halfwidth marks beside
     # Chinese text to fullwidth, any ellipsis to U+2026). On by default because most such
     # marks are typing slips and because the aligner spends a real pause on the result. Turn
@@ -470,7 +484,8 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     ),
     "realign": (
         "realign", "realign_mode", "realign_max_scale", "realign_cut_policy",
-        "realign_adjust_tolerance", "realign_normalize", "realign_sync_anchor_density",
+        "realign_adjust_tolerance", "realign_split", "realign_split_gap", "realign_pause_gap",
+        "realign_normalize", "realign_sync_anchor_density",
         "realign_anchor", "realign_window", "realign_commit_margin", "realign_min_score",
     ),
     "proofreading": (

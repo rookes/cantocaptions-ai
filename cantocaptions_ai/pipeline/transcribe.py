@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import heapq
 import os
 import time
 import warnings
@@ -153,8 +154,7 @@ def _merge_and_write(
             audio_path = display_paths.get(audio_path, audio_path)
         result["language"] = align_language
 
-        new_segments = assemble_cues(
-            result["segments"],
+        assembly = dict(
             punctuation=punctuation,
             segmentation=segmentation,
             align_merge_distance=align_merge_distance,
@@ -167,6 +167,14 @@ def _merge_and_write(
             merge=merge,
             max_cue_duration=max_cue_duration,
         )
+        new_segments = assemble_cues(result["segments"], **assembly)
+        if item.get("overlay_segments"):
+            # Top-of-screen cues (realign.split_tracks) are assembled as a track of their
+            # own, so the duration floor's non-overlap guarantee holds within each track,
+            # and only then interleaved by start: overlapping the main line is their point.
+            # A merge, not a sort -- it never reorders the main track among itself.
+            overlay = assemble_cues(item["overlay_segments"], **assembly)
+            new_segments = list(heapq.merge(new_segments, overlay, key=lambda s: s["start"]))
 
         if order_cues and debug_dir is not None:
             # After assembly so the timings and text are the ones that shipped, and before
@@ -314,11 +322,11 @@ def _proofread_realign_input(cfg, proofreader, precleaner=None, collect: bool = 
     """
     import tempfile
     from cantocaptions_ai.utils.output import WriteSRT
-    from cantocaptions_ai.utils.subtitles import read_subtitle_cues
+    from cantocaptions_ai.utils.subtitles import cue_segment, read_subtitle_cues
 
     src = cfg.realign
     stem = os.path.splitext(os.path.basename(src))[0]
-    segments = [{"start": c.start, "end": c.end, "text": c.text} for c in read_subtitle_cues(src)]
+    segments = [cue_segment(c) for c in read_subtitle_cues(src)]
     result = {"segments": segments, "language": cfg.language}
     out_dir = tempfile.mkdtemp(prefix="cantocaptions-proofread-") if collect else cfg.output_dir
     os.makedirs(out_dir, exist_ok=True)
@@ -511,7 +519,7 @@ def proofread_files(paths: List[str], cfg, names: Optional[Dict[str, str]] = Non
     from cantocaptions_ai.languages import get_language_pack
     from cantocaptions_ai.pipeline.proofread import load_proofreader
     from cantocaptions_ai.utils.output import output_names
-    from cantocaptions_ai.utils.subtitles import read_subtitle_cues
+    from cantocaptions_ai.utils.subtitles import cue_segment, read_subtitle_cues
 
     pack = get_language_pack(cfg.language)
     profile = pack.resolve(cfg.model)
@@ -537,8 +545,7 @@ def proofread_files(paths: List[str], cfg, names: Optional[Dict[str, str]] = Non
     for path in paths:
         name = names[path]
         # Line breaks kept: inside a cue one usually marks a change of speaker.
-        segments = [{"start": c.start, "end": c.end, "text": c.text}
-                    for c in read_subtitle_cues(path)]
+        segments = [cue_segment(c) for c in read_subtitle_cues(path)]
         result = {"segments": segments, "language": cfg.language}
         marks = _proofread(proofreader, name, result, reference_cues, cleaner, layout,
                            cfg.debug_dir, cfg.load_debug_dir, output_dir=cfg.output_dir,
@@ -872,6 +879,14 @@ def validate_config(cfg) -> None:
                 f"realign_adjust_tolerance must be positive, got "
                 f"{cfg.realign_adjust_tolerance}"
             )
+        if cfg.realign_split not in ("auto", "pauses", "lines", "off"):
+            raise ConfigError(
+                "realign_split must be 'auto', 'pauses', 'lines' or 'off', got "
+                f"{cfg.realign_split!r}"
+            )
+        for name in ("realign_split_gap", "realign_pause_gap"):
+            if getattr(cfg, name) <= 0:
+                raise ConfigError(f"{name} must be positive, got {getattr(cfg, name)}")
         mode = resolve_realign_mode(cfg.realign, cfg.realign_mode)
         if mode in ("sync", "adjust") and not subtitle_has_timings(cfg.realign):
             raise ConfigError(

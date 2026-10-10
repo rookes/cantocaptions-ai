@@ -113,6 +113,47 @@ class Segment:
 # --- Low-level CTC alignment ---
 # source: https://docs.pytorch.org/audio/stable/tutorials/forced_alignment_tutorial.html
 
+def filler_mask(frame_times, spans: Sequence[Sequence[float]]) -> Optional[torch.Tensor]:
+    """Which frames of *frame_times* fall inside any of *spans*, or None if none do."""
+    if not spans or frame_times is None or not len(frame_times):
+        return None
+    times = torch.as_tensor(np.asarray(frame_times, dtype=np.float64))
+    mask = torch.zeros(len(times), dtype=torch.bool)
+    for start, end in spans:
+        mask |= (times >= float(start)) & (times < float(end))
+    return mask if bool(mask.any()) else None
+
+
+def concurrent_emission(emission: torch.Tensor, tokens: Sequence[int], blank_id: int,
+                        mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """*emission* for aligning a line spoken *over* other speech (a ``{\\an8}`` cue).
+
+    The trellis charges every frame a line does not occupy at the *blank* probability, which
+    is right when the rest of the audio is silence and badly wrong when it is someone else
+    talking: the main line's frames are expensive as blank, so the cheapest path finishes
+    the background line before the main speech starts -- at the window's edge, wherever the
+    line was really said. Here any frame may instead be passed over as *filler*, at the cost
+    of the best token that is not in this line. Other speech then costs nothing to pass, and
+    the line's own characters still have to land where they are heard. Only the blank
+    column changes, so per-character peaks and spot-checks read the emission as it was.
+
+    ``mask`` (one bool per frame) limits this to the frames where other speech is known to
+    be. The main track uses it over the spans of the top-of-screen cues it no longer holds:
+    that speech used to be consumed by those lines in sequence, and without them it was
+    expensive dead air that pulled the next main line back across it (2.3 s, measured).
+    """
+    own = set(int(t) for t in tokens) | {blank_id}
+    others = [i for i in range(emission.size(1)) if i not in own]
+    if not others:
+        return emission
+    out = emission.clone()
+    filler = torch.maximum(emission[:, blank_id], emission[:, others].max(dim=1).values)
+    if mask is not None:
+        filler = torch.where(mask.to(filler.device), filler, emission[:, blank_id])
+    out[:, blank_id] = filler
+    return out
+
+
 def get_trellis(emission, tokens, blank_id=0, free_end: bool = False):
     """Forced-alignment trellis over *emission* for *tokens*.
 
@@ -820,6 +861,12 @@ def _align_segment(
     split_chars = punctuation.split_chars
     tokens = [model_dictionary[c] if c not in split_chars else spacing_char_id for c in text_clean]
 
+    if segment.get("concurrent"):
+        emission = concurrent_emission(emission, tokens, blank_id)
+    elif segment.get("filler_spans"):
+        mask = filler_mask(frame_times, segment["filler_spans"])
+        if mask is not None and len(mask) == emission.size(0):
+            emission = concurrent_emission(emission, tokens, blank_id, mask=mask)
     trellis = get_trellis(emission, tokens, blank_id)
     path = backtrack(trellis, emission, tokens, blank_id)
 
@@ -982,6 +1029,12 @@ def _align_segment(
         cue_reasons = segment.get("cue_reasons")
         if cue_reasons and sdx2 < len(cue_reasons) and cue_reasons[sdx2]:
             subsegment["realign_reason"] = cue_reasons[sdx2]
+        cue_styles = segment.get("cue_styles")
+        if cue_styles and sdx2 < len(cue_styles) and cue_styles[sdx2]:
+            subsegment["style_tags"] = cue_styles[sdx2]
+        cue_placements = segment.get("cue_placements")
+        if cue_placements and sdx2 < len(cue_placements):
+            subsegment["realign_placement"] = tuple(cue_placements[sdx2])
         if avg_logprob is not None:
             subsegment["avg_logprob"] = avg_logprob
         aligned_subsegments.append(subsegment)
@@ -999,10 +1052,12 @@ def _align_segment(
     aligned_subsegments["end"] = interpolate_nans(aligned_subsegments["end"], method=interpolate_method)
 
     # Concatenate sentences with same timestamps
-    if "realign_reason" not in aligned_subsegments.columns:
-        aligned_subsegments["realign_reason"] = None
+    for column in ("realign_reason", "style_tags", "realign_placement"):
+        if column not in aligned_subsegments.columns:
+            aligned_subsegments[column] = None
     agg_dict = {"text": " ".join, "words": "sum", "release_from": "first",
-                "realign_reason": "first"}
+                "realign_reason": "first", "style_tags": "first",
+                "realign_placement": "first"}
     if not _spaced(model_lang, script):
         agg_dict["text"] = "".join
     if return_char_alignments:
@@ -1015,8 +1070,11 @@ def _align_segment(
     for row in records:
         # A column of Nones comes back from groupby as NaN, and NaN is *truthy* -- test the
         # type, not the value, or every cue in the file ends up carrying a float "reason".
-        if not isinstance(row.get("realign_reason"), str) or not row["realign_reason"]:
-            row.pop("realign_reason", None)
+        for column in ("realign_reason", "style_tags"):
+            if not isinstance(row.get(column), str) or not row[column]:
+                row.pop(column, None)
+        if not isinstance(row.get("realign_placement"), tuple):
+            row.pop("realign_placement", None)
     return records
 
 

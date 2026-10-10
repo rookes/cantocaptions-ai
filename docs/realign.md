@@ -72,6 +72,147 @@ the 7 two-line cues are dashed two-speaker exchanges. The mechanism is one entry
 changes. It cannot split a cue, because `_get_sentence_spans` is never consulted under
 `--realign`.
 
+**Splitting a cue where the audio pauses (`--realign_split`).** A subtitler often holds two
+sentences on screen as one cue across the pause between them, as two lines or run together
+on one. `split_at_pauses` (run after stage-4 alignment, on the final character timings) cuts
+a cue where the audio agrees, trying the input's own line breaks first:
+
+* **at a line break** when the gap between the last timed character of one line and the
+  first of the next is at least `--realign_split_gap` (0.3 s), and a half of
+  `MAX_DETACHED_RUN` characters or fewer is not split off beyond `MAX_INTERNAL_GAP` (the
+  "short and far away means misplaced" rule tightening uses);
+* **between two characters written together** (`pauses` only) when the second starts at
+  least `--realign_pause_gap` (0.7 s) after the first, and each piece keeps
+  `PAUSE_SPLIT_MIN_CHARS` (3) timed characters. Nothing written between them (punctuation,
+  a space, an untimed character) is allowed: an untimed character would count its own
+  duration as pause;
+* either way a piece of `SHORT_PIECE_CHARS` (4) timed characters or fewer needs
+  `SHORT_PIECE_EXTRA` (0.2 s) more pause, so 0.5 s at a line break and 0.9 s between words. A
+  short exchange reads easily as one cue, and a subtitler keeps it whole across a pause that
+  would split two full sentences;
+* each piece's median `peak` is at least `LINE_SPLIT_MIN_PEAK` (0.5), neither is
+  smeared (`_plausible_span`), no line opens with a dialogue dash, and the cue carries no
+  `realign_reason`. Each piece is tested again, strongest bare pause first.
+
+The tail starts on its own first character; the head ends the way any cue before a pause
+does, released `align_release` past its last character and stopping `align_padding` short
+of the tail. `auto` (the default) is `pauses` in `adjust`, whose premise is already that the
+input's own timing is not trusted, and `off` elsewhere; `lines` keeps only the first rule.
+
+**Why the onset, not the gap.** Between two characters with nothing written between them
+there is no pause token, and this trellis charges a character's held frames at the blank
+probability, so the whole silence is folded into the first character's span: the measured
+gap between the two spans is 0.00 s at 12 of the 14 bare boundaries the checker cut on
+episode 2. The time from one character's onset to the next is what carries it. Two other
+measures were tried on the same boundaries and are no better: a blank token inserted between
+the characters takes exactly the frames after the first one's onset (its span is the onset
+gap within a frame or two), and the longest near-silent run in the isolated vocals is 0.00 s
+at several real cuts -- the pause is a breath or room tone, not silence.
+
+**Why three characters a piece.** No acoustic measure here tells a pause from a drawn-out
+syllable. On episode 2 every bare boundary the checker kept with an onset gap of 0.4 s or
+more had one or two characters on one side: a held syllable before a final particle (好痛|啊,
+冷淡|㗎, 魔法|寫) or a short opener (就算|莎緹拉…).
+
+**Measured on two ReZero broadcast episodes**, each realigned in mode `adjust` from a badly
+timed copy and scored against a hand-finished one:
+
+| | line breaks | bare pauses ≥ 0.4 s | ≥ 0.5 s | ≥ 0.6 s | ≥ 0.7 s |
+|---|---|---|---|---|---|
+| ep 2 (to 07:59): cuts the checker also made / cuts made | 7 / 7 | 11 / 11 | 7 / 7 | 6 / 6 | 5 / 5 |
+| ep 1 (whole file): same | 1 / 4 → **1 / 1** | 9 / 41 | 6 / 22 | 5 / 15 | 2 / 2 |
+
+The two files disagree about pauses of 0.4-0.6 s inside a sentence and about two-line cues
+with a 0.4 s gap: episode 2's checker split those run-ons, episode 1's finished file keeps
+them whole. The line-break half of that disagreement turned out to be about length: the three
+two-line cues episode 1 kept whole at 0.44 s all had a piece of 3-4 characters (嚇唔係呀？ /
+呢個係最東㗎啦？, 我唔知呀 / 唔講喇, 好痛呀 / 好難受), while every cut either checker made with a
+piece that short had 0.64 s or more (我冇事啊 / …, 喂 / …). The short-piece margin removes
+exactly those three and changes nothing else: episode 2's output is byte-identical with and
+without it, and episode 1 goes from 2 of 5 cuts matching to 2 of 2. The bare-pause half is
+editorial rather than acoustic, so the default sits at 0.7 s,
+where both files agree on every cut (7 of 7). `--realign_pause_gap 0.4` is the episode-2
+reading and finds over twice as many of its cuts. Most of episode 1's own 67 hand cuts are
+out of reach by design: they split off a one- or two-character interjection (呀|冇問題,
+哦|通常…), which the three-character rule refuses. Timing is unaffected either way: start
+error against the finished file is identical with and without splitting.
+
+On episode 2 the line-break rule reproduced every hand split, with every edge within 0.1 s of
+the hand timing (starts within 0.03 s). The peak gate refused one candidate (a 2.56 s gap,
+halves at 0.31 / 0.48); the checker later found a line missing from the transcript inside
+that gap.
+
+**Top-of-screen cues (`{\an8}`) are a track of their own under `sync` and `adjust`.** The
+override block is read off the cue (`SubtitleCue.style`), kept out of the text the aligner
+and proofreader see, and written back by the SRT writer (WebVTT gets `line:0`). Such a cue
+is almost always background speech running concurrently with the main line, and everything
+in this module assumes one ordered, non-overlapping stream, so in sequence it was a line out
+of order: the anchor search read it with its neighbours, forced alignment put it before or
+after the cue it overlaps, and `map_cues`' overlap trim cut the main cue short where it began.
+
+`split_tracks` takes them out before the anchor search; the main track is fitted and placed
+as if they were absent. Each top cue is then mapped through the main fit on its own
+(`_overlay_transform` empties `Transform.ids` and re-derives each cut's `cue_indices`, since
+both number the *main* track's lines), and under `adjust` forced-aligned alone inside the
+same leash and clamped to its prior. Its alignment chunks are separate, and the finished cues
+travel on `item["overlay_segments"]`, are assembled as their own track, and are interleaved
+by start only at the writer (`heapq.merge`, never a sort, so the main track's order cannot be
+touched). Under `transcript` there is no prior to place a concurrent line by, so a top cue
+stays in sequence and only its tag is carried.
+
+> **A line spoken over other speech needs `concurrent_emission`.** The trellis charges every
+> frame a line does not occupy at the *blank* probability. That is right over silence and
+> wrong over someone else talking: the main line's frames are expensive as blank, so the
+> cheapest path finishes the background line *before* the main speech starts, at the edge
+> of its window, whatever was really said where. Concurrent segments may pass over any
+> frame as filler at the cost of the best token not in the line. Only the blank column
+> changes, so peaks and spot-checks are unaffected.
+
+**Chunk reach under `adjust`.** `build_align_input` used to put each chunk boundary in the
+middle of the gap between two lines and cap the chunk at `chunk_size` from its start. On the
+same ReZero episode, the line after the 93 s opening was given the chunk [109.1, 137.1] while
+placed at 155.95: the chunk ended 19 s before the line began, and forced alignment put it in
+the theme song, 46 s early. The placement itself was right (−0.03 s from its prior); only
+stage 4 moved it. Two changes:
+
+* the `chunk_size` cap now comes out of the silence before a group's lines, never the lines
+  (all modes: a chunk that does not hold its own line is wrong in any mode);
+* `reach` caps how far into a gap a chunk extends from the line beside it. `adjust` passes
+  its leash, so a chunk never holds more of an empty stretch than the transform allows the
+  cue to move into. `transcript` keeps the midpoint until it is re-measured on the fixtures.
+
+* under a reach, a gap wider than twice it also ends the chunk (the cut `bracket_blocks`
+  already makes for the placement), so no chunk holds a wide gap in its middle either.
+
+This is a contract fix rather than a scoring one. The leash already *is* adjust's bound on a
+move; the fault was that stage 4 did not honour it. **`hold_to_placement` closes it at the
+last step**: each cue's placement rides through alignment (`cue_placements` →
+`realign_placement`), and a cue the final alignment moved further than the leash takes its
+placement back, flagged `off_prior`. Stage 4 moves the median cue 0.000 s from its
+placement on that episode; of the moves over 1 s whose truth is known, the three over 2 s
+were all wrong (2.1-2.8 s early, placement within 0.1 s) and the two under it were
+corrections (+1.6 s, +1.7 s), so the leash is where the line falls.
+
+**The main track passes over the top-of-screen speech too.** Taking `{\an8}` lines out of
+the sequence leaves their speech in the main track's audio with nothing to consume it, and
+it pulled the next main line back across it (奇怪喇 and 嚟唔切喇, 2.2-2.3 s early). The main
+track's chunks and its placement fill therefore carry `filler_spans` (the top cues'
+placements, or their source spans mapped through the transform) and apply
+`concurrent_emission` on those frames only.
+
+**Measured end to end on that episode against the hand-corrected file (to 07:23, 119 cues):**
+
+| | cues | worst start error | start p90 | top cues tagged | hand splits made |
+|---|---|---|---|---|---|
+| before | 398 | 46.80 s | 0.067 s | 0 of 5 | 0 of 6 |
+| after | 413 | 0.67 s | 0.059 s | 5 of 5 | 6 of 6 (3 of 3 refusals agree) |
+
+Three cues got worse: 奇怪喇 (+0.09 → −0.67 s; the background line before it ends 啦, which
+competes for its 喇, and it is flagged `isolated`), 着住嘅運動衫… (−0.02 → +0.14 s) and 激氣啊
+(0.00 → +0.06 s, held to its placement). Past the hand-checked part, three more cues moved
+2-42 s, each onto its own source position (the 42 s one was the same wide-gap fault before
+the ending).
+
 ## Fitting the transform between two releases (pipeline/timefit.py)
 
 `sync` and `adjust` both rest on one question: given the lines we are confident about, what is

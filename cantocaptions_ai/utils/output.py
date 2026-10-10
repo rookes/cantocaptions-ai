@@ -307,7 +307,8 @@ class SubtitlesWriter(ResultWriter):
             segment_start = self.format_timestamp(segment["start"])
             segment_end = self.format_timestamp(segment["end"])
             segment_text = segment["text"].strip().replace("-->", "->")
-            yield segment_start, segment_end, _with_speaker(segment, segment_text, options)
+            yield (segment_start, segment_end, _with_speaker(segment, segment_text, options),
+                   segment.get("style_tags") or "")
 
     def format_timestamp(self, seconds: float):
         return format_timestamp(
@@ -323,9 +324,14 @@ class WriteVTT(SubtitlesWriter):
     decimal_marker: str = "."
 
     def write_result(self, result: dict, file: TextIO, options: dict):
+        from cantocaptions_ai.utils.subtitles import is_top_position
+
         print("WEBVTT\n", file=file)
-        for start, end, text in self.iterate_result(result, options):
-            print(f"{start} --> {end}\n{text}\n", file=file, flush=True)
+        for start, end, text, style in self.iterate_result(result, options):
+            # WebVTT has no override blocks; its own way of saying "top of the frame" is a
+            # cue setting. Any other ASS styling has no equivalent and is dropped.
+            settings = " line:0" if is_top_position(style) else ""
+            print(f"{start} --> {end}{settings}\n{text}\n", file=file, flush=True)
 
 
 class WriteSRT(SubtitlesWriter):
@@ -334,10 +340,12 @@ class WriteSRT(SubtitlesWriter):
     decimal_marker: str = ","
 
     def write_result(self, result: dict, file: TextIO, options: dict):
-        for i, (start, end, text) in enumerate(
+        for i, (start, end, text, style) in enumerate(
             self.iterate_result(result, options), start=1
         ):
-            print(f"{i}\n{start} --> {end}\n{text}\n", file=file, flush=True)
+            # The override blocks go back exactly as the input had them (``{\an8}``); players
+            # that read SRT honour them, and the rest show the text as before.
+            print(f"{i}\n{start} --> {end}\n{style}{text}\n", file=file, flush=True)
 
 
 def _single_line(text: str) -> str:
