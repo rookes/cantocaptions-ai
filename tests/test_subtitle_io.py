@@ -8,8 +8,11 @@ fixture 5 of the 7 two-line cues are two-speaker dialogue pairs -- so the round 
 
 import pytest
 
+from cantocaptions_ai.utils.output import WriteSRT, WriteVTT
 from cantocaptions_ai.utils.subtitles import (
     SubtitleFormatError,
+    cue_segment,
+    is_top_position,
     load_subtitle_file,
     read_subtitle_cues,
     strip_markup,
@@ -156,3 +159,67 @@ def test_has_timings_false_for_a_plain_transcript(tmp_path):
 def test_has_timings_tests_content_not_only_extension(tmp_path):
     # A transcript saved as .srt must not be "synced" against timings it does not have.
     assert not subtitle_has_timings(_write(tmp_path, "a.srt", "one\ntwo\n"))
+
+
+# --- Position tags -------------------------------------------------------------------
+#
+# {\an8} is not styling: it says where the whole cue goes, and on a subtitle it almost always
+# marks background speech running concurrently with the main line. Stripping it moved those
+# cues onto the main line, where they collide with whatever is said there.
+
+TOP_SRT = (
+    "1\n00:00:01,000 --> 00:00:03,000\n主線\n\n"
+    "2\n00:00:01,500 --> 00:00:02,500\n{\\an8}背景對白\n\n"
+)
+
+
+def test_a_leading_override_block_is_kept_apart_from_the_text(tmp_path):
+    cues = read_subtitle_cues(_write(tmp_path, "a.srt", TOP_SRT))
+    assert [c.style for c in cues] == ["", r"{\an8}"]
+    assert cues[1].text == "背景對白"
+
+
+def test_only_the_cue_opening_counts_as_its_style(tmp_path):
+    srt = "1\n00:00:01,000 --> 00:00:02,000\n第一行\n{\\an8}第二行\n\n"
+    cue = read_subtitle_cues(_write(tmp_path, "a.srt", srt))[0]
+    assert cue.style == ""
+    assert cue.text == "第一行\n第二行"
+
+
+@pytest.mark.parametrize("style, top", [
+    (r"{\an8}", True), (r"{\an7}", True), (r"{\an9}", True), (r"{\fs20\an8}", True),
+    (r"{\a6}", True), (r"{\an2}", False), (r"{\an5}", False), (r"{\a10}", False),
+    (r"{\i1}", False), ("", False),
+])
+def test_top_positions_are_recognised(style, top):
+    assert is_top_position(style) is top
+
+
+def test_cue_segment_carries_the_style(tmp_path):
+    cues = read_subtitle_cues(_write(tmp_path, "a.srt", TOP_SRT))
+    assert "style_tags" not in cue_segment(cues[0])
+    assert cue_segment(cues[1])["style_tags"] == r"{\an8}"
+
+
+def _written(writer, segments, tmp_path):
+    writer(str(tmp_path))({"segments": segments, "language": "yue"}, "out", {})
+    return (tmp_path / f"out.{writer.extension}").read_text(encoding="utf-8")
+
+
+def test_srt_writer_puts_the_override_block_back(tmp_path):
+    segments = [{"start": 1.0, "end": 3.0, "text": "主線"},
+                {"start": 1.5, "end": 2.5, "text": "背景對白", "style_tags": r"{\an8}"}]
+    out = _written(WriteSRT, segments, tmp_path)
+    assert "\n{\\an8}背景對白\n" in out
+    assert "\n主線\n" in out
+    # ...and the round trip reads it back where it was.
+    assert [c.style for c in read_subtitle_cues(str(tmp_path / "out.srt"))] == ["", r"{\an8}"]
+
+
+def test_vtt_writer_says_top_with_a_cue_setting(tmp_path):
+    segments = [{"start": 1.0, "end": 3.0, "text": "主線"},
+                {"start": 1.5, "end": 2.5, "text": "背景對白", "style_tags": r"{\an8}"}]
+    out = _written(WriteVTT, segments, tmp_path)
+    assert "00:01.500 --> 00:02.500 line:0\n背景對白" in out
+    assert "{" not in out
+    assert "00:01.000 --> 00:03.000\n主線" in out

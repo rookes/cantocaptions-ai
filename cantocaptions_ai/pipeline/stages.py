@@ -367,12 +367,17 @@ def _run_realign(
     In ``sync`` mode the cues are already finished -- the transform placed them and nothing
     downstream is allowed to move them -- so the item carries them directly and is marked
     ``realign_sync`` so the caller skips alignment entirely.
+
+    Top-of-screen cues (``{\\an8}``) in sync and adjust are a track of their own (see
+    realign.split_tracks): finished ones go on ``overlay_segments``, and under adjust their
+    alignment input goes on ``realign_overlay`` for the caller to align separately.
     """
     from cantocaptions_ai.pipeline.align_profiles import DEFAULT_ALIGN_PROFILE
     from cantocaptions_ai.pipeline.alignment import compute_vad_emissions
     from cantocaptions_ai.pipeline.realign import (
-        EmissionTimeline, assign_lines, assign_lines_adjust, assign_lines_sync,
-        build_align_input, load_transcript_lines, segments_from_timings, warn_low_confidence,
+        EmissionTimeline, adjust_leash, assign_lines, assign_lines_adjust, assign_lines_sync,
+        build_align_input, load_transcript_lines, segments_from_timings, split_tracks,
+        warn_low_confidence,
     )
     from cantocaptions_ai.utils.debug import write_realign_transform
 
@@ -470,23 +475,55 @@ def _run_realign(
                 dropped, debug_dir,
             )
 
+        # Under transcript mode there is no prior to place a concurrent line by, so a top cue
+        # stays in sequence; see realign.split_tracks.
+        main, overlay = split_tracks(lines) if timed else (lines, [])
         if mode == "sync":
             # Nothing downstream may re-time these: the whole contract of sync is that the
             # subtitle's own proportions survive, and forced alignment would undo that.
-            segments = segments_from_timings(lines, timings, dropped)
+            segments = segments_from_timings(main, timings, dropped)
             result = {"segments": segments, "language": align_metadata["language"]}
-            result_items.append({**item, "result": result, "realign_sync": True})
+            extra = {"overlay_segments": segments_from_timings(overlay, timings, dropped)} \
+                if overlay else {}
+            result_items.append({**item, "result": result, "realign_sync": True, **extra})
             continue
 
-        kept = [line for line in lines if line.index not in dropped]
-        kept_timings = [t for t in timings if t.index not in dropped]
-        chunks, transcript = build_align_input(
-            kept, kept_timings, vad_segments, chunk_size,
-        )
+        # Under adjust, no chunk may hold more of a gap beside a line than the leash: the line
+        # was placed within it, and a chunk wider than that is room for forced alignment to
+        # put it somewhere the transform already ruled out. See build_align_input.
+        reach = adjust_leash(adjust_tolerance, report) if mode == "adjust" else None
+
+        by_index = {t.index: t for t in timings}
+
+        def align_input(track, concurrent=False, filler_spans=()):
+            kept = [line for line in track if line.index not in dropped]
+            kept_timings = [by_index[line.index] for line in kept]
+            return build_align_input(kept, kept_timings, vad_segments, chunk_size,
+                                     reach=reach, concurrent=concurrent,
+                                     filler_spans=filler_spans,
+                                     carry_placements=reach is not None)
+
+        # The main track no longer holds the top-of-screen lines, but their speech is still
+        # in its audio: say where, so its lines pass over it rather than being pulled into it.
+        background = [(by_index[line.index].start, by_index[line.index].end)
+                      for line in overlay if line.index not in dropped]
+        chunks, transcript = align_input(main, filler_spans=background)
         result = {"segments": transcript, "language": align_metadata["language"]}
+        extra = {"realign_leash": reach} if reach is not None else {}
+        if overlay:
+            # Its own chunks, aligned on their own: the two tracks overlap by design, and
+            # align()'s release/trim pass would otherwise cut each main cue short at the top
+            # cue beginning inside it. Concurrent, because the main line is talking under it.
+            overlay_chunks, overlay_transcript = align_input(overlay, concurrent=True)
+            extra["realign_overlay"] = {
+                **item, "vad_segments": overlay_chunks,
+                "result": {"segments": overlay_transcript,
+                           "language": align_metadata["language"]},
+                "emission_timeline": timeline,
+            }
         result_items.append({
             **item, "vad_segments": chunks, "result": result,
-            "emission_timeline": timeline,
+            "emission_timeline": timeline, **extra,
         })
     return result_items
 
@@ -848,6 +885,34 @@ class VocalIsolationStage(CachedStage):
 
 # --- Realign, acoustic anchor: replaces ASR through alignment ------------------------------
 
+def _finish_realigned(segments: List[dict], cfg, split: str,
+                      leash: Optional[float] = None) -> List[dict]:
+    """The fixups every realigned track gets after forced alignment, in order.
+
+    The leash (mode adjust) is held after tightening, which can only move edges inwards,
+    and before the split, which must not cut a cue whose timing was just put back. The line
+    split measures the pause between the characters that actually set the cue's edges, and
+    runs before the visibility repair, so a piece it makes gets the same duration guarantee
+    as any other cue. Sentinels go last: the split needs the words to line up with the
+    text, sentinel included.
+    """
+    from cantocaptions_ai.pipeline.realign import (
+        ensure_visible_cues, hold_to_placement, split_at_pauses, strip_sentinels,
+        tighten_cue_spans,
+    )
+
+    tighten_cue_spans(segments)
+    hold_to_placement(segments, leash, cfg.align_padding)
+    segments, _cuts = split_at_pauses(
+        segments, mode=split, line_gap=cfg.realign_split_gap,
+        pause_gap=cfg.realign_pause_gap, align_padding=cfg.align_padding,
+        align_release=cfg.align_release,
+    )
+    ensure_visible_cues(segments)
+    strip_sentinels(segments)
+    return segments
+
+
 class RealignAcousticStage(Stage):
     """The transcript is known and complete, only its timings are missing. The alignment
     model does both jobs -- a coarse sliding search for where each line sits, then forced
@@ -863,9 +928,7 @@ class RealignAcousticStage(Stage):
 
     def run(self, ctx, items):
         from cantocaptions_ai.pipeline.alignment import load_align_model
-        from cantocaptions_ai.pipeline.realign import (
-            ensure_visible_cues, strip_sentinels, tighten_cue_spans,
-        )
+        from cantocaptions_ai.pipeline.realign import ensure_visible_cues, split_mode
 
         cfg = ctx.cfg
         with StageTimer(self.name, ctx.summary, progress=ctx.progress) as stage:
@@ -905,9 +968,14 @@ class RealignAcousticStage(Stage):
             # nothing re-times them afterwards. So alignment and its fixups are skipped
             # rather than run and then overridden.
             pending = [item for item in items if not item.get("realign_sync")]
+            # Top-of-screen tracks ride along as extra items, mapped back by position: they
+            # share their file's audio_path, so the by-path lookup below cannot tell them apart.
+            owners = [item["audio_path"] for item in pending if item.get("realign_overlay")]
+            overlays = [item.pop("realign_overlay") for item in pending
+                        if item.get("realign_overlay")]
             if pending:
                 aligned = _run_alignment(
-                    pending, align_model, align_metadata, cfg.device,
+                    pending + overlays, align_model, align_metadata, cfg.device,
                     cfg.align_padding, cfg.align_release, cfg.interpolate_method,
                     cfg.return_char_alignments, cfg.print_progress, cfg.align_batch_size,
                     progress_callback=stage.reporter,
@@ -924,17 +992,24 @@ class RealignAcousticStage(Stage):
                     # through cue_spans rather than letting punctuation derive them.
                     punctuation=ctx.realign_punct,
                 )
+                aligned, aligned_overlays = aligned[:len(pending)], aligned[len(pending):]
                 by_path = {item["audio_path"]: item for item in aligned}
+                for path, overlay in zip(owners, aligned_overlays):
+                    by_path[path]["overlay_segments"] = overlay["result"]["segments"]
                 items = [by_path.get(item["audio_path"], item) for item in items]
+            split = split_mode(cfg.realign_split, ctx.realign_mode)
             for item in items:
                 if item.get("realign_sync"):
                     # No words and no sentinels to tidy; only the two validity guarantees.
                     ensure_visible_cues(item["result"]["segments"])
+                    ensure_visible_cues(item.get("overlay_segments") or [])
                     continue
-                segments = item["result"]["segments"]
-                tighten_cue_spans(segments)
-                ensure_visible_cues(segments)
-                strip_sentinels(segments)
+                leash = item.pop("realign_leash", None)
+                item["result"]["segments"] = _finish_realigned(
+                    item["result"]["segments"], cfg, split, leash)
+                if item.get("overlay_segments"):
+                    item["overlay_segments"] = _finish_realigned(
+                        item["overlay_segments"], cfg, split, leash)
         del align_model, align_metadata
         flush_vram()
         return items
@@ -1240,12 +1315,20 @@ class AlignmentStage(_AsrPath):
             )
             if cfg.realign:
                 from cantocaptions_ai.pipeline.realign import (
-                    enforce_cue_order, ensure_visible_cues, strip_sentinels,
-                    tighten_cue_spans, warn_on_implausible_cues,
+                    enforce_cue_order, ensure_visible_cues, split_at_pauses,
+                    split_mode, strip_sentinels, tighten_cue_spans,
+                    warn_on_implausible_cues,
                 )
+                split = split_mode(cfg.realign_split, ctx.realign_mode)
                 for item in items:
                     segments = item["result"]["segments"]
                     tighten_cue_spans(segments)
+                    segments, _cuts = split_at_pauses(
+                        segments, mode=split, line_gap=cfg.realign_split_gap,
+                        pause_gap=cfg.realign_pause_gap, align_padding=cfg.align_padding,
+                        align_release=cfg.align_release,
+                    )
+                    item["result"]["segments"] = segments
                     # Order first: ensure_visible_cues reads the previous cue's end as
                     # its floor, which is only meaningful once the cues are in order.
                     enforce_cue_order(segments)

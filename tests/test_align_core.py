@@ -100,3 +100,38 @@ def test_peak_says_whether_the_character_was_heard():
     assert peak_of(wrong, "狗") < 0.1
     words = [w for seg in wrong["segments"] for w in seg["words"] if w["word"] == "狗"]
     assert words and words[0]["peak"] < 0.1
+
+
+def test_a_declared_cue_carries_its_style_tags_onto_the_finished_cue():
+    # --realign declares each line's position tag ({\an8}) beside its cue span; alignment
+    # must land it on that cue alone, and never in the text the aligner reads.
+    scripted = ScriptedAudio()
+    segments = StubVad().process(scripted.samples)
+    first = segments[0]
+    text = scripted.text_at(first["start"], first["end"])
+    split = text.index("，")
+    transcript = [{
+        "start": first["start"], "end": first["end"], "text": text,
+        "cue_spans": [(0, split), (split + 1, len(text) - 1)],
+        "cue_styles": ["", r"{\an8}"],
+    }]
+    model, meta = fake_align_model(scripted)
+    result = align(transcript, model, meta, segments[:1], "cpu", vram_checks=False)
+    assert [s.get("style_tags") for s in result["segments"]] == [None, r"{\an8}"]
+    assert all("{" not in s["text"] for s in result["segments"])
+
+
+def test_a_concurrent_line_still_lands_on_its_own_characters():
+    # Passing over other speech as filler must not let the line itself drift: its own
+    # characters are never filler, so they still have to be placed where they are heard.
+    scripted = ScriptedAudio()
+    segments = StubVad().process(scripted.samples)
+    first = segments[0]
+    text = scripted.text_at(first["start"], first["end"])
+    clause = text[text.index("，") + 1:]
+    transcript = [{"start": first["start"], "end": first["end"], "text": clause,
+                   "concurrent": True}]
+    model, meta = fake_align_model(scripted)
+    result = align(transcript, model, meta, segments[:1], "cpu", vram_checks=False)
+    truth = next(start for ch, start, _ in scripted.char_times[0] if ch == clause[0])
+    assert result["segments"][0]["start"] == pytest.approx(truth, abs=FRAME_S / 2)

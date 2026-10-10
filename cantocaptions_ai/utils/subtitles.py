@@ -50,14 +50,34 @@ _HTML_TAG = re.compile(r"</?[a-zA-Z][^>]*>")
 # ASS/SSA override blocks, which survive a careless conversion to SRT: ``{\an8}``, ``{\pos(..)}``.
 _ASS_OVERRIDE = re.compile(r"\{\\[^}]*\}")
 
+# The override blocks a cue *opens* with. These are kept rather than stripped: ``{\an8}`` is
+# not styling the words, it says where the whole cue goes, and on a subtitle it almost always
+# marks concurrent background speech shown at the top while the main line carries on below.
+# Losing it moves that cue onto the main line, where it collides with whatever is said there.
+_LEADING_OVERRIDES = re.compile(r"^\s*((?:\{\\[^}]*\})+)")
+
+# Top-of-screen positions: numpad-style \an7-9, and legacy SSA \a5-7 (top left/centre/right;
+# \a9-11 are the middle row, hence the lookahead).
+_TOP_POSITION = re.compile(r"\\an[789]|\\a[567](?!\d)")
+
+
+def is_top_position(style: str) -> bool:
+    """True when *style* (a cue's leading override blocks) puts the cue at the top."""
+    return bool(style) and _TOP_POSITION.search(style) is not None
+
 
 @dataclass
 class SubtitleCue:
-    """One cue, with its line breaks preserved."""
+    """One cue, with its line breaks preserved.
+
+    ``style`` is the override blocks the cue opened with (``{\\an8}``), verbatim, so a writer
+    can put them back; the text itself never carries them.
+    """
     index: int
     start: float
     end: float
     text: str
+    style: str = ""
 
 
 class SubtitleFormatError(ValueError):
@@ -134,12 +154,17 @@ def read_subtitle_cues(path: str) -> List[SubtitleCue]:
             continue
 
         body: List[str] = []
+        style = ""
         while i < n and lines[i].strip():
+            if not body:
+                leading = _LEADING_OVERRIDES.match(lines[i])
+                style = leading.group(1) if leading else ""
             body.append(strip_markup(lines[i]).strip())
             i += 1
         text = "\n".join(part for part in body if part)
         if text:
-            cues.append(SubtitleCue(index=len(cues), start=start, end=end, text=text))
+            cues.append(SubtitleCue(index=len(cues), start=start, end=end, text=text,
+                                    style=style))
     if not cues:
         raise SubtitleFormatError(f"No subtitle cues found in: {path}")
     return cues
@@ -156,6 +181,14 @@ def load_subtitle_file(path: str) -> List[SingleSegment]:
         {"start": cue.start, "end": cue.end, "text": cue.text.replace("\n", " ")}
         for cue in read_subtitle_cues(path)
     ]
+
+
+def cue_segment(cue: SubtitleCue) -> SingleSegment:
+    """One cue as a segment that keeps its line breaks and its position (``style_tags``)."""
+    segment: SingleSegment = {"start": cue.start, "end": cue.end, "text": cue.text}
+    if cue.style:
+        segment["style_tags"] = cue.style
+    return segment
 
 
 def subtitle_has_timings(path: str) -> bool:
