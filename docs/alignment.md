@@ -174,8 +174,18 @@ a slow speaker ends well before the syllable does. On a learner's vocabulary vid
 `OyWxo0hNNls`), 44 of 210 cues were still on speech when they ended: 我對佢嘅表現 vanished
 0.7–0.8 s before 現 was over, 每次見工 0.6 s before 工.
 
-Three repairs, in order:
+Four repairs, in order:
 
+- **Every sentence alignment emits is released**, whatever it ends on. The release is
+  measured from the punctuation mark's start where a pause mark ends the sentence (the mark is
+  blank, so its span is the pause), and otherwise from the end of the last spoken character. The
+  mark used to be a condition, not just a starting point. A transcription segment that ended on
+  `」` (not a pause token) or on nothing got no release, and bluey's
+  今次保怡嘅故事係關於「神奇木琴」 left the screen 0.04 s into 琴, which runs on for another
+  0.3 s. Without vocal isolation a music bed sits under that line, so `extend_to_sound` can't
+  judge it either. Measured on bluey and Doraemon (isolated and not): five cue ends moved, the
+  start and end shares within 0.5 s moved by 0.2 points or less, and this line now ends at
+  90.35, just after 琴 does.
 - **A `split_gapped_cues` head is released** into the pause like a cue ending on punctuation
   (`release=align_release`, stopping `align_padding` short of the tail).
 - **A pass-E head is released the same way** (`assemble_cues(align_release=)`). Cut where

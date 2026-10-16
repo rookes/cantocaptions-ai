@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import math
 from functools import lru_cache
 import time
+import unicodedata
 from typing import Callable, Dict, Iterable, Mapping, NamedTuple, Optional, Sequence, Union, List, Tuple
 
 import numpy as np
@@ -1000,10 +1001,21 @@ def _align_segment(
         sentence_start = curr_chars["start"].min()
         last_char = end_chars.iloc[-1]
         sentence_end = end_chars["end"].max()
-        # Sentences ending on punctuation get their end time released (extended) later,
-        # in align(), once the position relative to *all* subsegments in the file
-        # (not just this transcript segment) is known — see release_from below.
-        release_from = last_char["start"] if last_char["char"] in split_chars else None
+        # Every sentence gets its end time released (extended) later, in align(), once the
+        # position relative to *all* subsegments in the file (not just this transcript
+        # segment) is known — see release_from below. From the punctuation mark's start where
+        # one ends the sentence (it is mapped to blank, so its span is the pause, not speech),
+        # otherwise from the end of the last spoken character. A sentence ending with no
+        # mark, or on one that is not a pause token (「神奇木琴」), used to get no release at
+        # all and left the screen the moment CTC placed its last character -- 0.04 s into 琴.
+        spoken = end_chars[end_chars["end"].notna() & ~end_chars["char"].map(
+            lambda c: c in split_chars or unicodedata.category(c).startswith(("P", "Z")))]
+        if last_char["char"] in split_chars and not pd.isna(last_char["start"]):
+            release_from = last_char["start"]
+        elif len(spoken):
+            release_from = spoken["end"].max()
+        else:
+            release_from = None
 
         sentence_words = []
         for word_idx in curr_chars["word-idx"].unique():

@@ -164,3 +164,15 @@ def test_a_long_english_cue_is_never_cut_inside_a_word():
     assert " ".join(c["text"].strip() for c in cues) == sentence
     for cue in cues:
         assert all(word in sentence.split() for word in cue["text"].split())
+
+
+@pytest.mark.parametrize("text", ["佢話「神奇」", "佢話神奇"])
+def test_a_sentence_is_released_without_a_pause_mark(text):
+    # The release is not tied to punctuation: a sentence ending on 」 (not a pause token) or
+    # on nothing at all is released from its last spoken character, like one ending on 。.
+    scripted = ScriptedAudio(script=((1.0, "佢話神奇"),), duration=5.0)
+    result = _align(scripted, texts=[text], align_release=0.5, return_char_alignments=True,
+                    extend_ends=False)
+    seg = result["segments"][-1]
+    last = max(c["end"] for c in seg["chars"] if c.get("end") is not None)
+    assert seg["end"] == pytest.approx(last + 0.5, abs=1e-3)
