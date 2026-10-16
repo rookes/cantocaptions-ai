@@ -234,20 +234,23 @@ replace = '獎'
 pattern = '俾'
 replace = '畀'
 
+# The plural 哋 rules skip a 地 that starts a word: 私人地方, 我地圖, 我地獄. The lookahead
+# holds only characters the pronoun never precedes in the strict-tier corpus (0 of ~109k
+# lines). 點, 上, 下 and 面 are left out: 我哋點算, 我哋上去, 你哋面對 are common.
 [[rules]]
-pattern = '我地'
+pattern = '我地(?![方圖獄區址盤步產氈震底牢板毯鐵位])'
 replace = '我哋'
 
 [[rules]]
-pattern = '你地'
+pattern = '你地(?![方圖獄區址盤步產氈震底牢板毯鐵位])'
 replace = '你哋'
 
 [[rules]]
-pattern = '佢地'
+pattern = '佢地(?![方圖獄區址盤步產氈震底牢板毯鐵位])'
 replace = '佢哋'
 
 [[rules]]
-pattern = '人地'
+pattern = '人地(?![方圖獄區址盤步產氈震底牢板毯鐵位])'
 replace = '人哋'
 
 [[rules]]

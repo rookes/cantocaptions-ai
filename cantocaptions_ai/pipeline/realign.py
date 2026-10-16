@@ -627,25 +627,33 @@ def _bounded_timing(
 # recoverable only by letting the search look backwards, which it deliberately cannot do.
 
 
-def _trim_detached_edges(runs: Sequence[Sequence]) -> List:
+def _chars_in(words: Sequence[Mapping]) -> int:
+    """How many characters *words* hold. A CJK word is one character, but a word of
+    code-switched English is several, and the thresholds here were set in characters."""
+    return sum(len(str(w.get("word", "")).strip()) for w in words)
+
+
+def _trim_detached_edges(runs: Sequence[Sequence],
+                         size: Callable[[Sequence], int] = len) -> List:
     """Flatten *runs*, dropping short ones from either end.
 
     A run in the middle is never dropped however short it is: whatever it is, the characters
     on both sides of it place it, so it is part of the line. Only an edge run is unanchored,
     and it goes only if it is both short (MAX_DETACHED_RUN) and outweighed by what is left --
     so a line the search split evenly in two keeps its opening rather than jumping forward,
-    which is the tie-break the coarse pass has always had.
+    which is the tie-break the coarse pass has always had. ``size`` counts a run's
+    characters (a run of tokens: its length; of aligned words: :func:`_chars_in`).
     """
     lo, hi = 0, len(runs)
-    rest = sum(len(run) for run in runs)
+    rest = sum(size(run) for run in runs)
     # A tie is resolved towards the *opening*: a line the search split evenly in two starts
     # where the line starts rather than jumping forward, which is the tie-break the coarse
     # pass has always had. Hence < at the head and <= at the tail.
-    while hi - lo > 1 and len(runs[lo]) <= MAX_DETACHED_RUN and len(runs[lo]) < rest - len(runs[lo]):
-        rest -= len(runs[lo])
+    while hi - lo > 1 and size(runs[lo]) <= MAX_DETACHED_RUN and size(runs[lo]) < rest - size(runs[lo]):
+        rest -= size(runs[lo])
         lo += 1
-    while hi - lo > 1 and len(runs[hi - 1]) <= MAX_DETACHED_RUN and len(runs[hi - 1]) <= rest - len(runs[hi - 1]):
-        rest -= len(runs[hi - 1])
+    while hi - lo > 1 and size(runs[hi - 1]) <= MAX_DETACHED_RUN and size(runs[hi - 1]) <= rest - size(runs[hi - 1]):
+        rest -= size(runs[hi - 1])
         hi -= 1
     return [item for run in runs[lo:hi] for item in run]
 
@@ -2242,7 +2250,7 @@ def tighten_cue_spans(
                 runs.append([cur])
             else:
                 runs[-1].append(cur)
-        core = _trim_detached_edges(runs)
+        core = _trim_detached_edges(runs, size=_chars_in)
 
         start = max(seg["start"], core[0]["start"])
         # The end is left alone when the line's last character is in the core: alignment
@@ -2350,8 +2358,10 @@ class _Cut:
 
 def _find_cut(
     segment: Mapping, line_gap: float, pause_gap: Optional[float], split_chars: set,
+    script=None,
 ) -> Optional[_Cut]:
-    """The best place to split *segment*, or None. A line break wins over a bare pause."""
+    """The best place to split *segment*, or None. A line break wins over a bare pause, and a
+    bare pause inside a word of ``script``'s (樂觀, an English word) is never one."""
     from cantocaptions_ai.pipeline.align_checks import _word_offsets
 
     text = str(segment.get("text", ""))
@@ -2383,7 +2393,7 @@ def _find_cut(
         return float(tail[0]["start"]) < float(segment["end"])
 
     def needed(base: float, head, tail) -> float:
-        short = min(len(head), len(tail)) <= SHORT_PIECE_CHARS
+        short = min(_chars_in(head), _chars_in(tail)) <= SHORT_PIECE_CHARS
         return base + (SHORT_PIECE_EXTRA if short else 0.0)
 
     for at in (k for k, ch in enumerate(text) if ch == "\n"):
@@ -2397,7 +2407,7 @@ def _find_cut(
         # A run of a character or two sitting far from the rest is what a misplaced token
         # looks like (MAX_DETACHED_RUN): tighten_cue_spans already declined to trust one
         # beyond MAX_INTERNAL_GAP, so a cue must not be built around it here either.
-        if min(len(head), len(tail)) <= MAX_DETACHED_RUN and gap > MAX_INTERNAL_GAP:
+        if min(_chars_in(head), _chars_in(tail)) <= MAX_DETACHED_RUN and gap > MAX_INTERNAL_GAP:
             continue
         if acceptable(head, tail, text[:at], text[at + 1:]):
             return _Cut(at, at + 1, cut, gap, head[-1], tail[0], "line")
@@ -2415,8 +2425,10 @@ def _find_cut(
         gap = float(n["start"]) - float(p["start"])
         if gap < pause_gap or (best is not None and gap <= best.gap):
             continue
+        if script is not None and script.inside_word(text, offsets[i + 1][0]):
+            continue
         head, tail = real(words[:i + 1]), real(words[i + 1:])
-        if min(len(head), len(tail)) < PAUSE_SPLIT_MIN_CHARS:
+        if min(_chars_in(head), _chars_in(tail)) < PAUSE_SPLIT_MIN_CHARS:
             continue
         if gap < needed(pause_gap, head, tail):
             continue
@@ -2435,9 +2447,11 @@ def split_at_pauses(
     align_padding: float = 0.04,
     align_release: float = 0.4,
     split_chars: Sequence[str] = REALIGN_PUNCTUATION.split_chars,
+    script=None,
 ) -> Tuple[List[dict], int]:
     """Split cues where the audio puts a real pause: at line breaks, and with ``mode``
-    ``pauses`` also between two characters written together.
+    ``pauses`` also between two characters written together (never inside a word of
+    ``script``'s, when one is given).
 
     A line break is always preferred: one that qualifies is cut before any bare boundary is
     considered, and each piece is then tested again. The tail starts on its own first
@@ -2462,7 +2476,7 @@ def split_at_pauses(
     while pending:
         segment = pending.pop(0)
         found = None if segment.get("realign_reason") else _find_cut(
-            segment, line_gap, pause_gap if mode == "pauses" else None, split)
+            segment, line_gap, pause_gap if mode == "pauses" else None, split, script)
         if found is None:
             out.append(segment)
             continue

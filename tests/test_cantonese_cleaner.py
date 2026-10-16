@@ -185,6 +185,64 @@ class TestRuleLoader(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_ruleset(path)
 
+    def test_when_limits_a_rule_to_matching_lines(self):
+        from cantocaptions_ai.cleaning.rules import apply_ruleset
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rules.toml"
+            path.write_text(
+                "[[rules]]\npattern = ','\nreplace = '，'\nwhen = '[\\u4e00-\\u9fff]'\n",
+                encoding="utf-8",
+            )
+            rules = load_ruleset(path)
+            self.assertEqual(apply_ruleset("好,好", rules), "好，好")
+            self.assertEqual(apply_ruleset("yes, no", rules), "yes, no")
+
+    def test_bad_when_regex_names_file_and_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.toml"
+            path.write_text("[[rules]]\npattern = 'a'\nreplace = ''\nwhen = '(unclosed'\n",
+                            encoding="utf-8")
+            with self.assertRaises(ValueError) as ctx:
+                load_ruleset(path)
+            self.assertIn("bad.toml", str(ctx.exception))
+            self.assertIn("#1", str(ctx.exception))
+
+
+class TestCodeSwitchedPunctuation(unittest.TestCase):
+    """A line with no Chinese is English, and keeps English punctuation; a line with Chinese
+    in it takes full-width punctuation, English words included."""
+
+    def setUp(self):
+        self.cleaner = SubtitleCleaner(max_line_count=2)
+
+    def test_english_line_keeps_half_width_punctuation(self):
+        for text, expected in [
+            ("Touched， moved，", "Touched, moved"),
+            ("Are you satisfied with this result？", "Are you satisfied with this result?"),
+            ("Are you satisfied with this result?", "Are you satisfied with this result?"),
+            ("Don't be so pessimistic!", "Don't be so pessimistic!"),
+            ("It was so embarrassing。", "It was so embarrassing"),
+            ("I'm fine。Thanks", "I'm fine. Thanks"),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(self.cleaner.clean(text), expected)
+
+    def test_mixed_line_takes_full_width_punctuation(self):
+        for text, expected in [
+            ("你識唔識講English?", "你識唔識講English？"),
+            ("佢話sorry, 我話OK", "佢話sorry，我話OK"),
+            ("Touched， 好感動", "Touched，好感動"),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(self.cleaner.clean(text), expected)
+
+    def test_hyphenated_word_keeps_its_hyphen(self):
+        self.assertEqual(self.cleaner.clean("My mom is very open-minded"), "My mom is very open-minded")
+        self.assertEqual(self.cleaner.clean("買件T-shirt"), "買件T-shirt")
+
+    def test_spelled_out_letters_are_joined(self):
+        self.assertEqual(self.cleaner.clean("係A-P-P嚟㗎"), "係APP嚟㗎")
+
 
 class TestCleanerConstruction(unittest.TestCase):
 
@@ -219,6 +277,24 @@ class TestCleanerConstruction(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # comma_conjunctions.toml
 # ---------------------------------------------------------------------------
+
+class TestPluralDei(unittest.TestCase):
+    """chars_hk's 地→哋 plural rules must not break a word that starts with 地."""
+
+    def setUp(self):
+        from cantocaptions_ai.cleaning.rules import apply_ruleset
+        rules = load_ruleset(BUILTIN_RULES_DIR / "chars_hk.toml")
+        self.apply = lambda text: apply_ruleset(text, rules)
+
+    def test_pronoun_is_fixed(self):
+        self.assertEqual(self.apply("我地點算啊？你地面對佢啦"), "我哋點算啊？你哋面對佢啦")
+        self.assertEqual(self.apply("佢地走咗，人地話嘅"), "佢哋走咗，人哋話嘅")
+
+    def test_word_starting_with_dei_is_kept(self):
+        self.assertEqual(self.apply("擅闖私人地方"), "擅闖私人地方")
+        self.assertEqual(self.apply("指向我地圖上嘅北面"), "指向我地圖上嘅北面")
+        self.assertEqual(self.apply("迫我地獄式訓練"), "迫我地獄式訓練")
+
 
 class TestCommaConjunctions(unittest.TestCase):
 
@@ -500,9 +576,10 @@ class TestCleanSubtitle(unittest.TestCase):
     def test_english_spacing(self):
         # 咁 stays 咁 (the 咁→噉 rules are commented out in legacy); the stale legacy
         # test expected 噉.
+        # English counts half a Chinese character, so this is 21 wide and fits one line.
         self.assertEqual(self.clean("同 埋有陣時學,大家覺得好似係\nall or nothing,"),
-                         "同埋有陣時學，大家覺得好似係\nall or nothing")
-        self.assertEqual(self.clean("咁你就要走去Adobe\nIllustrator。"), "咁你就要走去Adobe\nIllustrator")
+                         "同埋有陣時學，大家覺得好似係all or nothing")
+        self.assertEqual(self.clean("咁你就要走去Adobe\nIllustrator。"), "咁你就要走去Adobe Illustrator")
 
     def test_number_retention(self):
         self.assertEqual(self.clean("呢個字體可以幫你完全,唔可以完全嘅,99.7％嘅時候,揀中呢一個"),

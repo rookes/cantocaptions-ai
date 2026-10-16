@@ -1,9 +1,10 @@
 """TOML-backed regex rule engine for subtitle cleaning.
 
 A rule file holds an ordered array of ``[[rules]]`` tables with ``pattern``/``replace``
-strings and an optional ``comment``. Rules are applied sequentially, one ``re.sub`` pass
-each. Language packs ship their rule files (e.g. ``languages/yue/rules/``); a user may
-point ``--clean_rules_dir`` at their own.
+strings, an optional ``comment``, and an optional ``when``: a regex the line must contain
+(``re.search``) for the rule to apply at all, e.g. only to a line with Chinese in it. Rules
+are applied sequentially, one ``re.sub`` pass each. Language packs ship their rule files
+(e.g. ``languages/yue/rules/``); a user may point ``--clean_rules_dir`` at their own.
 """
 import functools
 import re
@@ -22,6 +23,7 @@ class Rule:
     pattern: "re.Pattern[str]"
     replace: str
     comment: Optional[str] = None
+    when: Optional["re.Pattern[str]"] = None
 
 
 RuleSet = List[Rule]
@@ -40,16 +42,19 @@ def load_ruleset(path: Path) -> RuleSet:
         try:
             pattern = re.compile(entry["pattern"])
             replace = entry["replace"]
+            when = re.compile(entry["when"]) if entry.get("when") is not None else None
         except KeyError as e:
             raise ValueError(f"{path}: rule #{i + 1} is missing required key {e}") from e
         except re.error as e:
             raise ValueError(f"{path}: rule #{i + 1} has an invalid regex: {e}") from e
-        rules.append(Rule(pattern, replace, entry.get("comment")))
+        rules.append(Rule(pattern, replace, entry.get("comment"), when))
     return rules
 
 
 def apply_ruleset(text: str, rules: RuleSet) -> str:
     for rule in rules:
+        if rule.when is not None and not rule.when.search(text):
+            continue
         text = rule.pattern.sub(rule.replace, text)
     return text
 

@@ -12,11 +12,11 @@ to distrust, which is the thing a 2000-cue file cannot be used without.
 
 ``split_gapped_cues`` is the one exception, and it is exception-shaped on purpose: it acts
 on ``find_gapped_cues``' finding by breaking the cue in two, and it is the only thing here
-that is **opt-in**, enabled per align model by ``AlignProfile.split_gap`` or per run by
+that is per align model, enabled by ``AlignProfile.split_gap`` or per run by
 ``--align_split_gap``. Reporting a doubtful cue costs nothing; inventing a cue boundary
-that was not there does, so the threshold it runs at is deliberately well above the one it
-reports at (see ``SPLIT_INTERNAL_GAP``). The detection is shared -- one scan, two verdicts
--- so the two can never disagree about what a gap is.
+that was not there does, so it only believes a gap the evidence supports (``SPLIT_MIN_PEAK``,
+``SPLIT_MIN_SILENCE``) and never cuts inside a word. The detection is shared -- one scan, two
+verdicts -- so the two can never disagree about what a gap is.
 
 ``find_silent_starts`` catches a cue whose start time lands on audio where nothing is
 being said. Alignment placing a character over silence is always wrong, whatever produced
@@ -31,6 +31,7 @@ over music beds and room tone, which are speechless but not silent. Treat a clea
 "nothing obvious", not as proof the alignment is sound.
 """
 
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
@@ -72,13 +73,48 @@ MIN_GAP_FRAMES = 4
 # that are written next to each other means one of them was placed somewhere it was not said.
 MAX_INTERNAL_GAP = 1.0
 
-# A suggested starting point for ``split_gapped_cues``, not a default anything uses on its
-# own: splitting is opt-in per align model (``AlignProfile.split_gap``) or per run
-# (``--align_split_gap``). It sits well above MAX_INTERNAL_GAP because reporting and breaking
-# are different bets. At 1.0 s, 45% of the cues flagged are still within half a second of the
-# reference, so a break there would invent a cue boundary about as often as it found one;
-# 1.5 s is long enough that the two halves are not plausibly one utterance.
+# split_gapped_cues' default when a caller names no threshold. The pipeline's comes from the
+# align model (``AlignProfile.split_gap``: 1.0 s for the Cantonese model) or
+# ``--align_split_gap``. Unguarded, a break at 1.0 s would invent a cue boundary about as often
+# as it found one (45% of the cues flagged there are within half a second of the reference);
+# the guard below is what makes 1.0 s safe, and this stays the conservative choice for a
+# caller with no evidence to give it.
 SPLIT_INTERNAL_GAP = 1.5
+
+# What split_gapped_cues needs before it believes a gap. The failure behind the 45% above is
+# a character placed where it was not said, and the model says so: the misplaced side's
+# characters were not heard there (``peak``). So a side whose Chinese characters have a median
+# peak under SPLIT_MIN_PEAK (realign's LINE_SPLIT_MIN_PEAK, for the same question) blocks the
+# split -- unless at least SPLIT_MIN_SILENCE of the gap is silence against its region's own
+# noise floor, which says the characters cover all the speech there is and the gap is a real
+# pause however unsure the model was of the words. That second route still needs one side
+# not to be unheard: with both unheard, the "pause" is as likely to sit between two misplaced
+# tokens. A side with no Chinese (code-switched English, which this model barely hears) is no
+# evidence either way.
+SPLIT_MIN_PEAK = 0.5
+SPLIT_MIN_SILENCE = 0.8
+
+# A frame is silent this far below its region's speech level (or within FLOOR_MARGIN_DB of
+# the floor, whichever is higher). The floor alone does not work on isolated vocals: their
+# floor is digital silence near -185 dBFS, which nothing in a real pause reaches. Measured on
+# three files: real pauses sit 95-160 dB under speech; a held syllable or speech that alignment
+# left uncovered sits 0-30 dB under it.
+SILENCE_BELOW_SPEECH_DB = 40.0
+
+# extend_to_sound: a cue whose last syllable is still sounding when it ends is extended to
+# where that sound stops. CTC gives a character only the frames it fires on, so a syllable held
+# by a slow speaker (a learner's 表現, 見工) outlasts its span by up to a second, and the cue
+# left the screen before the word was finished. A frame is sound within SOUND_BELOW_SPEECH_DB
+# of its region's speech level; a dip of SOUND_HANGOVER or less inside a syllable does not end
+# it; and the sound must stop within SOUND_MAX_EXTEND of the word, because a held syllable ends
+# and music, effects or the next speaker do not. Measured (2026-10) on a slow single-speaker
+# vocabulary video: cues still on speech at their end, 44 of 210 -> 5. On bluey and Doraemon
+# against their references: starts and cue counts unchanged, ends early by more than 0.3 s
+# 9.1/9.3% -> 7.6/6.4%, late by more than 0.5 s 19.7/17.4% -> 19.7/18.2%. Without the "must
+# stop" rule the same extension made 21-29% of their ends late, from 30 to 40 dB alike.
+SOUND_MAX_EXTEND = 1.5
+SOUND_HANGOVER = 0.12
+SOUND_BELOW_SPEECH_DB = 40.0
 
 
 @dataclass(frozen=True)
@@ -272,20 +308,141 @@ def _split_one(segment: Mapping, gaps: Sequence[InternalGap],
     return pieces
 
 
+class _SilenceMap:
+    """Which stretches of a file are silent, each region judged against its own levels.
+
+    Like ``find_silent_starts``, but a frame also counts as silent SILENCE_BELOW_SPEECH_DB
+    under the region's speech level. Time outside every region is silent (VAD found no speech
+    there); a region with no usable floor (a music bed) is never silent, since nothing there
+    can be told apart from speech.
+    """
+
+    def __init__(self, regions: Iterable[Mapping], sample_rate: int = SAMPLE_RATE,
+                 frame_seconds: float = FRAME_SECONDS) -> None:
+        self.frame_seconds = frame_seconds
+        self.regions: List[Tuple[float, float, Optional[np.ndarray]]] = []
+        self.levels: List[Tuple[np.ndarray, float, float]] = []
+        for region in regions:
+            audio = region.get("audio")
+            if audio is None:
+                continue
+            db = frame_dbfs(audio, sample_rate, frame_seconds)
+            mask = None
+            floor = speech = float("nan")
+            if db.size:
+                floor, speech = np.percentile(db, [5, 95])
+                if speech - floor >= MIN_SEPARATION_DB:
+                    mask = db < max(floor + FLOOR_MARGIN_DB, speech - SILENCE_BELOW_SPEECH_DB)
+            self.regions.append((float(region["start"]), float(region["end"]), mask))
+            self.levels.append((db, float(floor), float(speech)))
+        order = sorted(range(len(self.regions)), key=lambda i: self.regions[i][0])
+        self.regions = [self.regions[i] for i in order]
+        self.levels = [self.levels[i] for i in order]
+
+    def describe(self, start: float, end: float) -> str:
+        """The gap's median level and its region's floor and speech level, for the log."""
+        mid = (start + end) / 2
+        for (r0, r1, _), (db, floor, speech) in zip(self.regions, self.levels):
+            if r0 <= mid < r1:
+                frames = db[int((start - r0) / self.frame_seconds):int((end - r0) / self.frame_seconds)]
+                level = float(np.median(frames)) if frames.size else float("nan")
+                return f"{level:.0f} dBFS, floor {floor:.0f}, speech {speech:.0f}"
+        return "outside every region"
+
+    def _sound(self, t: float) -> Optional[bool]:
+        """Whether the frame at *t* is within SOUND_BELOW_SPEECH_DB of its region's speech
+        level; None outside every region or in one with no usable floor."""
+        for (r0, r1, mask), (db, _floor, speech) in zip(self.regions, self.levels):
+            if r0 <= t < r1:
+                idx = int((t - r0) / self.frame_seconds)
+                if mask is None or not 0 <= idx < db.size:
+                    return None
+                return bool(db[idx] > speech - SOUND_BELOW_SPEECH_DB)
+        return None
+
+    def sound_until(self, t: float, limit: float,
+                    hangover: float = SOUND_HANGOVER) -> Optional[float]:
+        """Where the sound running at *t* stops: the end of its last frame before a silence
+        longer than ``hangover``. *t* itself if *t* is not on sound. None if it does not stop
+        before *limit*, or runs where sound cannot be judged (no region, or a region with no
+        usable floor): sound that will not stop is not one syllable being held."""
+        last, quiet = t, 0.0
+        step = self.frame_seconds
+        while t < limit:
+            found = self._sound(t)
+            if found is None:
+                return None
+            if not found:
+                quiet += step
+                if quiet > hangover:
+                    return last
+            else:
+                quiet = 0.0
+                last = t + step
+            t += step
+        return None
+
+    def share(self, start: float, end: float) -> Optional[float]:
+        """The share of [start, end) that is silent; None with no audio to judge by."""
+        if not self.regions or end <= start:
+            return None
+        times = np.arange(start, end, self.frame_seconds) + self.frame_seconds / 2
+        silent = 0
+        for t in times:
+            region = next((r for r in self.regions if r[0] <= t < r[1]), None)
+            if region is None:
+                silent += 1
+                continue
+            mask = region[2]
+            idx = int((t - region[0]) / self.frame_seconds)
+            if mask is not None and 0 <= idx < mask.size and mask[idx]:
+                silent += 1
+        return silent / len(times)
+
+
+def _heard(words: Sequence[Mapping]) -> Optional[bool]:
+    """Whether the model heard these words where it put them: the median ``peak`` of their
+    Chinese characters, or None where there are none (English, digits) or no peaks at all."""
+    from cantocaptions_ai.text_profiles import display_columns
+
+    def chinese(word: str) -> bool:
+        return bool(word) and all(display_columns(c) == 2
+                                  and not unicodedata.category(c).startswith(("P", "S"))
+                                  for c in word)
+
+    peaks = [float(w["peak"]) for w in words
+             if w.get("peak") is not None and chinese(str(w.get("word", "")).strip())]
+    if not peaks:
+        return None
+    return float(np.median(peaks)) >= SPLIT_MIN_PEAK
+
+
 def split_gapped_cues(
     segments: Sequence[Mapping],
     min_gap: float = SPLIT_INTERNAL_GAP,
     split_chars: Iterable[str] = (),
+    regions: Optional[Iterable[Mapping]] = None,
+    script=None,
+    release: float = 0.0,
+    padding: float = 0.0,
 ) -> Tuple[List[dict], int]:
-    """Break every cue holding a silence of ``min_gap`` or more into one cue per utterance.
+    """Break every cue holding a believable silence of ``min_gap`` or more into one cue per
+    utterance.
 
-    The one place in this module that *repairs* rather than reports, and the only one that
-    is opt-in — because breaking a cue is a bet, where saying "distrust this one" is not.
-    See ``find_gapped_cues`` for the measurement: at the 1 s reporting threshold, 45% of the
-    cues flagged are still within half a second of the reference, so a break there would be
-    wrong about as often as it was right. Above ``SPLIT_INTERNAL_GAP`` the two halves are
-    not plausibly one utterance, and each half's own timings are the ones alignment actually
+    The one place in this module that *repairs* rather than reports — because breaking a cue
+    is a bet, where saying "distrust this one" is not. See ``find_gapped_cues`` for the
+    measurement: at the 1 s reporting threshold, 45% of the cues flagged are still within
+    half a second of the reference. What those have in common is a character placed where it
+    was not said, so a gap is only believed when the evidence says the placement is sound:
+    neither side's Chinese characters went unheard (``SPLIT_MIN_PEAK``), or the gap is
+    silence in the audio (``SPLIT_MIN_SILENCE`` of it, judged against ``regions`` — VAD
+    segments or one whole-file region carrying ``audio``). Without ``regions`` only the
+    first test can pass. Each half's own timings are then the ones alignment actually
     measured — a cue spanning the silence has a start or an end that was never spoken.
+    A gap inside a word of ``script``'s (``ScriptConfig.inside_word``: 樂觀, or an English
+    word) is never cut, however long; it stays a ``find_gapped_cues`` report. With
+    ``release``, each head is then released into the pause the way alignment releases a cue
+    ending on punctuation, stopping ``padding`` short of the piece after it.
 
     The cut is exactly the silence: the head keeps the cue's own start and ends on its last
     timed character before the gap, the tail begins on its first timed character after it
@@ -296,17 +453,93 @@ def split_gapped_cues(
     made. A cue whose words cannot be located in its own text is passed through whole.
     """
     split = set(split_chars)
+    silence = _SilenceMap(regions) if regions is not None else None
     out: List[dict] = []
     breaks = 0
     for segment in segments:
-        gaps = list(_internal_gaps(segment, min_gap, split))
+        words = list(segment.get("words") or [])
+        candidates = list(_internal_gaps(segment, min_gap, split))
+        if script is not None and candidates:
+            text = str(segment.get("text", ""))
+            offsets = _word_offsets(text, words)
+            if offsets is not None:
+                candidates = [g for g in candidates
+                              if not script.inside_word(text, offsets[g.after_idx][0])]
+        gaps = []
+        for k, gap in enumerate(candidates):
+            # Each side is the run of words up to the next candidate gap: the piece this cut
+            # would actually make.
+            lo = candidates[k - 1].after_idx if k else 0
+            hi = candidates[k + 1].after_idx if k + 1 < len(candidates) else len(words)
+            head, tail = _heard(words[lo:gap.after_idx]), _heard(words[gap.after_idx:hi])
+            quiet = silence.share(gap.at, gap.at + gap.gap) if silence is not None else None
+            believed = (head is not False and tail is not False) or (
+                quiet is not None and quiet >= SPLIT_MIN_SILENCE
+                and (head is not False or tail is not False))
+            logger.debug(
+                "Gap of %.2fs at %.3fs between %r and %r: heard %s/%s, %s silent (%s) -> %s",
+                gap.gap, gap.at, gap.before, gap.after, head, tail,
+                "?" if quiet is None else f"{quiet:.0%}",
+                silence.describe(gap.at, gap.at + gap.gap) if silence is not None else "no audio",
+                "split" if believed else "kept",
+            )
+            if believed:
+                gaps.append(gap)
         pieces = _split_one(segment, gaps) if gaps else None
         if pieces is None:
             out.append(dict(segment))
             continue
+        if release:
+            for head, tail in zip(pieces, pieces[1:]):
+                head["end"] = round(max(head["end"], min(head["end"] + release,
+                                                         tail["start"] - padding)), 3)
         breaks += len(pieces) - 1
         out.extend(pieces)
     return out, breaks
+
+
+def extend_to_sound(
+    segments: Sequence[dict],
+    regions: Iterable[Mapping],
+    padding: float = 0.0,
+    max_extend: float = SOUND_MAX_EXTEND,
+    file_end: Optional[float] = None,
+    split_chars: Iterable[str] = (),
+) -> int:
+    """Extend each cue whose last syllable is still sounding when it ends (in place).
+
+    The question is asked of the cue's last spoken word, not of its end: the sound must run
+    unbroken from that word's aligned end past the cue's end. A cue whose end was already
+    released past a silence -- the speaker stopped, and whatever sounds after that is music, an
+    effect or someone else -- is left alone. The new end is where that sound stops, no more than
+    ``max_extend`` after the word, and at least two ``padding`` short of the next cue, so an
+    extension never brings two cues close enough for cue assembly to join them. Nothing moves
+    where ``regions`` cannot tell silence from sound (see ``_SilenceMap``). Returns how many
+    ends moved.
+    """
+    silence = regions if isinstance(regions, _SilenceMap) else _SilenceMap(regions)
+    split = set(split_chars)
+    moved = 0
+    for k, seg in enumerate(segments):
+        end = float(seg["end"])
+        spoken = [w for w in seg.get("words") or []
+                  if w.get("end") is not None and str(w.get("word", "")).strip()
+                  and str(w.get("word", "")).strip() not in split]
+        if not spoken:
+            continue
+        last = float(spoken[-1]["end"])
+        nxt = segments[k + 1]["start"] if k + 1 < len(segments) else file_end
+        limit = last + max_extend
+        if nxt is not None:
+            limit = min(limit, float(nxt) - 2 * padding)
+        if limit <= end:
+            continue
+        sound_end = silence.sound_until(last, limit)
+        if sound_end is not None and round(sound_end, 3) > end + 1e-3:
+            sound_end = round(sound_end, 3)
+            seg["end"] = sound_end
+            moved += 1
+    return moved
 
 
 @dataclass(frozen=True)

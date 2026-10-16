@@ -27,6 +27,69 @@ shorter than the pause before it by more than `FORWARD_PAUSE_MARGIN` (0.05 s) --
 `leading_markers` -- and pass C ranks candidates on the same measure. Measured on a ~900-cue
 episode, it changed two cues, both towards the reference segmentation.
 
+**Widths, not character counts.** The line budgets in passes A and C (and the line breaker in
+`cleaning/layout.py`) measure text with `ScriptConfig.width`. Under CJK an English letter, digit
+or space counts half a Chinese character, so `Considerate, thoughtful` (22 characters, 11 wide)
+fits one line. A Chinese-only line measures exactly its length, so Cantonese output is unchanged.
+The long-cue split (pass E, `max_cue_duration`) cuts only between `words`, and alignment keeps
+an English word as one (see [alignment.md](alignment.md#code-switched-english-pipelinealignmentpy)).
+It also never cuts inside a Chinese word: `ScriptConfig.inside_word` asks the language pack
+(`languages/yue/words.py`), so 樂觀 and 結果 stay whole. pycantonese's segmentation decides,
+with one correction. It glues what it doesn't know into long tokens (演奏一首, 外觀同符合,
+生蠔王豆沙包大), and trusting those left a long cue nowhere to cut but the wrong place. So only a
+token of up to three characters is one word. Inside a longer one, a cut is protected only where
+a word from its own dictionary (HKCanCor plus rime-cantonese) spans it: 演奏|一首 may be cut,
+豆沙|包 may not. The dictionary is never consulted *across* the segmenter's boundaries, where it
+over-protects: 現有 ("existing") is a word, but 我對佢嘅表現有啲失望 is 表現 / 有啲. The same
+check guards `split_gapped_cues` and realign's pause split.
+
+**Pass E leaves a clause read slowly alone.** A cue whose text fits on one line is long only
+because it is spoken slowly, so pass E cuts it only at punctuation or at an aligned pause of
+`ONE_LINE_MIN_PAUSE` (0.5 s). Alignment can't show a pause inside a clause anyway: CTC gives
+each character a span reaching the next, so a learner's 一諗起下個月去旅行, read over 5.3 s,
+reads 0 at every gap and was cut mid-word at 下個|月. Measured (2026-10) on bluey and Doraemon
+against their references, the one-line cuts the references agree with sat at aligned gaps of
+1.2 and 2.0 s, and the ones they disagree with (美景將可|以望見得到, 大亂中嘅|不倒金威) at 0.0.
+Start error within 0.5 s is 78.5 % with the rule and 78.7 % without. The one agreed cut it loses
+sits at `、`, which pass E doesn't treat as punctuation (Tension、|拖鞋).
+
+**Text that fits the screen is cut only at a confident pause.** Pass E has three tiers by the
+width of the cue's text:
+
+| text | cut at |
+|---|---|
+| fits one line | punctuation, or an aligned gap of `ONE_LINE_MIN_PAUSE` (0.5 s) |
+| fits the screen (`max_line_width × max_line_count`) | punctuation, or the longest pause of `CONFIDENT_PAUSE` (0.25 s); otherwise shown whole, over two lines |
+| longer | wherever is least bad, as before; a cut can't be avoided |
+
+A pause is the aligned gap or the extra time a word was held (`_held`), whichever is longer.
+CTC folds a pause inside a clause into the earlier character's span, so the hold is where it
+shows. In bluey's 跟住落嚟我將會演奏一首好出名嘅土耳其進行曲啊 every character runs about
+0.16 s onset to onset and 奏 runs 0.48 s; the reference cuts after 演奏, and that is now the cut.
+Before, with every gap at 0, pass E took the middlemost boundary (好|出名).
+
+Swept (2026-10) on bluey and Doraemon against their references, with and without vocal
+isolation (start / end within 0.5 s, both files pooled):
+
+| | isolated | not isolated |
+|---|---|---|
+| before | 78.5 % / 77.1 % | 79.5 % / 77.1 % |
+| `CONFIDENT_PAUSE` 0.20 or 0.25 s | 78.9 % / 77.4 % | 79.9 % / 77.4 % |
+| 0.35 s | 78.4 % / 76.9 % | 79.4 % / 76.9 % |
+| 0.25 s with `max_cue_duration` 4.5 s | 77.9 % / 76.6 % | 79.4 % / 76.9 % |
+
+Every cut that changed in bluey now matches the reference (演奏|一首…, 對唔住啊|啱啱…,
+真係成日都|令我…), as does Doraemon's 三冠王|豆沙包. The cap stays at 4 s: the references
+do split the cues between 4 and 4.5 s. On a learner's vocabulary video, English sentences with
+no confident pause stay one two-line subtitle where they were cut mid-sentence before.
+
+**Every cue is at least `align_padding` from the next** on the ASR path. Alignment's
+release/trim pass already does this, but pass E's cut made touching pairs when it cut where
+alignment showed no pause (the head ended where the tail began). Pass E now ends the head
+`align_padding` early, and `_keep_apart` checks the whole file once more after pass D. A cue too
+short to give up the padding is left touching, never overlapping. Under `--realign`
+(`merge=False`) the source's own chained cues are kept as they are.
+
 Compare `merge_segments()` in `utils/schema.py`, which does the actual joining and preserves keys later stages attach (notably `speaker`).
 
 Text cleaning runs inside `transcribe.py:_merge_and_write()` on the assembled cues, just before the writer. It edits segment `text` only (word/char timings are left as alignment ground truth), drops noise-only subtitles (`is_removable`), and is skipped under `--realign_mode sync` and `adjust`, whose input is already a finished subtitle. When `--debug_dir` is set, a pre-cleaning SRT snapshot is written to `{debug_dir}/{stem}/pre_cleaning/` (not a loadable checkpoint — cleaning always re-runs so rule edits take effect during `--load_debug_dir` replay).

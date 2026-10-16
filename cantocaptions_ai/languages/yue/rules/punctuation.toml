@@ -1,6 +1,12 @@
 # Punctuation and whitespace normalization (legacy clean_punctuation)
 # Rules are applied in order, top to bottom, one re.sub pass each.
 # Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
+#
+# Code-switched English: a line with Chinese in it takes full-width punctuation, so the rules
+# converting to full width carry a `when` matching a CJK character. A line with no Chinese at
+# all is English and keeps (or gets back) half-width punctuation -- the ASR writes
+# "Touched， moved" and "result？" even there; those rules carry a `when` matching a line with
+# no CJK character anywhere.
 
 [[rules]]
 pattern = '[~～]'
@@ -17,9 +23,9 @@ replace = "'"
 comment = 'restore normal apostrophe'
 
 [[rules]]
-pattern = '([a-zA-Z])-([a-zA-Z])'
-replace = '\1\2'
-comment = 'remove random hyphens'
+pattern = '(?<=[a-zA-Z])(?<![a-zA-Z]{2})-(?=[a-zA-Z](?![a-zA-Z]))'
+replace = ''
+comment = 'join spelled-out letters (A-P-P -> APP); a hyphenated word (open-minded) keeps its hyphen'
 
 [[rules]]
 pattern = '(?<![a-zA-Z])\s+(?![a-zA-Z])'
@@ -48,6 +54,7 @@ comment = 'Netflix standard uses half-width percent sign'
 [[rules]]
 pattern = '\?'
 replace = '？'
+when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
 
 [[rules]]
 pattern = '\.\.\.'
@@ -58,8 +65,36 @@ pattern = '… '
 replace = '…'
 
 [[rules]]
+pattern = '\s*，\s*(?=\S)'
+replace = ', '
+when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+comment = 'English line: half-width comma, one space after'
+
+[[rules]]
+pattern = '\s*。\s*(?=\S)'
+replace = '. '
+when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+
+[[rules]]
+pattern = '？'
+replace = '?'
+when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+
+[[rules]]
+pattern = '！'
+replace = '!'
+when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+
+[[rules]]
+pattern = '\s*[，,]\s*$'
+replace = ''
+when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+comment = 'English line: no trailing comma, as on a Chinese line'
+
+[[rules]]
 pattern = '([^\d零一二兩两三四五六七八九十百千])[。.]([^\d零一二兩两三四五六七八九十百千])'
 replace = '\1，\2'
+when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
 
 [[rules]]
 pattern = '[。.]$'
@@ -72,10 +107,18 @@ replace = ''
 [[rules]]
 pattern = '[!！]'
 replace = '，'
+when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
 
 [[rules]]
 pattern = ','
 replace = '，'
+when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
+
+[[rules]]
+pattern = '\s*([，？！。…：；、])\s*'
+replace = '\1'
+when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
+comment = 'no space beside full-width punctuation, English neighbours included'
 
 [[rules]]
 pattern = '^，'

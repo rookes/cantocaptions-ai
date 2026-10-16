@@ -14,6 +14,7 @@ from cantocaptions_ai.pipeline.align_checks import (
     FRAME_SECONDS,
     MIN_GAP_FRAMES,
     SPLIT_INTERNAL_GAP,
+    extend_to_sound,
     find_gapped_cues,
     find_silent_starts,
     frame_dbfs,
@@ -339,14 +340,74 @@ class TestSplitGappedCues(unittest.TestCase):
         self.assertEqual(starts, sorted(starts))
 
 
-class TestSplitIsOptIn(unittest.TestCase):
-    """The threshold is per align model, and no shipped model sets one."""
+class TestSplitGuard(unittest.TestCase):
+    """A gap is only cut where the evidence says the placement is sound: neither side's
+    Chinese went unheard, or the audio in the gap is silent. The cases are the measured ones."""
 
-    def test_no_profile_splits_by_default(self):
+    def _cue(self, *spans):
+        return {"start": spans[0][1], "end": spans[-1][2],
+                "text": "".join(s[0] for s in spans),
+                "words": [{"word": w, "start": a, "end": b, "peak": p}
+                          for w, a, b, p in spans]}
+
+    def _regions(self, silent_from, silent_to, duration=10.0):
+        """One region: speech everywhere except a digitally silent stretch."""
+        audio = 0.3 * np.sin(np.arange(int(duration * SR)) * 0.05)
+        audio[int(silent_from * SR):int(silent_to * SR)] = 0.0
+        return [{"start": 0.0, "end": duration, "audio": audio}]
+
+    def test_heard_on_both_sides_splits_without_audio(self):
+        # 佢仍然 / 好樂觀, read slowly: a held syllable, then a short pause.
+        cue = self._cue(("佢", 1.0, 1.6, 1.0), ("仍", 1.6, 1.9, 1.0), ("然", 1.9, 2.0, 1.0),
+                        ("好", 3.04, 3.6, 1.0), ("樂", 3.6, 4.0, 0.98), ("觀", 4.0, 4.1, 0.92))
+        out, breaks = split_gapped_cues([cue], 1.0)
+        self.assertEqual([c["text"] for c in out], ["佢仍然", "好樂觀"])
+
+    def test_english_is_no_evidence_against_a_split(self):
+        cue = self._cue(("Disappointed", 1.0, 2.1, 0.11), ("失", 3.3, 3.8, 0.95),
+                        ("望", 3.8, 3.85, 0.86))
+        self.assertEqual(split_gapped_cues([cue], 1.0)[1], 1)
+
+    def test_an_unheard_side_with_speech_in_the_gap_is_kept(self):
+        # The misplacement the 45% figure is made of: a token put where it was not said.
+        cue = self._cue(("離", 1.0, 1.2, 0.1), ("譜", 1.2, 1.4, 0.06), ("啊", 2.72, 2.8, 0.02))
+        regions = self._regions(silent_from=9.0, silent_to=9.5)
+        self.assertEqual(split_gapped_cues([cue], 1.0, regions=regions)[1], 0)
+
+    def test_silence_in_the_gap_rescues_one_unheard_side(self):
+        # stubborn / 固執: the model under-heard 固執, but the gap is silence.
+        cue = self._cue(("stubborn", 1.0, 1.7, 0.01), ("固", 3.2, 3.6, 0.17),
+                        ("執", 3.6, 3.65, 0.23))
+        self.assertEqual(split_gapped_cues([cue], 1.0)[1], 0, "no audio, no rescue")
+        regions = self._regions(silent_from=1.7, silent_to=3.2)
+        self.assertEqual(split_gapped_cues([cue], 1.0, regions=regions)[1], 1)
+
+    def test_silence_does_not_rescue_two_unheard_sides(self):
+        cue = self._cue(("對", 1.0, 1.2, 0.0), ("唔", 1.2, 1.4, 0.0), ("住", 1.4, 1.6, 0.0),
+                        ("啊", 4.5, 4.6, 0.15))
+        regions = self._regions(silent_from=1.6, silent_to=4.5)
+        self.assertEqual(split_gapped_cues([cue], 1.0, regions=regions)[1], 0)
+
+    def test_a_word_is_never_cut(self):
+        from cantocaptions_ai.text_profiles import CJK_SCRIPT
+        cue = self._cue(("佢", 1.0, 1.2, 1.0), ("好", 1.2, 1.4, 1.0), ("樂", 1.4, 1.6, 1.0),
+                        ("觀", 3.0, 3.2, 1.0))
+        self.assertEqual(split_gapped_cues([cue], 1.0)[1], 1, "no script: no word check")
+        self.assertEqual(split_gapped_cues([cue], 1.0, script=CJK_SCRIPT)[1], 0)
+
+
+class TestSplitDefaults(unittest.TestCase):
+    """The threshold is per align model: the Cantonese model's is measured, and nothing else
+    inherits it."""
+
+    def test_only_the_cantonese_model_splits_by_default(self):
         self.assertIsNone(DEFAULT_ALIGN_PROFILE.split_gap)
         for name, profile in ALIGN_PROFILES.items():
             with self.subTest(model=name):
-                self.assertIsNone(profile.split_gap)
+                if name == "alvanlii/wav2vec2-BERT-cantonese":
+                    self.assertEqual(profile.split_gap, 1.0)
+                else:
+                    self.assertIsNone(profile.split_gap)
 
     def test_a_model_with_no_entry_gets_the_no_op_default(self):
         self.assertIsNone(get_align_profile("some/model-added-later").split_gap)
@@ -354,3 +415,56 @@ class TestSplitIsOptIn(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExtendToSound(unittest.TestCase):
+    """A cue may not end while its last syllable is still sounding -- but only a syllable that
+    ends: sound that runs on is music, an effect or someone else."""
+
+    def _audio(self, sound, duration=10.0):
+        """Silence except the (start, end) spans in *sound*, which carry a steady tone."""
+        audio = np.zeros(int(duration * SR), dtype=np.float32)
+        for a, b in sound:
+            n = np.arange(int(a * SR), int(b * SR))
+            audio[n] = 0.3 * np.sin(n * 0.05)
+        return [{"start": 0.0, "end": duration, "audio": audio}]
+
+    def _cue(self, start, end, *words):
+        return {"start": start, "end": end, "text": "".join(w for w, _, _ in words),
+                "words": [{"word": w, "start": a, "end": b} for w, a, b in words]}
+
+    def test_a_held_last_syllable_extends_the_cue(self):
+        # 我對佢嘅表現: CTC gave 現 0.2 s, the speaker held it for 0.9 s.
+        cue = self._cue(1.0, 2.2, ("表", 1.0, 2.0), ("現", 2.0, 2.2))
+        moved = extend_to_sound([cue], self._audio([(1.0, 2.9)]))
+        self.assertEqual(moved, 1)
+        self.assertAlmostEqual(cue["end"], 2.92, delta=0.05)
+
+    def test_sound_that_does_not_stop_is_not_the_syllable(self):
+        cue = self._cue(1.0, 2.2, ("表", 1.0, 2.0), ("現", 2.0, 2.2))
+        self.assertEqual(extend_to_sound([cue], self._audio([(1.0, 9.0)])), 0)
+        self.assertEqual(cue["end"], 2.2)
+
+    def test_a_release_past_silence_is_left_alone(self):
+        # The speaker stopped at 2.2; the cue was released to 2.8; a sound starts at 2.6.
+        cue = self._cue(1.0, 2.8, ("好", 1.0, 2.2), ("，", 2.2, 2.3))
+        self.assertEqual(extend_to_sound([cue], self._audio([(1.0, 2.2), (2.6, 3.0)]),
+                                         split_chars="，"), 0)
+
+    def test_never_close_enough_to_the_next_cue_to_be_joined(self):
+        first = self._cue(1.0, 2.2, ("表", 1.0, 2.0), ("現", 2.0, 2.2))
+        second = self._cue(3.0, 4.0, ("有", 3.0, 4.0))
+        self.assertEqual(extend_to_sound([first, second], self._audio([(1.0, 2.99)]),
+                                         padding=0.04), 0, "sound runs to the next cue")
+        self.assertEqual(first["end"], 2.2)
+
+
+class TestSplitRelease(unittest.TestCase):
+    def test_a_split_head_is_released_into_the_pause(self):
+        cue = {"start": 1.0, "end": 5.1, "text": "現有",
+               "words": [{"word": "現", "start": 1.0, "end": 1.2, "peak": 1.0},
+                         {"word": "有", "start": 5.0, "end": 5.1, "peak": 1.0}]}
+        (head, tail), _ = split_gapped_cues([cue], 1.0, release=0.64, padding=0.04)
+        self.assertAlmostEqual(head["end"], 1.84, places=3)
+        (head, tail), _ = split_gapped_cues([cue], 1.0)
+        self.assertEqual(head["end"], 1.2, "no release asked for, none given")

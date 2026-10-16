@@ -210,6 +210,16 @@ class TestSplitLineBreaks(unittest.TestCase):
         self.assertEqual(split_at_pauses([far])[1], 0)
         self.assertEqual(split_at_pauses([near])[1], 1)
 
+    def test_an_english_word_counts_as_its_characters(self):
+        # Alignment keeps "Hello" as one word, but the thresholds above are in characters: a
+        # five-letter half is not the one-character misplacement 喂 is.
+        cue = _two_line_cue("喂", "你喺度做乜嘢啊", MAX_INTERNAL_GAP + 0.5)
+        cue["words"][0] = _word("Hello", 9.4, 10.15)
+        cue["text"], cue["start"] = "Hello" + cue["text"][1:], 9.4
+        out, cuts = split_at_pauses([cue])
+        self.assertEqual(cuts, 1)
+        self.assertEqual(out[0]["text"], "Hello")
+
     def test_a_cue_already_in_doubt_is_not_split(self):
         cue = _two_line_cue("今日天氣", "幾好喎", 1.0)
         cue["realign_reason"] = REASON_ISOLATED
@@ -302,6 +312,14 @@ class TestSplitAtPauses(unittest.TestCase):
         long = _onsets(len(text), pause_after=2, pause=0.8)     # 就算莎 | 緹拉…
         self.assertEqual(split_at_pauses([_run_on(text, short)])[1], 0)
         self.assertEqual(split_at_pauses([_run_on(text, long)])[1], 1)
+
+    def test_a_pause_inside_a_word_is_not_a_cut(self):
+        # Given the script, the split asks it where words are: 樂觀 is one.
+        from cantocaptions_ai.text_profiles import CJK_SCRIPT
+        text = "佢仍然好樂觀好開心呀"
+        onsets = _onsets(len(text), pause_after=4, pause=0.8)      # 佢仍然好樂 | 觀好開心呀
+        self.assertEqual(split_at_pauses([_run_on(text, onsets)])[1], 1)
+        self.assertEqual(split_at_pauses([_run_on(text, onsets)], script=CJK_SCRIPT)[1], 0)
 
     def test_an_untimed_character_between_is_not_counted_as_pause(self):
         # The onset gap across 僵 includes 僵 itself, which the align model could not time.

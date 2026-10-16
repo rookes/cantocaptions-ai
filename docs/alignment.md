@@ -93,18 +93,40 @@ for a whole transcript line and wrong for a two-character cue (it declines to tr
 exactly that reason). It lands as a cue `note`, so it shows up in `notes.srt` next to the
 substitutions.
 
-**`split_gapped_cues` is the opt-in repair, and it is a different bet at a different
-threshold.** Where the gap is long enough that the two halves cannot plausibly be one
+**`split_gapped_cues` is the repair, and it is a different bet.** Where the gap is long enough that the two halves cannot plausibly be one
 utterance, the honest fix is not to pick a side — it is to stop pretending the cue is one cue.
 Both halves' own timings are the ones alignment actually measured; only the cue *spanning* them
 has an edge nobody spoke. So the split needs no answer to "which side", which is exactly what
 made trimming unworkable.
 
-`SPLIT_INTERNAL_GAP` (1.5 s) is the suggested starting point rather than `MAX_INTERNAL_GAP`
-(1.0 s) because the 45 % figure above is a statement about the reporting threshold: a break at
-1 s would invent a cue boundary about as often as it found one. **This has not been measured on
-a fixture the way the reporting threshold was** — 1.5 s is reasoned from the reporting numbers,
-not swept — which is why nothing enables it by default.
+**Unguarded, a break at 1 s would invent a cue boundary about as often as it found one** (the
+45 % above). What those gaps have in common is a character placed where it was not said, and
+the model says so. So a gap is only believed when the evidence says the placement is sound:
+
+- **both sides heard:** neither side's Chinese characters has a median `peak` under
+  `SPLIT_MIN_PEAK` (0.5, realign's bar for the same question). A side with no Chinese
+  (code-switched English, which this model barely hears) is no evidence either way; or
+- **the gap is silence:** at least `SPLIT_MIN_SILENCE` (80 %) of it is silent audio and one side
+  is not unheard. Silence is judged against the region's speech level
+  (`SILENCE_BELOW_SPEECH_DB`, 40 dB under it) as well as its floor. On isolated vocals the floor
+  is digital silence near -185 dBFS, which no real pause reaches; real pauses measured 95–160 dB
+  under speech, a held syllable or uncovered speech 0–30 dB.
+
+A gap inside a word (`ScriptConfig.inside_word`: 樂觀, or an English word) is never cut. It
+stays a report.
+
+Measured at 1.0 s (2026-10, isolated vocals) on bluey and Doraemon against their references,
+and on a code-switched vocabulary video (YouTube `OyWxo0hNNls`):
+
+| file | gaps ≥ 1 s | split | kept |
+|---|---:|---:|---|
+| bluey | 1 | 0 | 1: one side unheard (0.39), speech in the gap |
+| Doraemon | 9 | 0 | 9: all have an unheard side, 4 of them a lone 啊 the reference does not have |
+| vocabulary video | 13 | 13 | 0: every English gloss from its Cantonese, 道歉 from 如果你做錯咗, phrases read with a pause |
+
+On the fixtures CER, cue count and coverage are unchanged, start error within 0.5 s goes from
+78.4 % to 78.7 % (from word-safe long-cue cuts), and no gap was split. Two gaps the reference
+does separate were kept (景|郁, 食|啊): the guard trades those for never cutting a misplacement.
 
 The cut is exactly the silence and nothing is retimed: the head keeps the cue's own start and
 ends on its last timed character before the gap, the tail begins on its first timed character
@@ -118,7 +140,7 @@ never placed, so nothing says it belongs to the clause after the silence.
 (`align_profiles.py`) holds the threshold, because how long a hole a model leaves between two
 characters is a fact about that model's emission; a model with no measured number inherits
 nobody else's. `--align_split_gap SECONDS` overrides the profile for one run, and `0` forces it
-off. **No shipped profile sets one**, so the default behaviour is unchanged and pinned by test.
+off. **Only `alvanlii/wav2vec2-BERT-cantonese` sets one (1.0 s)**, pinned by test.
 The detection is shared with `find_gapped_cues` — one scan, two verdicts — so the report and
 the break can never disagree about what a gap is.
 
@@ -141,6 +163,65 @@ characters where `score` found about a tenth -- but it shares the align model's 
 low-confidence sentence-final particles (啊 especially) and characters substituted through
 `VocabRepair` read low whether or not they are right. It is diagnostic only; nothing in the
 pipeline acts on it.
+
+## Cue ends and a slow speaker (pipeline/align_checks.py + segmentation.py)
+
+CTC gives a character only the frames it fires on. A cue ending on punctuation has its end
+released `align_release` past the last character, but before 2026-10 a cue with no
+punctuation at its end got no release. That covered the ASR's unpunctuated segment ends, a
+`split_gapped_cues` head, and a pass-E head. Its end was the last character's span, which for
+a slow speaker ends well before the syllable does. On a learner's vocabulary video (YouTube
+`OyWxo0hNNls`), 44 of 210 cues were still on speech when they ended: 我對佢嘅表現 vanished
+0.7–0.8 s before 現 was over, 每次見工 0.6 s before 工.
+
+Three repairs, in order:
+
+- **A `split_gapped_cues` head is released** into the pause like a cue ending on punctuation
+  (`release=align_release`, stopping `align_padding` short of the tail).
+- **A pass-E head is released the same way** (`assemble_cues(align_release=)`). Cut where
+  alignment shows no pause, that leaves exactly `align_padding`.
+- **`extend_to_sound`** extends a cue whose last syllable is still sounding to where the sound
+  stops. It asks the question of the last *spoken word*, not the cue's end: a cue released past
+  a silence is left alone, because the speaker stopped. And the sound must stop within
+  `SOUND_MAX_EXTEND` (1.5 s) of the word. A held syllable ends; music, an effect or the next
+  speaker don't, and without that rule the extension made 21–29 % of the fixtures' ends late.
+  It never comes within two `align_padding` of the next cue, so it can't create a merge. It's
+  ASR path only: `--realign` has its own edge repairs (`tighten_cue_spans`, the leash).
+
+Measured (2026-10, isolated vocals):
+
+| | vocabulary video: cues still on speech at their end | bluey / Doraemon: end early by > 0.3 s | late by > 0.5 s |
+|---|---|---|---|
+| before | 44 of 210 | 9.1 % / 9.3 % | 19.7 % / 17.4 % |
+| releases only | 33 | 8.3 % / 9.1 % | 19.7 % / 17.4 % |
+| + `extend_to_sound` | 5 | 7.6 % / 6.4 % | 19.7 % / 18.2 % |
+
+Fixture starts, cue counts and CER are unchanged throughout.
+
+## Code-switched English (pipeline/alignment.py)
+
+Under a script without spaces every character is its own entry in a cue's `words`, and every
+cue cutter cuts only between two `words`: cue assembly's long-cue split (`_best_cut`),
+`split_gapped_cues`, and realign's `_find_cut`. English inside a Cantonese line was therefore
+cuttable at any letter. On a Cantonese-vocabulary video with English glosses (YouTube
+`OyWxo0hNNls`, 2026-10), the long-cue split produced `Vocabula|ry`, `hi|s or her`,
+`willing t|o` and `you'|ve`, each at a "0.0 s" pause. So `_align_segment` keeps each
+`text_profiles.LATIN_WORD` match (letters and digits, joined by `'`, `-` or `.`) as one
+word. `chars` stays one per character with its own timing, and CJK-only text yields exactly the
+`words` it always did. Realign's thresholds were set in characters (`MAX_DETACHED_RUN`,
+`PAUSE_SPLIT_MIN_CHARS`, `SHORT_PIECE_CHARS`), so it weighs a run of words by its characters
+(`realign._chars_in`).
+
+**`alvanlii/wav2vec2-BERT-cantonese` barely hears English.** Its vocabulary has lowercase
+a–y without q (no z in either case), plus `|`. Spaces are dropped under the CJK script, so
+English is aligned as one unbroken letter run. On the same video every segment aligned and all 67
+English-only cues got timed letters, but the median letter `peak` was **0.04** (2% at 0.5 or
+more), against **0.99** for Chinese characters in the same file. An English cue's edges come
+from VAD and its well-aligned Chinese neighbours, and its letters are spread across the span
+between them. That is adequate for cue timing, but the positions *inside* English are inferred,
+not heard. That is why the long-cue split found zero pauses at arbitrary letters, and why it
+should only ever cut English between whole words. Mapping spaces to `|` or switching to an
+English-capable align model would need its own measurement; neither has been tried.
 
 ## Characters the align model has no token for (pipeline/align_vocab.py)
 

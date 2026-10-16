@@ -173,7 +173,8 @@ After alignment, subtitles are split and re-merged to maintain output standards.
   longer cue (usually a clause the ASR never punctuated) is cut at its longest internal pause. `0` turns it off
 * `max_line_width` / `max_line_count` (default: the language's width / 2) — control forced line breaks and how text is
   wrapped. Unset, the width is the language's own: 18 characters for Chinese, 42 for space-separated scripts. `0` never
-  breaks a line
+  breaks a line. Width is measured as displayed: in a Chinese line, English letters, digits and spaces count half a
+  character, and an English word is never broken across lines or subtitles
 
 More extensive text processing, such as OpenCC simplified -> traditional options and regex substitutions, are configurable via .toml
 files in `cantocaptions_ai/languages/yue/rules/` (point `--clean_rules_dir` at a copy to use your own).

@@ -31,6 +31,8 @@ passes B-D entirely.
 
 from typing import Callable, List, Optional, Sequence
 
+import numpy as np
+
 from cantocaptions_ai.text_profiles import (
     DEFAULT_PUNCTUATION,
     DEFAULT_SCRIPT,
@@ -41,7 +43,7 @@ from cantocaptions_ai.text_profiles import (
     boundary_is_mergeable,
     is_mergeable,
 )
-from cantocaptions_ai.pipeline.align_checks import InternalGap, _split_one
+from cantocaptions_ai.pipeline.align_checks import InternalGap, _split_one, _word_offsets
 from cantocaptions_ai.pipeline.speaker_assign import speaker_scope
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.schema import SingleAlignedSegment, merge_segments
@@ -328,7 +330,7 @@ def _rescue_short_cues(
                 if left_idx < 0 or left_idx + 1 >= len(cues):
                     continue
                 left, right = cues[left_idx], cues[left_idx + 1]
-                if len(script.join(_text(left), _text(right))) > rescue_max_chars:
+                if script.width(script.join(_text(left), _text(right))) > rescue_max_chars:
                     continue
                 if not _within_cap(left, right, max_cue_duration):
                     continue
@@ -370,27 +372,83 @@ def _rescue_short_cues(
 PUNCTUATION_BONUS = 0.25
 BALANCE_WEIGHT = 0.5
 
+# A cue that fits on one line is long only because it is spoken slowly, so pass E cuts it only
+# at punctuation or at an aligned pause at least this long. Measured on bluey and Doraemon
+# against their references: the one-line cuts the references agree with sat at gaps of 1.2 and
+# 2.0 s, the ones they disagree with (美景將可|以望見得到, 大亂中嘅|不倒金威) at 0.0 s -- as did
+# every boundary of a learner's 一諗起下個月去旅行, read over 5 s.
+ONE_LINE_MIN_PAUSE = 0.5
+
+# The least pause (aligned gap, or extra time a word was held: see _held) at which pass E
+# believes the speaker broke off, where no punctuation says so. Below it nothing is cut:
+# a line with no pause to cut at is better shown whole, over two lines, than split mid-phrase.
+CONFIDENT_PAUSE = 0.25
+
+
+def _held(content: Sequence) -> List[float]:
+    """For each consecutive pair of timed words, how much longer the first was held than this
+    cue's speaker usually holds a character: its onset-to-onset interval less its length in
+    characters times the cue's median per character.
+
+    That is where a pause inside a clause shows. CTC gives each character a span reaching the
+    next, so the aligned gap between two characters reads 0 whatever the audio did; the
+    silence is folded into the earlier character's span (realign measures its bare-boundary
+    pauses onset to onset for the same reason). In bluey's 跟住落嚟我將會演奏一首好出名嘅…,
+    every character runs about 0.16 s and 奏 0.48 s: the pause after 演奏.
+    """
+    def chars(w) -> int:
+        return max(1, len(str(w.get("word", "")).strip()))
+
+    spans = [(float(b["start"]) - float(a["start"]), chars(a))
+             for (_, a), (_, b) in zip(content, content[1:])]
+    if not spans:
+        return []
+    per_char = float(np.median([span / n for span, n in spans]))
+    return [span - n * per_char for span, n in spans]
+
 
 def _best_cut(seg: SingleAlignedSegment, punctuation: PunctuationConfig,
-              min_piece: float) -> Optional[InternalGap]:
-    """Where to cut *seg*: between two consecutive timed content words (CJK: characters),
-    leaving at least ``min_piece`` seconds each side. None if nowhere qualifies."""
+              min_piece: float, script: Optional[ScriptConfig] = None,
+              fits: Optional[str] = None) -> Optional[InternalGap]:
+    """Where to cut *seg*, or None: never inside a word of ``script``'s (樂觀 is two CJK
+    "words" to alignment but one to a reader), at least ``min_piece`` seconds from either end,
+    and only where something says the speaker broke off -- a punctuation mark, or a confident
+    pause. A pause is the aligned gap or the extra time the earlier word was held
+    (:func:`_held`), whichever is longer, and it is confident at ``CONFIDENT_PAUSE``. Of
+    those, the longest pause wins (a punctuation mark adds ``PUNCTUATION_BONUS``), the middle
+    only breaking a tie.
+
+    ``fits`` says how much of the screen the cue's text needs. ``"line"`` asks for more:
+    punctuation or an aligned gap of ``ONE_LINE_MIN_PAUSE``, since a clause read slowly holds
+    every character long and held time alone is no reason to cut a line that already fits.
+    ``"screen"`` (it fits the lines a subtitle has) is the rule above: with no pause to cut at,
+    it is shown whole. ``None`` -- it would not fit, or nobody said -- must be cut, so every
+    boundary is a candidate and the pause only ranks them.
+    """
     split = set(punctuation.split_chars)
     words = seg.get("words") or []
+    offsets = _word_offsets(str(seg.get("text", "")), words) if script is not None else None
     content = [
         (i, w) for i, w in enumerate(words)
         if w.get("start") is not None and w.get("end") is not None
         and str(w.get("word", "")).strip() and str(w.get("word", "")).strip() not in split
     ]
+    held = _held(content)
     start, end = float(seg["start"]), float(seg["end"])
     duration = end - start
     best, best_score = None, None
-    for (i, a), (j, b) in zip(content, content[1:]):
+    for k, ((i, a), (j, b)) in enumerate(zip(content, content[1:])):
         head, tail = float(a["end"]) - start, end - float(b["start"])
         if head < min_piece or tail < min_piece:
             continue
-        pause = max(0.0, float(b["start"]) - float(a["end"]))
+        if offsets is not None and script.inside_word(str(seg["text"]), offsets[j][0]):
+            continue
+        gap = max(0.0, float(b["start"]) - float(a["end"]))
+        pause = max(gap, held[k])
         marked = any(str(w.get("word", "")).strip()[-1:] in split for w in words[i:j])
+        if not marked and (fits == "line" and gap < ONE_LINE_MIN_PAUSE
+                           or fits == "screen" and pause < CONFIDENT_PAUSE):
+            continue
         centre = (float(a["end"]) + float(b["start"])) / 2
         off_centre = abs(centre - (start + end) / 2) / duration
         score = pause + (PUNCTUATION_BONUS if marked else 0.0) - BALANCE_WEIGHT * off_centre
@@ -405,6 +463,11 @@ def _split_long_cues(
     segments: Sequence[SingleAlignedSegment],
     max_cue_duration: float,
     punctuation: PunctuationConfig,
+    script: Optional[ScriptConfig] = None,
+    line_width: Optional[float] = None,
+    align_padding: float = 0.0,
+    align_release: float = 0.0,
+    screen_width: Optional[float] = None,
 ) -> List[SingleAlignedSegment]:
     """Pass E: cut every cue longer than ``max_cue_duration`` until its pieces fit.
 
@@ -412,6 +475,19 @@ def _split_long_cues(
     is never shaved into a fragment for pass D to stretch. A cue with nowhere to cut -- no
     word timings, or no boundary far enough from both ends -- is left as it is. The cut
     itself is ``align_checks._split_one``'s, so text, words and characters stay in step.
+
+    A cue whose text fits on one line (``line_width``, in ``script``'s width) is long only
+    because it is spoken slowly -- one clause, a learner's video reading 一諗起下個月去旅行
+    over 5 s -- so it is cut only at punctuation or a pause of ``ONE_LINE_MIN_PAUSE``, never
+    mid-clause where alignment shows nothing (CTC gives each character a span reaching the
+    next, so a clause read slowly still reads 0 at every gap). One that fits the screen
+    (``screen_width``: every line a subtitle has) is cut only at punctuation or a confident
+    pause, or not at all: shown whole over two lines beats 好|出名. Only text too long for the
+    screen is cut wherever is least bad (see :func:`_best_cut`). The head ends the way alignment
+    ends a cue followed by a pause: released ``align_release`` past its last character, and
+    stopping ``align_padding`` short of the tail -- so a cut with no pause leaves exactly the
+    padding, and one at a pause does not drop the subtitle the instant the last syllable is
+    recognised (CTC spans end long before a slow speaker's syllable does).
     """
     min_piece = max_cue_duration / 4
     out: List[SingleAlignedSegment] = []
@@ -422,17 +498,44 @@ def _split_long_cues(
         if _duration(seg) <= max_cue_duration + GAP_EPS:
             out.append(seg)
             continue
-        cut = _best_cut(seg, punctuation, min_piece)
+        width = script.width(_text(seg)) if script is not None else None
+        fits = (None if width is None
+                else "line" if line_width is not None and width <= line_width
+                else "screen" if screen_width is not None and width <= screen_width
+                else None)
+        cut = _best_cut(seg, punctuation, min_piece, script, fits=fits)
         pieces = _split_one(seg, [cut], kind="split_long") if cut is not None else None
         if not pieces:
             out.append(seg)
             continue
+        head, tail = pieces
+        head["end"] = round(max(head["start"], min(head["end"] + align_release,
+                                                   tail["start"] - align_padding)), 3)
         cuts += 1
         pending.extend(reversed(pieces))
     if cuts:
         logger.info("Split %d cue(s) longer than %.1fs at their longest internal pause",
                     cuts, max_cue_duration)
     return out
+
+
+def _keep_apart(segments: Sequence[SingleAlignedSegment],
+                align_padding: float) -> List[SingleAlignedSegment]:
+    """Leave at least ``align_padding`` between every cue and the next, by ending the earlier
+    one sooner -- the rule alignment applies to cues that would touch, applied once more to
+    whatever the passes made. Never makes a cue end before it starts: one that short is left
+    touching its neighbour (never overlapping it).
+    """
+    cues = list(segments)
+    for cue, nxt in zip(cues, cues[1:]):
+        limit = round(nxt["start"] - align_padding, 3)
+        if cue["end"] <= limit:
+            continue
+        if limit > cue["start"]:
+            cue["end"] = limit
+        elif nxt["start"] > cue["start"]:
+            cue["end"] = min(cue["end"], nxt["start"])
+    return cues
 
 
 def _apply_duration_floor(
@@ -475,6 +578,7 @@ def assemble_cues(
     merge: bool = True,
     script: ScriptConfig = DEFAULT_SCRIPT,
     max_cue_duration: float = 0.0,
+    align_release: float = 0.0,
 ) -> List[SingleAlignedSegment]:
     """Turn aligned subsegments into displayable cues (passes A-E; see module docstring).
 
@@ -484,7 +588,9 @@ def assemble_cues(
     the script's ``line_width`` by default); ``rescue_max_chars`` caps a short-cue
     rescue and defaults to ``max_chars`` -- callers pass the full multi-line budget
     (``max_line_width * max_line_count``) so a stranded marker can attach to a sentence that
-    will simply be broken over two lines. ``is_noise`` decides pass B and is skipped when None.
+    will simply be broken over two lines. Both are widths (``script.width``: in CJK an
+    English letter counts half), not character counts. ``is_noise`` decides pass B and is
+    skipped when None.
 
     ``min_cue_duration=0`` reduces this to pass A alone.
 
@@ -540,9 +646,13 @@ def assemble_cues(
                 vetoes, script, max_cue_duration,
             )
     if merge and max_cue_duration > 0:
-        cues = _split_long_cues(cues, max_cue_duration, punctuation)
+        cues = _split_long_cues(cues, max_cue_duration, punctuation, script,
+                                line_width=max_chars, align_padding=align_padding,
+                                align_release=align_release, screen_width=rescue_max_chars)
     if min_cue_duration > 0:
         cues = _apply_duration_floor(cues, min_cue_duration, align_padding)
+    if merge:
+        cues = _keep_apart(cues, align_padding)
 
     vetoes.report()
     return cues

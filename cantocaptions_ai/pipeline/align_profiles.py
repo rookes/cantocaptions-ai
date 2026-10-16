@@ -95,8 +95,8 @@ class AlignProfile:
     substitutions: Optional[str] = None
     # The least silence (seconds) between two adjacent characters of one cue at which this
     # model's alignment should be read as two separate utterances, so the cue is broken in
-    # two. None -- the default -- never splits, which is the behaviour every caller had
-    # before this field existed.
+    # two, when split_gapped_cues believes the gap. None -- the default -- never splits, which
+    # is the behaviour every caller had before this field existed.
     #
     # It belongs to the align model because it is a statement about *that model's* emission:
     # how long a hole between two characters it will leave when it has nothing to place one
@@ -131,6 +131,12 @@ ALIGN_PROFILES: Dict[str, AlignProfile] = {
         primer=TailPrimer(),
         substitutions="wav2vec2-bert-cantonese.toml",
         char_substitution="homophone",
+        # Split at 1 s, the gap find_gapped_cues reports at, now that split_gapped_cues only
+        # believes a gap the model heard both sides of or the audio shows is silence. On
+        # bluey and Doraemon that refuses every gap at or over 1 s (10, all with an unheard
+        # side and speech in the gap); on a code-switched vocabulary video it splits each
+        # English gloss from its Cantonese and each phrase read with a pause.
+        split_gap=1.0,
     ),
     "facebook/wav2vec2-base-960h": _RAW_INPUT,
     "facebook/wav2vec2-base-10k-voxpopuli-ft-fr": _RAW_INPUT,

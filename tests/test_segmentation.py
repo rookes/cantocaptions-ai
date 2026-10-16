@@ -744,7 +744,10 @@ class TestMaxCueDuration(unittest.TestCase):
         plain = timed(list("一二三四五六七八九十一二三四五六七八九十"), step=0.25)
         cues = assemble_cues([cue_of(plain, sep="")], min_cue_duration=0.5,
                              max_cue_duration=4.0)
-        self.assertEqual([len(c["text"]) for c in cues], [10, 10])
+        # Near the middle, but not between 十 and 一: 十一 is one word.
+        self.assertEqual(len(cues), 2)
+        self.assertLessEqual(abs(len(cues[0]["text"]) - 10), 1)
+        self.assertNotEqual((cues[0]["text"][-1], cues[1]["text"][0]), ("十", "一"))
 
     def test_every_piece_fits_and_none_is_a_fragment(self):
         words = timed([f"w{i}" for i in range(40)], step=0.3)   # 12 s, no pauses at all
@@ -769,3 +772,133 @@ class TestMaxCueDuration(unittest.TestCase):
 def _spaced():
     from cantocaptions_ai.text_profiles import SPACED_SCRIPT
     return SPACED_SCRIPT
+
+
+class TestLongCueSplitKeepsWords(unittest.TestCase):
+    """Pass E cuts between two of alignment's words, and to alignment every Chinese character
+    is one -- so without the script's word check it cut 結果 into 結 and 果."""
+
+    def test_a_chinese_word_is_never_cut(self):
+        # Evenly timed, so every boundary looks alike and the middle one -- inside 結果 --
+        # would win.
+        text = "我今日真係好開心佢結果幾好我哋都好開心呀"
+        self.assertEqual(text[9:11], "結果")
+        words = timed(list(text), step=0.25)
+        cues = assemble_cues([cue_of(words, sep="")], min_cue_duration=0.5,
+                             max_cue_duration=4.0)
+        self.assertEqual(len(cues), 2)
+        self.assertEqual("".join(texts(cues)), text)
+        self.assertNotEqual((cues[0]["text"][-1], cues[1]["text"][0]), ("結", "果"))
+
+
+class TestSlowOneLineCue(unittest.TestCase):
+    """A cue that fits on one line is long only because it is spoken slowly. Pass E cuts it
+    at punctuation or a real pause, never mid-clause where alignment shows nothing."""
+
+    def test_a_slow_clause_is_left_whole(self):
+        # 一諗起下個月去旅行, read over 5.3 s; CTC spans touch, so every gap reads 0.
+        words = timed(list("一諗起下個月去旅行"), start=30.706, step=0.59)
+        cues = assemble_cues([cue_of(words, sep="")], min_cue_duration=0.5,
+                             max_cue_duration=4.0)
+        self.assertEqual(texts(cues), ["一諗起下個月去旅行"])
+
+    def test_a_real_pause_still_splits_it(self):
+        words = timed(list("係大雄屋企喎胖虎小夫"), step=0.3, pauses={5: 1.2})
+        cues = assemble_cues([cue_of(words, sep="")], min_cue_duration=0.5,
+                             max_cue_duration=4.0)
+        self.assertEqual(texts(cues), ["係大雄屋企喎", "胖虎小夫"])
+
+    def test_text_too_wide_for_one_line_is_still_cut(self):
+        words = timed(list("我今日真係好開心佢結果幾好我哋都好開心呀"), step=0.25)
+        self.assertEqual(len(assemble_cues([cue_of(words, sep="")], min_cue_duration=0.5,
+                                           max_cue_duration=4.0)), 2)
+
+
+class TestPadding(unittest.TestCase):
+    """No two cues out of assembly sit closer than align_padding."""
+
+    def test_a_long_cue_cut_with_no_pause_leaves_the_padding(self):
+        words = timed(list("我今日真係好開心佢結果幾好我哋都好開心呀"), step=0.25)
+        head, tail = assemble_cues([cue_of(words, sep="")], min_cue_duration=0.5,
+                                   max_cue_duration=4.0, align_padding=0.04)
+        self.assertAlmostEqual(tail["start"] - head["end"], 0.04, places=3)
+
+    def test_touching_cues_are_pulled_apart(self):
+        # A full stop keeps pass A from joining them; nothing else would part them.
+        cues = assemble_cues([seg(1.0, 2.0, "你好。"), seg(2.0, 3.0, "我走先")],
+                             min_cue_duration=0.5, align_padding=0.04)
+        self.assertEqual([(c["start"], c["end"]) for c in cues], [(1.0, 1.96), (2.0, 3.0)])
+
+    def test_a_cue_too_short_to_give_the_padding_is_left_touching(self):
+        cues = assemble_cues([seg(1.0, 1.02, "喂。"), seg(1.02, 3.0, "我走先")],
+                             min_cue_duration=0, align_padding=0.04)
+        self.assertEqual([(c["start"], c["end"]) for c in cues], [(1.0, 1.02), (1.02, 3.0)])
+
+    def test_realign_cues_keep_their_own_timing(self):
+        # merge=False: the source subtitle's chained cues are authoritative.
+        cues = assemble_cues([seg(1.0, 2.0, "你好。"), seg(2.0, 3.0, "我走先")],
+                             min_cue_duration=0, merge=False, align_padding=0.04)
+        self.assertEqual([(c["start"], c["end"]) for c in cues], [(1.0, 2.0), (2.0, 3.0)])
+
+
+class TestLongCueRelease(unittest.TestCase):
+    def test_a_cut_at_a_pause_releases_the_head_into_it(self):
+        words = timed(list("我對今次考試好有信心呀我哋"), step=0.3, pauses={5: 1.0})
+        head, tail = assemble_cues([cue_of(words, sep="")], min_cue_duration=0.5,
+                                   max_cue_duration=4.0, align_padding=0.04,
+                                   align_release=0.64)[:2]
+        self.assertEqual(head["text"], "我對今次考試")
+        self.assertAlmostEqual(head["end"], words[5]["end"] + 0.64, places=3)
+        self.assertLess(head["end"], tail["start"])
+
+
+class TestConfidentPause(unittest.TestCase):
+    """Text that fits the screen is cut only at punctuation or its longest confident pause --
+    a character held well past this speaker's usual -- and otherwise shown whole."""
+
+    TEXT = "跟住落嚟我將會演奏一首好出名嘅土耳其進行曲啊"   # bluey; 22 wide, 4.7 s
+
+    def _cue(self, held=None):
+        # Every character 0.2 s apart, except 奏 (index 8) held as the speaker paused. As CTC
+        # aligns it: 奏's span runs on to 一, so the aligned gap is 0 and only the hold shows.
+        words = timed(list(self.TEXT), start=32.16, step=0.2, pauses={8: held} if held else None)
+        for a, b in zip(words, words[1:]):
+            a["end"] = b["start"]
+        return words
+
+    def test_the_cut_is_at_the_held_character(self):
+        cues = assemble_cues([cue_of(self._cue(held=0.32), sep="")], min_cue_duration=0.5,
+                             max_cue_duration=4.0, rescue_max_chars=36)
+        self.assertEqual(texts(cues), ["跟住落嚟我將會演奏", "一首好出名嘅土耳其進行曲啊"])
+
+    def test_with_no_pause_it_is_shown_whole(self):
+        cues = assemble_cues([cue_of(self._cue(), sep="")], min_cue_duration=0.5,
+                             max_cue_duration=4.0, rescue_max_chars=36)
+        self.assertEqual(texts(cues), [self.TEXT])
+
+    def test_too_long_for_the_screen_it_is_cut_anyway(self):
+        cues = assemble_cues([cue_of(self._cue(), sep="")], min_cue_duration=0.5,
+                             max_cue_duration=4.0, rescue_max_chars=18)
+        self.assertEqual(len(cues), 2)
+
+
+class TestCantoneseWords(unittest.TestCase):
+    """languages/yue/words.py: the segmenter's boundaries, its dictionary inside long tokens."""
+
+    def check(self, text, cut):
+        from cantocaptions_ai.text_profiles import CJK_SCRIPT
+        return CJK_SCRIPT.inside_word(text, text.index(cut[0]) + len(cut[0]))
+
+    def test_a_word_is_never_cut(self):
+        self.assertTrue(self.check("佢仍然好樂觀", ("樂", "觀")))
+        self.assertTrue(self.check("你對呢個結果滿唔滿意", ("結", "果")))
+        self.assertTrue(self.check("我有啲後悔冇早啲開始", ("冇早", "啲")))
+
+    def test_a_blob_the_segmenter_glued_can_be_cut_between_its_words(self):
+        # pycantonese reads 演奏一首 as one token; 演奏 and 一首 are two words.
+        self.assertFalse(self.check("我將會演奏一首好出名嘅歌", ("演奏", "一")))
+        self.assertTrue(self.check("係生蠔王豆沙包大減價", ("豆沙", "包")))
+
+    def test_the_segmenters_boundary_beats_a_dictionary_word_across_it(self):
+        # 現有 ("existing") is a word, but this is 表現 / 有啲.
+        self.assertFalse(self.check("我對佢嘅表現有啲失望", ("表現", "有")))

@@ -87,6 +87,7 @@ def _run_alignment(
     punctuation=DEFAULT_PUNCTUATION,
     split_gap: Optional[float] = None,
     script=None,
+    extend_ends: bool = True,
 ) -> List[ProcessingItem]:
     from cantocaptions_ai.pipeline.alignment import align
     if progress_callback is not None:
@@ -120,7 +121,7 @@ def _run_alignment(
                 spotchecks=spotchecks,
                 punctuation=punctuation,
                 timeline=timeline,
-                split_gap=split_gap, script=script,
+                split_gap=split_gap, script=script, extend_ends=extend_ends,
             )
             aligned_result['language'] = result['language']
         else:
@@ -886,7 +887,7 @@ class VocalIsolationStage(CachedStage):
 # --- Realign, acoustic anchor: replaces ASR through alignment ------------------------------
 
 def _finish_realigned(segments: List[dict], cfg, split: str,
-                      leash: Optional[float] = None) -> List[dict]:
+                      leash: Optional[float] = None, script=None) -> List[dict]:
     """The fixups every realigned track gets after forced alignment, in order.
 
     The leash (mode adjust) is held after tightening, which can only move edges inwards,
@@ -906,7 +907,7 @@ def _finish_realigned(segments: List[dict], cfg, split: str,
     segments, _cuts = split_at_pauses(
         segments, mode=split, line_gap=cfg.realign_split_gap,
         pause_gap=cfg.realign_pause_gap, align_padding=cfg.align_padding,
-        align_release=cfg.align_release,
+        align_release=cfg.align_release, script=script,
     )
     ensure_visible_cues(segments)
     strip_sentinels(segments)
@@ -986,6 +987,8 @@ class RealignAcousticStage(Stage):
                     # so nothing here may break one in two -- not even an align profile that
                     # asked for it on the ASR path.
                     split_gap=0,
+                    # Realign has its own cue-edge repairs (tighten_cue_spans, the leash).
+                    extend_ends=False,
                     script=ctx.profile.script,
                     # Not profile.punctuation: realign needs the space, the newline and the
                     # line sentinel to be pause tokens, and declares its cue boundaries
@@ -1006,10 +1009,10 @@ class RealignAcousticStage(Stage):
                     continue
                 leash = item.pop("realign_leash", None)
                 item["result"]["segments"] = _finish_realigned(
-                    item["result"]["segments"], cfg, split, leash)
+                    item["result"]["segments"], cfg, split, leash, ctx.profile.script)
                 if item.get("overlay_segments"):
                     item["overlay_segments"] = _finish_realigned(
-                        item["overlay_segments"], cfg, split, leash)
+                        item["overlay_segments"], cfg, split, leash, ctx.profile.script)
         del align_model, align_metadata
         flush_vram()
         return items
@@ -1311,6 +1314,7 @@ class AlignmentStage(_AsrPath):
                 ),
                 # See RealignAcousticStage for why this is forced off under --realign.
                 split_gap=0 if cfg.realign else cfg.align_split_gap,
+                extend_ends=not cfg.realign,
                 script=ctx.profile.script,
             )
             if cfg.realign:
@@ -1326,7 +1330,7 @@ class AlignmentStage(_AsrPath):
                     segments, _cuts = split_at_pauses(
                         segments, mode=split, line_gap=cfg.realign_split_gap,
                         pause_gap=cfg.realign_pause_gap, align_padding=cfg.align_padding,
-                        align_release=cfg.align_release,
+                        align_release=cfg.align_release, script=ctx.profile.script,
                     )
                     item["result"]["segments"] = segments
                     # Order first: ensure_visible_cues reads the previous cue's end as

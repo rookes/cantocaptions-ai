@@ -28,12 +28,14 @@ from cantocaptions_ai.utils.schema import (
 )
 from cantocaptions_ai.text_profiles import (
     DEFAULT_PUNCTUATION,
+    LATIN_WORD,
     PunctuationConfig,
     ScriptConfig,
     SpotCheck,
     script_for_language,
 )
 from cantocaptions_ai.pipeline.align_checks import (
+    extend_to_sound,
     split_gapped_cues,
     warn_on_gapped_cues,
     warn_on_silent_starts,
@@ -952,6 +954,16 @@ def _align_segment(
         def _at(frame: float) -> float:
             return frame * ratio + t1
 
+    spaced = _spaced(model_lang, script)
+    # Without spaces every character is its own word -- except inside a run of code-switched
+    # English (or a number), which stays one word. Cue assembly, split_gapped_cues and
+    # realign all cut a cue only between two words, so this is what keeps "vocabulary" from
+    # being cut into "vocabula" and "ry".
+    within_word = set()
+    if not spaced:
+        for match in LATIN_WORD.finditer(text):
+            within_word.update(range(match.start(), match.end() - 1))
+
     char_segments_arr = []
     word_idx = 0
     for cdx, char in enumerate(text):
@@ -965,8 +977,9 @@ def _align_segment(
             peak = round(peaks[k], 3)
         char_segments_arr.append({"char": char, "start": start, "end": end, "score": score,
                                   "peak": peak, "word-idx": word_idx})
-        if not _spaced(model_lang, script):
-            word_idx += 1
+        if not spaced:
+            if cdx not in within_word:
+                word_idx += 1
         elif cdx == len(text) - 1 or text[cdx + 1] == " ":
             word_idx += 1
 
@@ -1197,6 +1210,7 @@ def align(
     timeline=None,
     split_gap: Optional[float] = None,
     script: Optional[ScriptConfig] = None,
+    extend_ends: bool = True,
 ) -> AlignedTranscriptionResult:
     """Align phoneme recognition predictions to known transcription.
 
@@ -1221,6 +1235,10 @@ def align(
     ``script`` (from the ASR model's profile) decides whether spaces separate words, which
     changes how words are counted, how sentences are split and how subsegments rejoin. None
     derives it from the align model's language.
+
+    ``extend_ends`` extends a cue whose end still sits on speech to where the sound stops
+    (``align_checks.extend_to_sound``). ``--realign`` passes False: its cue edges have their
+    own repairs (``realign.tighten_cue_spans``, the leash).
     """
     spotchecks = spotchecks or {}
     if processor is None:
@@ -1364,10 +1382,14 @@ def align(
     # each piece keeps the outer edge it was given and takes its inner one from its own
     # characters, so nothing overlaps and no cue outside the split moves -- and *before* the
     # checks below, so they judge the cues the rest of the pipeline will see.
+    # The audio the checks below judge silence against: the VAD segments, or the whole file.
+    regions = vad_segments if vad_segments is not None else whole_file_region(audio, MAX_DURATION)
     split_gap = profile.split_gap if split_gap is None else split_gap
     if split_gap and aligned_segments:
         aligned_segments, breaks = split_gapped_cues(
-            aligned_segments, split_gap, punctuation.split_chars,
+            aligned_segments, split_gap, punctuation.split_chars, regions=regions,
+            script=script or script_for_language(model_lang),
+            release=align_release, padding=align_padding,
         )
         if breaks:
             logger.info(
@@ -1375,13 +1397,21 @@ def align(
                 breaks, "" if breaks == 1 else "s", split_gap,
             )
 
+    # --- A cue may not end while its last syllable is still being said. CTC gives a character
+    # only the frames it fires on, so a syllable held by a slow speaker outlasts its span, and
+    # a cue with no punctuation to release its end (or one whose release is too short) left the
+    # screen before the word was finished. After the split, so each piece is extended against
+    # its own neighbour; before the checks, which judge the final edges.
+    if extend_ends and aligned_segments:
+        moved = extend_to_sound(aligned_segments, regions, align_padding, file_end=MAX_DURATION,
+                                split_chars=punctuation.split_chars)
+        if moved:
+            logger.debug("Extended %d cue end(s) to where the speech stops", moved)
+
     # --- Validate. Model-agnostic and always on: a cue start sitting on silence is wrong
     # whichever align model produced it. Runs on final timings, after the release/trim
     # pass, so it judges what the rest of the pipeline will actually consume.
-    silent = warn_on_silent_starts(
-        aligned_segments,
-        vad_segments if vad_segments is not None else whole_file_region(audio, MAX_DURATION),
-    )
+    silent = warn_on_silent_starts(aligned_segments, regions)
     # Land the finding on the cue rather than only printing it: a warning that names no cue
     # cannot be acted on across a 2000-line file. setdefault so a reason set at placement
     # time ("no audio for this line") outranks a symptom of it.

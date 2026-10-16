@@ -135,3 +135,32 @@ def test_a_concurrent_line_still_lands_on_its_own_characters():
     result = align(transcript, model, meta, segments[:1], "cpu", vram_checks=False)
     truth = next(start for ch, start, _ in scripted.char_times[0] if ch == clause[0])
     assert result["segments"][0]["start"] == pytest.approx(truth, abs=FRAME_S / 2)
+
+
+def test_code_switched_english_stays_one_word():
+    # Without spaces every Chinese character is its own word, but a run of English is one:
+    # cue assembly and realign cut a cue only between two words.
+    text = "我識講vocabulary同open-minded。"
+    scripted = ScriptedAudio(script=((1.0, text),), duration=8.0)
+    result = _align(scripted, return_char_alignments=True)
+    words = [w["word"] for seg in result["segments"] for w in seg["words"]]
+    assert words == ["我", "識", "講", "vocabulary", "同", "open-minded", "。"]
+    # ...while the characters stay one per character, each with its own timing.
+    assert "".join(c["char"] for seg in result["segments"] for c in seg["chars"]) == text
+
+
+def test_a_long_english_cue_is_never_cut_inside_a_word():
+    # The align model hears no gap between English words (it barely hears English at all),
+    # so every boundary inside the sentence looks the same to the long-cue split. Each piece
+    # must still start and end on a whole word.
+    from cantocaptions_ai.pipeline.segmentation import assemble_cues
+
+    sentence = "I get very nervous every time I have a job interview"
+    spoken = sentence.replace(" ", "").lower()
+    scripted = ScriptedAudio(script=((1.0, spoken),), duration=10.0)
+    segments = _align(scripted, texts=[sentence])["segments"]
+    cues = assemble_cues(segments, min_cue_duration=0, max_cue_duration=4.0)
+    assert len(cues) > 1
+    assert " ".join(c["text"].strip() for c in cues) == sentence
+    for cue in cues:
+        assert all(word in sentence.split() for word in cue["text"].split())

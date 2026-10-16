@@ -103,6 +103,7 @@ def _merge_and_write(
     max_cue_duration: float = 0.0,
     order_cues: bool = False,
     *,
+    align_release: float = 0.0,
     collect: bool = False,
     audio_start_offset: float = 0.0,
     display_paths: Optional[dict] = None,
@@ -166,6 +167,7 @@ def _merge_and_write(
             script=script,
             merge=merge,
             max_cue_duration=max_cue_duration,
+            align_release=align_release,
         )
         new_segments = assemble_cues(result["segments"], **assembly)
         if item.get("overlay_segments"):
@@ -1298,7 +1300,7 @@ def _execute_pipeline(
             # a decision somebody made, not an artefact of over-splitting.
             min_cue_duration=0.0 if realign_mode == "sync" else cfg.min_cue_duration,
             merge_gap=cfg.merge_gap, max_line_width=cfg.max_line_width,
-            max_line_count=cfg.max_line_count,
+            max_line_count=cfg.max_line_count, align_release=cfg.align_release,
             # Under --realign the cue boundaries came from the transcript's own line breaks
             # and are not an artifact to be undone, so the two passes that join cues are
             # off; the noise drop and the duration floor still run.

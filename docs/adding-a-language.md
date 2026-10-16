@@ -53,7 +53,7 @@ other language.
 
 | Field | What it buys |
 |---|---|
-| `script` | `ScriptConfig(word_separator, line_width, layout)`. `layout` names a line breaker in `cleaning/layout.py` (`"cjk"`, `"word"`); add one there if neither fits. |
+| `script` | `ScriptConfig(word_separator, line_width, layout, cell_columns)`. `layout` names a line breaker in `cleaning/layout.py` (`"cjk"`, `"word"`); add one there if neither fits. `cell_columns` is how many display columns `line_width` counts per cell: 2 for CJK (a half-width English letter counts half), 1 for a spaced script (a CJK character counts two); every width budget uses `ScriptConfig.width`. |
 | `punctuation` | `PunctuationConfig(split_chars, mergeable_chars)`: where alignment splits clauses and which trailing marks still let two cues join. |
 | `conventions` | `{model name: ModelConventions}`: how one ASR model writes this language. `normalization` (e.g. OpenCC), `spotchecks` (interchangeable characters alignment may swap for the one the audio supports), `segmentation.leading_markers` (clause-leading words cue assembly rejoins forwards), `cleaning_manifest`, and `punctuation`/`script` overrides. Unlisted models get the pack defaults. |
 | `cleaning` | `CleaningSpec(rules_dir, manifest, basic_manifest, builtin_steps, noise_tokens)`. See below. `basic_manifest` names the essential, content-preserving subset (punctuation, character variants) applied to a finished subtitle before it is proofread. |

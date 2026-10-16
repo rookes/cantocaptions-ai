@@ -150,7 +150,8 @@ class PipelineConfig:
     align_split_gap: Optional[float] = None
 
     # Subtitle formatting
-    # Characters per line before text is broken onto the next. None: the language's own width
+    # Line width before text is broken onto the next, in the script's cells (ScriptConfig.width:
+    # in Chinese, a half-width character counts half). None: the language's own width
     # (its script's line_width: 18 for Chinese, 42 for space-separated scripts), filled in by
     # validate_config (see LANGUAGE_DEFAULTED). 0: never break a line.
     max_line_width: Optional[int] = None

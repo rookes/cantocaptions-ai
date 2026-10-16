@@ -8,7 +8,7 @@ at the space nearest its middle.
 """
 from typing import Callable, Mapping, Optional
 
-from cantocaptions_ai.text_profiles import word_wrap
+from cantocaptions_ai.text_profiles import LATIN_WORD, word_wrap
 
 
 def _cjk(text: str, line_max_length: int) -> str:
@@ -21,6 +21,23 @@ def _cjk(text: str, line_max_length: int) -> str:
 LAYOUTS: Mapping[str, Callable[[str, int], str]] = {
     "cjk": _cjk,
     "word": word_wrap,
+}
+
+
+def _cjk_inside_word(text: str, at: int) -> bool:
+    from cantocaptions_ai.languages.yue.words import inside_word
+    return inside_word(text, at)
+
+
+def _latin_inside_word(text: str, at: int) -> bool:
+    return any(m.start() < at < m.end() for m in LATIN_WORD.finditer(text))
+
+
+# For each layout: whether cutting text before text[at] would split a word. Every cue
+# splitter asks this through ScriptConfig.inside_word before it cuts.
+WORD_CHECKS: Mapping[str, Callable[[str, int], bool]] = {
+    "cjk": _cjk_inside_word,
+    "word": _latin_inside_word,
 }
 
 

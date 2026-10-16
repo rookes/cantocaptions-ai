@@ -11,12 +11,37 @@ This module is deliberately free of any ``cantonese`` or ``pipeline`` import: it
 vocabulary both of those speak, not an implementation of either.
 """
 import re
+import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import List, Mapping, Optional, Tuple
 
 # Languages written without spaces between words. Mirrors utils.output's list, which
 # still serves the whisperX-era writers; this is the one the text conventions follow.
 LANGUAGES_WITHOUT_SPACES = ("ja", "zh", "yue")
+
+# One word of Latin-script text (or a number) written inside text that has no spaces between
+# its own words: code-switched English in a Cantonese line. Alignment keeps each match as one
+# word, so nothing that cuts a cue between words can cut inside it, and the line breaker never
+# breaks inside one. An apostrophe, hyphen or point joins two runs (you've, open-minded, 3.5).
+LATIN_WORD = re.compile(r"[A-Za-z0-9]+(?:['’\-.][A-Za-z0-9]+)*")
+
+
+@lru_cache(maxsize=4096)
+def display_columns(char: str) -> int:
+    """How many display columns *char* takes: 2 for a full-width character, 1 for a half-width one.
+
+    Half-width is what ``east_asian_width`` calls narrow (ASCII letters, digits, space and
+    punctuation) or half-width, plus a non-wide Latin letter or digit (é). Ambiguous-width
+    punctuation (…, ·) counts as full: a CJK font draws it full-width, and counting it so is
+    what keeps a line of Chinese measuring exactly its length in characters.
+    """
+    eaw = unicodedata.east_asian_width(char)
+    if eaw in ("W", "F"):
+        return 2
+    if eaw in ("Na", "H"):
+        return 1
+    return 1 if unicodedata.category(char)[0] in "LN" else 2
 
 CJK_SPLIT_CHARS = ("，", "。", "？", "！", "；", "…")
 CJK_MERGEABLE_CHARS = ("，",)
@@ -61,17 +86,33 @@ class ScriptConfig:
     ``word_separator`` joins two pieces of text that were split apart (two cues merged back
     into one, two words of a line): nothing for CJK, a space for space-separated scripts.
     It also decides whether alignment treats a space as a word boundary. ``line_width`` is
-    the default subtitle line length in characters, used where no ``max_line_width`` is set.
+    the default subtitle line length, used where no ``max_line_width`` is set, in this
+    script's own character cells (see :meth:`width`).
     ``layout`` names the line breaker (see ``cantonese.cleaner.LAYOUTS``): ``"cjk"`` breaks
     at punctuation or between words found by segmentation; ``"word"`` breaks at a space.
+    ``cell_columns`` is how many display columns one cell is: 2 for CJK, whose cell is one
+    Chinese character (so an English letter counts half), 1 for a space-separated script,
+    whose cell is one letter (so a Chinese character counts two).
     """
     word_separator: str = ""
     line_width: int = 18
     layout: str = "cjk"
+    cell_columns: int = 2
 
     @property
     def spaced(self) -> bool:
         return bool(self.word_separator)
+
+    def width(self, text: str) -> float:
+        """How wide *text* is on screen, in this script's cells (what ``line_width`` counts)."""
+        return sum(display_columns(c) for c in text) / self.cell_columns
+
+    def inside_word(self, text: str, at: int) -> bool:
+        """Whether cutting *text* before ``text[at]`` would split a word (see
+        ``cleaning.layout.WORD_CHECKS``, which this script's ``layout`` picks from)."""
+        from cantocaptions_ai.cleaning.layout import WORD_CHECKS
+        check = WORD_CHECKS.get(self.layout)
+        return check(text, at) if check is not None else False
 
     def join(self, left: str, right: str) -> str:
         """Join two pieces of text the way this script writes them."""
@@ -83,7 +124,7 @@ class ScriptConfig:
 
 
 CJK_SCRIPT = ScriptConfig()
-SPACED_SCRIPT = ScriptConfig(word_separator=" ", line_width=42, layout="word")
+SPACED_SCRIPT = ScriptConfig(word_separator=" ", line_width=42, layout="word", cell_columns=1)
 
 
 def script_for_language(language: Optional[str]) -> ScriptConfig:
@@ -165,12 +206,15 @@ def is_mergeable(
     max_chars: int = DEFAULT_SCRIPT.line_width,
     script: ScriptConfig = DEFAULT_SCRIPT,
 ) -> bool:
-    "Returns true if text1 and text2 can be acceptably merged into a single line."
+    """Returns true if text1 and text2 can be acceptably merged into a single line.
+
+    ``max_chars`` is a width in the script's cells (:meth:`ScriptConfig.width`).
+    """
     if len(text1) == 0 or len(text2) == 0:
         return True
 
     if boundary_is_mergeable(text1, punctuation):
-        if len(script.join(text1, text2)) <= max_chars:
+        if script.width(script.join(text1, text2)) <= max_chars:
             return True
 
     return False
@@ -186,11 +230,13 @@ def word_wrap(text: str, line_max_length: int) -> str:
     re-breaks text that already holds a line break, and leaves a line that fits (or has no
     space to break at) alone.
     """
-    if "\n" in text or len(text) <= line_max_length:
+    width = SPACED_SCRIPT.width
+    if "\n" in text or width(text) <= line_max_length:
         return text
     spaces = [m.start() for m in _SPACE_RUN.finditer(text)]
     if not spaces:
         return text
-    middle = len(text) / 2
-    best = min(spaces, key=lambda i: (len(text[:i]) > line_max_length, abs(i - middle)))
+    middle = width(text) / 2
+    best = min(spaces, key=lambda i: (width(text[:i]) > line_max_length,
+                                      abs(width(text[:i]) - middle)))
     return text[:best].rstrip() + "\n" + text[best:].lstrip()
