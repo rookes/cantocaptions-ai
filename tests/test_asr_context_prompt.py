@@ -23,6 +23,8 @@ def _pipeline(processor):
     pipe.processor = processor
     pipe.model = MagicMock()
     pipe.max_new_tokens = 200
+    pipe.loop_retry_penalty = 0
+    pipe._eos_ids = set()
     pipe.policy = MagicMock(enabled=False)
     pipe.preset_language = "yue"
     import torch

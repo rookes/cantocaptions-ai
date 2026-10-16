@@ -210,10 +210,17 @@ class BatchedAsrStage(AsrStage):
 
     def _segments(self, segs, texts) -> List[SingleSegment]:
         from cantocaptions_ai.languages.yue.text import normalize_segment_text
-        return [
-            normalize_segment_text({'text': text or '', 'start': seg['start'], 'end': seg['end']}, self.normalization)
-            for seg, text in zip(segs, texts)
-        ]
+        out = []
+        for seg, text in zip(segs, texts):
+            segment = normalize_segment_text(
+                {'text': str(text or ''), 'start': seg['start'], 'end': seg['end']}, self.normalization)
+            # A backend may mark how generation ended (_asr_native.AsrText). Recorded only
+            # when set, so ordinary segments -- and their checkpoints -- are unchanged.
+            for flag in ('budget_hit', 'retried'):
+                if getattr(text, flag, False):
+                    segment[flag] = True
+            out.append(segment)
+        return out
 
     def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
         """Transcribe all files, batching VAD segments across file boundaries.
@@ -376,6 +383,7 @@ def load_model(
     vram_headroom_mb: int = 512,
     processor=None,
     normalization=None,
+    loop_retry_penalty: float = 1.1,
 ) -> AsrStage:
     """Load the ASR model and the backend that runs it (see :func:`backend_for`).
 
@@ -406,4 +414,5 @@ def load_model(
     )
     if backend.name == "qwen3-asr":
         kwargs["compile_enabled"] = compile_enabled
+        kwargs["loop_retry_penalty"] = loop_retry_penalty
     return backend.load(**kwargs)

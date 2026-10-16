@@ -152,6 +152,77 @@ class TestAsrOomHalving(unittest.TestCase):
             self.assertIn("text", seg)
 
 
+class _LoopingModel:
+    """Fake model whose rows with an odd marker never emit EOS: without a repetition
+    penalty they run the whole token budget (a repetition loop); with one they stop.
+    Rows with an even marker always finish with EOS straight away."""
+
+    EOS = 99
+
+    def __init__(self, loops_under_penalty=False):
+        self.device = torch.device("cpu")
+        self.dtype = torch.float32
+        self.generation_config = type("GC", (), {"eos_token_id": [self.EOS, 98]})()
+        self.loops_under_penalty = loops_under_penalty
+        self.calls = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        input_ids = kwargs["input_ids"]
+        max_new = kwargs["max_new_tokens"]
+        penalised = kwargs.get("repetition_penalty") is not None
+        rows = []
+        for marker in input_ids[:, 0].tolist():
+            loops = marker % 2 == 1 and (not penalised or self.loops_under_penalty)
+            tail = [marker] * max_new if loops else [marker, self.EOS] + [98] * (max_new - 2)
+            rows.append(tail)
+        return torch.cat([input_ids, torch.tensor(rows, dtype=torch.long)], dim=1)
+
+
+class TestAsrLoopRetry(unittest.TestCase):
+    """A row that spends the whole budget without EOS is a repetition loop; it is
+    re-generated once, alone, with a repetition penalty."""
+
+    def _pipe(self, model, penalty=1.1):
+        return QwenPipelineNative(
+            model=model, processor=_FakeProcessor(), device="cpu",
+            language="yue", batch_size=4, loop_retry_penalty=penalty,
+        )
+
+    def test_looping_row_is_retried_with_penalty(self):
+        model = _LoopingModel()
+        result = self._pipe(model).process(_make_marked_segments([2, 3, 4]))
+        segs = result["segments"]
+        self.assertEqual([s["text"] for s in segs], ["2", "3", "4"])
+        self.assertEqual((segs[1].get("budget_hit"), segs[1].get("retried")), (True, True))
+        for s in (segs[0], segs[2]):
+            self.assertNotIn("budget_hit", s)
+            self.assertNotIn("retried", s)
+        self.assertEqual(len(model.calls), 2)
+        retry = model.calls[1]
+        self.assertEqual(retry["repetition_penalty"], 1.1)
+        self.assertEqual(retry["input_ids"][:, 0].tolist(), [3], "only the looping row is retried")
+
+    def test_retry_disabled_still_flags_the_loop(self):
+        model = _LoopingModel()
+        segs = self._pipe(model, penalty=0).process(_make_marked_segments([3]))["segments"]
+        self.assertEqual(len(model.calls), 1)
+        self.assertTrue(segs[0]["budget_hit"])
+        self.assertNotIn("retried", segs[0])
+
+    def test_no_loop_no_retry(self):
+        model = _LoopingModel()
+        segs = self._pipe(model).process(_make_marked_segments([2, 4]))["segments"]
+        self.assertEqual(len(model.calls), 1)
+        self.assertTrue(all("budget_hit" not in s for s in segs))
+
+    def test_retry_that_still_loops_keeps_its_text(self):
+        model = _LoopingModel(loops_under_penalty=True)
+        segs = self._pipe(model).process(_make_marked_segments([5]))["segments"]
+        self.assertEqual(segs[0]["text"], "5")
+        self.assertTrue(segs[0]["retried"])
+
+
 class TestAsrScatterAndOrder(unittest.TestCase):
     """Lock in that batching maps each decoded text back to its originating
     segment. These guard the correctness a future reorder/executor refactor could

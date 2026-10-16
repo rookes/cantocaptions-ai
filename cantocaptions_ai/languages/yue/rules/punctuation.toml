@@ -2,11 +2,15 @@
 # Rules are applied in order, top to bottom, one re.sub pass each.
 # Patterns/replacements use TOML literal (single-quoted) strings: backslashes are verbatim.
 #
-# Code-switched English: a line with Chinese in it takes full-width punctuation, so the rules
-# converting to full width carry a `when` matching a CJK character. A line with no Chinese at
-# all is English and keeps (or gets back) half-width punctuation -- the ASR writes
-# "Touched， moved" and "result？" even there; those rules carry a `when` matching a line with
-# no CJK character anywhere.
+# Code-switched English. Two line classes, told apart by each rule's `when`:
+#   * English: no CJK character anywhere AND at least one Latin letter. It keeps (or gets
+#     back) half-width punctuation -- the ASR writes "Touched， moved" and "result？" even
+#     there.
+#   * Chinese: everything else -- a line with CJK in it, English words included, and also a
+#     line with no letters at all (digits and marks: "14？", "1，2，3", "？？？"). Those are
+#     read in Cantonese, so they take full-width punctuation like the lines around them.
+#     The comma rule stays CJK-only; a letterless line gets its own copy, which leaves a
+#     thousands separator (1,000) alone.
 
 [[rules]]
 pattern = '[~～]'
@@ -54,7 +58,7 @@ comment = 'Netflix standard uses half-width percent sign'
 [[rules]]
 pattern = '\?'
 replace = '？'
-when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
+when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]|^[^A-Za-z]*$'
 
 [[rules]]
 pattern = '\.\.\.'
@@ -67,34 +71,34 @@ replace = '…'
 [[rules]]
 pattern = '\s*，\s*(?=\S)'
 replace = ', '
-when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+when = '^(?=[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*[A-Za-z])[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
 comment = 'English line: half-width comma, one space after'
 
 [[rules]]
 pattern = '\s*。\s*(?=\S)'
 replace = '. '
-when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+when = '^(?=[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*[A-Za-z])[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
 
 [[rules]]
 pattern = '？'
 replace = '?'
-when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+when = '^(?=[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*[A-Za-z])[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
 
 [[rules]]
 pattern = '！'
 replace = '!'
-when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+when = '^(?=[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*[A-Za-z])[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
 
 [[rules]]
 pattern = '\s*[，,]\s*$'
 replace = ''
-when = '^[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+when = '^(?=[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*[A-Za-z])[^\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
 comment = 'English line: no trailing comma, as on a Chinese line'
 
 [[rules]]
 pattern = '([^\d零一二兩两三四五六七八九十百千])[。.]([^\d零一二兩两三四五六七八九十百千])'
 replace = '\1，\2'
-when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
+when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]|^[^A-Za-z]*$'
 
 [[rules]]
 pattern = '[。.]$'
@@ -107,7 +111,7 @@ replace = ''
 [[rules]]
 pattern = '[!！]'
 replace = '，'
-when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
+when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]|^[^A-Za-z]*$'
 
 [[rules]]
 pattern = ','
@@ -115,9 +119,15 @@ replace = '，'
 when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
 
 [[rules]]
+pattern = '(?<!\d),|,(?!\d{3}(?!\d))'
+replace = '，'
+when = '^[^A-Za-z\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]*$'
+comment = 'letterless line (digits, marks): full-width comma, but 1,000 keeps its thousands separator'
+
+[[rules]]
 pattern = '\s*([，？！。…：；、])\s*'
 replace = '\1'
-when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]'
+when = '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]|^[^A-Za-z]*$'
 comment = 'no space beside full-width punctuation, English neighbours included'
 
 [[rules]]

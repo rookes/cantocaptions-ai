@@ -54,6 +54,10 @@ class PipelineConfig:
     threads: int = 0
     hf_token: Optional[str] = None
     compile: bool = False
+    # A chunk whose generation spends the whole token budget without an EOS is a
+    # repetition loop (a sung "da da da" decoding to 噔噔噔... until the cap); it is
+    # re-generated once with this repetition_penalty. 0 disables the retry.
+    asr_loop_retry_penalty: float = 1.1
 
     # Model loading
     # The ASR model; None uses the language pack's own (cantocaptions-cantonese-ASR for yue).
@@ -443,7 +447,7 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     "model": ("language", "model", "model_dir", "model_cache_only"),
     "inference": (
         "device", "device_index", "batch_size", "files_per_group", "asr_compute_type",
-        "attn_implementation", "threads", "hf_token", "compile",
+        "attn_implementation", "threads", "hf_token", "compile", "asr_loop_retry_penalty",
     ),
     "output": (
         "output_dir", "output_format", "verbose", "print_progress", "vram_checks",

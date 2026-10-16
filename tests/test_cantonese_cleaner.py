@@ -236,6 +236,26 @@ class TestCodeSwitchedPunctuation(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.cleaner.clean(text), expected)
 
+    def test_letterless_line_takes_full_width_punctuation(self):
+        # Digits and marks with no Latin letter are read in Cantonese, so they are a
+        # Chinese line, not an English one ("14?" used to stay half-width).
+        for text, expected in [
+            ("14?", "14？"),
+            ("43420024, 43420", "43420024，43420"),
+            ("1, 2, 3!", "1，2，3"),
+            ("1，2，3！", "1，2，3"),
+            ("100,000?", "100,000？"),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(self.cleaner.clean(text), expected)
+
+    def test_letterless_line_keeps_thousands_separator(self):
+        self.assertEqual(self.cleaner.clean("1,000"), "1,000")
+
+    def test_english_line_with_digits_stays_english(self):
+        self.assertEqual(self.cleaner.clean("I am 14?"), "I am 14?")
+        self.assertEqual(self.cleaner.clean("OK? Sure, fine"), "OK? Sure, fine")
+
     def test_hyphenated_word_keeps_its_hyphen(self):
         self.assertEqual(self.cleaner.clean("My mom is very open-minded"), "My mom is very open-minded")
         self.assertEqual(self.cleaner.clean("買件T-shirt"), "買件T-shirt")

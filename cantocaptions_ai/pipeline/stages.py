@@ -1123,6 +1123,7 @@ class TranscriptionStage(_CachedAsrPath):
             verbose=cfg.verbose,
             vram_checks=cfg.vram_checks,
             vram_headroom_mb=cfg.vram_headroom_mb,
+            loop_retry_penalty=cfg.asr_loop_retry_penalty,
         ) as model:
             timer.mark_inference_start()
             items = _stage_run(model, ctx, items, timer)

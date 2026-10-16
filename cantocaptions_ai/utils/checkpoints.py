@@ -36,7 +36,7 @@ _STAGE_FIELDS: Dict[str, Tuple[str, ...]] = {
         "vocal_isolation_method", "vocal_isolation_segment_mode", "vocal_isolation_compute_type",
         "vocal_isolation_span_gap",
     ),
-    "transcription": ("language", "asr_compute_type"),
+    "transcription": ("language", "asr_compute_type", "asr_loop_retry_penalty"),
     "ensemble": ("ensemble_model",),
     "llm_correction": ("llm_model", "reference_correction_semantic"),
     "diarization": ("diarize_model", "diarize_scope", "min_speakers", "max_speakers"),

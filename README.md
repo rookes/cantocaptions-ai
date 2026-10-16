@@ -115,6 +115,11 @@ would be a single cue.
 
 Only the fine-tune is tuned for Cantonese subtitles; the others are there for other languages, and for comparison.
 
+A Qwen3-ASR chunk that uses up its whole token budget without finishing is stuck in a repetition loop. For
+example, a sung "da da da" can come out as one 噔 after another until the budget runs out. Such a chunk is
+generated again once with `asr_loop_retry_penalty` (default 1.1, `0` turns it off), and the log warns when it
+happens.
+
 ### Speech detection (VAD)
 
 Before transcribing, the pipeline finds where the speech in the audio is and cuts it into chunks. Three 
@@ -175,6 +180,9 @@ After alignment, subtitles are split and re-merged to maintain output standards.
   wrapped. Unset, the width is the language's own: 18 characters for Chinese, 42 for space-separated scripts. `0` never
   breaks a line. Width is measured as displayed: in a Chinese line, English letters, digits and spaces count half a
   character, and an English word is never broken across lines or subtitles
+
+Punctuation follows the line. A line with Chinese in it, or with no letters at all (digits such as `14？`), takes
+full-width marks. A line of English takes English punctuation.
 
 More extensive text processing, such as OpenCC simplified -> traditional options and regex substitutions, are configurable via .toml
 files in `cantocaptions_ai/languages/yue/rules/` (point `--clean_rules_dir` at a copy to use your own).

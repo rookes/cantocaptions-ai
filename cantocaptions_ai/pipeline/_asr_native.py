@@ -3,7 +3,7 @@
 Loaded lazily by asr.load_model() when native qwen3_asr support is detected
 (transformers>=5.13.0, a base dependency).
 """
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,6 +28,27 @@ logger = get_logger(__name__)
 # so a 78s segment needs ~336 characters and would silently truncate. 8 leaves headroom
 # over the densest observed speech.
 _TOKENS_PER_SECOND = 8
+
+
+class AsrText(str):
+    """A decoded transcription that also says how generation ended.
+
+    ``budget_hit``: generation spent every allowed token without an EOS -- on this model
+    that is a repetition loop, not a long line (a sung "da da da" decoding to 噔 over and
+    over until the cap, which the processor's repetition pass then folds back to a single
+    噔). ``retried``: the row was re-generated with a repetition penalty because of it.
+    A plain ``str`` everywhere else, so callers that only want text see no change.
+    """
+
+    budget_hit: bool = False
+    retried: bool = False
+
+    @classmethod
+    def of(cls, text: str, *, budget_hit: bool = False, retried: bool = False) -> "AsrText":
+        out = cls(text)
+        out.budget_hit = budget_hit
+        out.retried = retried
+        return out
 
 
 def _compile_and_warmup(model, processor, language: str, batch_size: Optional[int]) -> None:
@@ -121,6 +142,7 @@ class QwenPipelineNative(BatchedAsrStage):
         verbose: bool = False,
         vram_checks: bool = True,
         normalization: TextNormalization = DEFAULT_NORMALIZATION,
+        loop_retry_penalty: float = 1.1,
     ):
         super().__init__(
             device=device, language=language, batch_size=batch_size,
@@ -130,6 +152,9 @@ class QwenPipelineNative(BatchedAsrStage):
         self.model = model
         self.processor = processor
         self.max_new_tokens = max_new_tokens
+        self.loop_retry_penalty = loop_retry_penalty
+        eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+        self._eos_ids = set(eos if isinstance(eos, (list, tuple)) else [eos]) - {None}
 
     def _backend_language(self, language: Optional[str]) -> str:
         # Qwen3-ASR names languages in English ("Cantonese"), and that is also what its
@@ -175,9 +200,37 @@ class QwenPipelineNative(BatchedAsrStage):
         With no context supplied this takes the plain ``apply_transcription_request``
         path unchanged, so runs without --asr_context are bit-identical to before.
 
+        A row that spends the whole token budget without an EOS is a repetition loop.
+        It is re-generated once with ``repetition_penalty`` = ``loop_retry_penalty``
+        (0 disables the retry). On the Bluey fixture's sung opening the loop decodes to a
+        lone 噔, and the retry recovers the whole chunk. Every text comes back as an
+        :class:`AsrText` carrying ``budget_hit``/``retried``.
+
         Raises RuntimeError on CUDA OOM (caught and retried at a smaller batch size by
         BatchExecutor); no shared state is mutated before the model call.
         """
+        texts, hits = self._generate(wavs, language, contexts)
+        out = [AsrText.of(t, budget_hit=h) for t, h in zip(texts, hits)]
+        looped = [i for i, h in enumerate(hits) if h]
+        if looped and self.loop_retry_penalty:
+            retry_texts, retry_hits = self._generate(
+                [wavs[i] for i in looped], language,
+                [contexts[i] for i in looped] if contexts is not None else None,
+                repetition_penalty=self.loop_retry_penalty,
+            )
+            for i, text, hit in zip(looped, retry_texts, retry_hits):
+                logger.warning(
+                    "ASR: a %.1f s chunk spent the whole token budget (repetition loop: %r); "
+                    "re-generated with repetition_penalty=%s%s",
+                    len(wavs[i]) / SAMPLE_RATE, str(out[i])[:20], self.loop_retry_penalty,
+                    " -- it still looped" if hit else "")
+                out[i] = AsrText.of(text, budget_hit=True, retried=True)
+        return out
+
+    def _generate(self, wavs: List, language: str,
+                  contexts: Optional[List[Optional[str]]] = None,
+                  **generate_kwargs) -> Tuple[List[str], List[bool]]:
+        """One ``generate`` over a batch: (decoded texts, per-row budget_hit)."""
         if contexts is not None and any(contexts):
             prompts = self._build_context_prompts(contexts, language)
             for prompt in prompts:
@@ -204,20 +257,26 @@ class QwenPipelineNative(BatchedAsrStage):
 
         with torch.inference_mode():
             generated = self.model.generate(
-                **inputs, max_new_tokens=max_new, do_sample=False
+                **inputs, max_new_tokens=max_new, do_sample=False, **generate_kwargs
             )
 
         # generate() returns a plain tensor by default; handle both for safety
         sequences = generated if isinstance(generated, torch.Tensor) else generated.sequences
         n_input = inputs["input_ids"].shape[1]
-        logger.debug("[TOKENS] batch=%d, new_tokens=%d, max=%d", len(wavs), sequences.shape[1] - n_input, self.max_new_tokens)
+        new_tokens = sequences[:, n_input:]
+        logger.debug("[TOKENS] batch=%d, new_tokens=%d, max=%d", len(wavs), new_tokens.shape[1], self.max_new_tokens)
+        # A row that finished early carries its EOS (then pad, itself an EOS id on
+        # Qwen3-ASR) somewhere in it; a row that never did ran the full budget.
+        hits = [new_tokens.shape[1] >= max_new
+                and not any(int(t) in self._eos_ids for t in row)
+                for row in new_tokens]
 
         # Qwen3ASRProcessor.decode(return_format="transcription_only") strips the
         # "language <LANG><asr_text>" prefix and applies the same repetition-collapsing
         # dehallucination pass the original qwen_asr package used — no extra
         # post-processing needed here.
         texts = self.processor.decode(
-            sequences[:, n_input:],
+            new_tokens,
             return_format="transcription_only",
             clean_up_tokenization_spaces=False,
         )
@@ -225,7 +284,7 @@ class QwenPipelineNative(BatchedAsrStage):
 
         for raw in texts:
             logger.debug("[RAW] %s", raw)
-        return texts
+        return texts, hits
 
 
 def load_model_native(
@@ -246,6 +305,7 @@ def load_model_native(
     vram_headroom_mb: int = 512,
     processor=None,
     normalization=None,
+    loop_retry_penalty: float = 1.1,
 ) -> QwenPipelineNative:
     """Build the native ASR pipeline, loading whatever the caller did not supply.
 
@@ -328,4 +388,5 @@ def load_model_native(
         verbose=verbose,
         vram_checks=vram_checks,
         normalization=normalization,
+        loop_retry_penalty=loop_retry_penalty,
     )
