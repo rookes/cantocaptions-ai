@@ -729,15 +729,18 @@ class StageTimer:
 
     # -- status and notes -------------------------------------------------------------------
 
-    def status(self, text: str = "") -> None:
+    def status(self, text: str = "", restart_clock: bool = True) -> None:
         """What the stage is doing now: ``loading model``, ``compiling model``, ``waiting for
         gemini-3.7-flash (398 cues)``. Shown beside the spinner with the time it has taken
         so far, or as the bar's postfix; "" clears it. Also sent to a sink with ``status``.
+        ``restart_clock=False`` updates a status that reports its own progress (a download's
+        byte count) without restarting the time shown beside it.
         """
         if text == self._status:
             return
         self._status = text
-        self._status_since = time.perf_counter()
+        if restart_clock:
+            self._status_since = time.perf_counter()
         send = getattr(self._progress, "status", None)
         if callable(send):
             send(text)

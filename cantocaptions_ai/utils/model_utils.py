@@ -535,13 +535,16 @@ class _DownloadProgressLogger(_TqdmBase):
     ``--log_file`` reassigns ``sys.stderr`` to a line-buffered file handle, none of that ever
     reaches disk while a download is in progress, so a live transfer and a dead one both look
     like total silence. This suppresses tqdm's own rendering and instead logs a real, flushed
-    line at most once per ``_LOG_INTERVAL_S`` — a gap longer than that in the log means the
-    transfer has actually stalled, not that output is buffered somewhere.
+    line at most once per ``_LOG_INTERVAL_S``, and only when the byte count has moved: hf_xet
+    reports in large batches, so the count can sit still for minutes on a live transfer, and
+    a line repeating the same figure says nothing.
 
-    Passed as ``snapshot_download(..., tqdm_class=...)``: huggingface_hub uses one instance of
-    this as the aggregate byte-progress bar across every file in the snapshot (see
+    Passed as ``snapshot_download(..., tqdm_class=...)``, huggingface_hub makes two instances
+    of this class. One is the aggregate byte bar across every file in the snapshot (see
     ``_AggregatedTqdm`` in ``huggingface_hub._snapshot_download``), fed by each file's real
-    download callback regardless of backend.
+    download callback regardless of backend. The other is ``thread_map``'s count of files
+    fetched (unit ``it``), which is ignored here: it advances only when a whole file lands.
+    ``hf_hub_download`` makes just the byte bar.
     """
 
     class _NullWriter:
@@ -558,12 +561,18 @@ class _DownloadProgressLogger(_TqdmBase):
     def __init__(self, *args, **kwargs):
         kwargs["file"] = self._NullWriter()
         super().__init__(*args, **kwargs)
+        self._bytes = self.unit == "B"
+        # The byte bar is updated from snapshot_download's worker threads, which don't
+        # inherit this thread's contextvars, so look the stage up here, where the bar is made.
+        self._stage = get_active_stage_timer()
         self._last_log_t = 0.0
+        self._last_log_n = 0
         self._last_status_t = 0.0
+        self._status_shown = False
 
     def update(self, n=1):
         result = super().update(n)
-        if self.n == 0:
+        if not self._bytes or self.n == 0:
             # Nothing has arrived yet (still resolving/connecting) — the caller's own
             # "Downloading ..." line already marks the start; logging a 0% heartbeat here
             # would just repeat on every connection-setup callback (observed every ~15s
@@ -582,14 +591,19 @@ class _DownloadProgressLogger(_TqdmBase):
         # On a live console the enclosing stage's status line carries the progress; the
         # periodic line then only needs to reach the log file. Without one (a redirected
         # console, or no stage) the line is the only sign the transfer is moving.
-        stage = get_active_stage_timer()
+        stage = self._stage
         live = stage is not None and stage.animated
         if live and (done or now - self._last_status_t >= 0.5):
             self._last_status_t = now
-            stage.status(f"downloading {progress}")
-        if done or now - self._last_log_t >= self._LOG_INTERVAL_S:
+            # The clock beside the status times the whole download, not the latest figure.
+            stage.status(f"downloading {progress}", restart_clock=not self._status_shown)
+            self._status_shown = True
+        moved = self.n != self._last_log_n
+        if moved and (done or now - self._last_log_t >= self._LOG_INTERVAL_S):
             self._last_log_t = now
-            (logger.debug if live else logger.info)("%s: %s", self.desc or "Download", progress)
+            self._last_log_n = self.n
+            # huggingface_hub's own desc is a placeholder ("Downloading (incomplete total...)").
+            (logger.debug if live else logger.info)("Downloaded %s", progress)
         return result
 
 
