@@ -147,8 +147,50 @@ the break can never disagree about what a gap is.
 **It does not apply under `--realign`, which passes `0` regardless of the flag.** There the
 transcript's line breaks *are* the cue boundaries and a cue is one whole line by contract; a
 line whose audio has a hole in it is the `find_implausible_cues` case, whose fix is upstream in
-chunking. Cue assembly cannot undo a split either way: the pieces are `split_gap` seconds
-apart, far beyond both `--align_merge_distance` (0.08 s) and `--merge_gap` (0.25 s).
+chunking. Cue assembly never undoes a split: every piece after the first carries `split_break`
+(see [cue-assembly.md](cue-assembly.md)), which matters for the particle route below, whose
+pieces can sit one `align_padding` apart.
+
+### Unpunctuated final particles
+
+The ASR leaves out the punctuation after about 3 % of final particles (啊 2.8 % of 13,660, 喇
+4.4 %, over the 96 checkpoints on hand), and where two utterances run together in one chunk
+nothing else marks where they part. Doraemon 007's 喺垃圾桶啊復原光線 is two utterances 3.1 s
+apart; the gadget call went unheard (median `peak` 0.14) and the gap was 48 % silent, so both
+guards above kept it.
+
+A text rule can't fix this alone. Of the 211 unpunctuated 啊 followed by more text, 92 are a
+right-dislocated tag (做咩啊你？) and about a quarter a topic or list 啊 (牛奶啊同埋雞蛋啊),
+a numeral (扣留四啊八個鐘) or a stutter; a comma there would be right about 30 % of the time.
+Timing separates them. With a pause of 0.25 s or more (the aligned gap, or the time the particle
+was held past the cue's usual, `_held`: CTC often folds the silence into the particle), 32 of 33
+were utterance ends after 啊 and 130 of 132 after the other particles (both misses 啦啦). The
+tags and topic particles sit at about 0.
+
+So `split_gapped_cues` takes `ends_utterance` (`PunctuationConfig.ends_utterance`; the yue pack
+sets `final_particles`, `particle_continuations` and `particle_words`). At a boundary right after
+an unpunctuated final particle that nothing continues (not 㗎咩, 先啦吓, 無啦啦, 喇叭) it cuts on
+a pause of `PARTICLE_MIN_PAUSE` (0.25 s), believes it with one side heard rather than both, and
+needs each piece on screen `PARTICLE_MIN_PIECE` (0.5 s, the default `min_cue_duration`, since
+the cut is final). Those pieces carry a `split_particle:` note. `text.PARTICLE_CHARS` is not the
+list: it holds 嘅, 呢, 可, 咩 and 吓, which are words far more often than sentence ends.
+
+Measured (2026-10, isolated vocals, same transcript both ways) together with pass E counting a
+head as shown ([cue-assembly.md](cue-assembly.md)):
+
+| file | particle splits | start within 0.2 s / 0.5 s |
+|---|---:|---|
+| bluey | 3 (敲啊\|保怡, 計喇\|巴高, 對唔住啊\|啱啱) | 62.9 → 65.2 % / 72.0 → 74.2 % |
+| Doraemon 555–556 | 1 (喎\|胖, already cut by pass E) | 78.2 → 78.0 % / 80.0 → 79.8 % |
+| Doraemon 007 (no reference) | 1 (喺垃圾桶啊\|復原光線) | — |
+
+CER and coverage are unchanged. Bluey's three now match the reference: the vocative 保怡 opens
+the reply it belongs to, and 咁多位先生女士，真係好對唔住啊 joins into the reference's one
+line. Doraemon's dip is one cue, from the pass-E change rather than a particle: the theme song's
+美景將可以望見得到, which the reference keeps whole, is now cut at a 0.8 s sung rest. Run over
+the assembled cues of all 96 checkpoints on hand, the particle route makes 145 cuts; read by
+hand, all but two (我再講乜嘢啊|你家下？, 我預你審三日㗎咋|schedule, both at 0.3–0.5 s) are
+utterance ends.
 
 ## Per-character `peak`: was this character heard? (pipeline/alignment.py)
 

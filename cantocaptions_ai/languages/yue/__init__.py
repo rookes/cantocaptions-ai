@@ -9,6 +9,7 @@ beside it in this package (``text``, ``numbers``, ``linebreak``, ``rules/``, ...
 
 Module import must stay cheap: OpenCC, pycantonese and the cleaning builtins load on use.
 """
+from dataclasses import replace
 from typing import List, Mapping
 
 from cantocaptions_ai.languages.base import CleaningSpec, LanguagePack, ModelConventions
@@ -87,10 +88,25 @@ def _select_track(streams: List[dict]) -> int:
     return select_cantonese_track(streams)
 
 
+# The ASR leaves out the punctuation after about 3% of final particles (啊 2.8%, 喇 4.4%), and
+# where two utterances run together in one chunk, nothing else marks where they part
+# (喺垃圾桶啊復原光線). The cue cutters cut there on a pause (align_checks.split_gapped_cues).
+# Not text.PARTICLE_CHARS: that list keeps 嘅, 呢, 可, 咩 and 吓, which are words far more often
+# than they end a sentence (嘅話, 呢個, 可以, 咩事). Those are continuations here, along with 嗬
+# and 嗎: a particle followed by one may be a cluster (嚟㗎咩, 先啦吓). 囉 is left out because the
+# conventions write the particle 囖, which leaves 囉 to 囉嗦 and 囉囉攣.
+YUE_PUNCTUATION = replace(
+    CJK_PUNCTUATION,
+    final_particles=tuple("啊呀喇啦㗎喎嘛吖啫咋囖噃𠻹嘞咯𠺢吒啩"),
+    particle_continuations=tuple("吓咩呢嗬嘅嗎哦"),
+    particle_words=("喇叭", "啫喱"),
+)
+
+
 YUE = LanguagePack(
     code="yue",
     script=CJK_SCRIPT,
-    punctuation=CJK_PUNCTUATION,
+    punctuation=YUE_PUNCTUATION,
     default_model="cantocaptions-cantonese-ASR",
     default_align_model="alvanlii/wav2vec2-BERT-cantonese",
     conventions={

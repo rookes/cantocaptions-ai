@@ -83,6 +83,19 @@ Every cut that changed in bluey now matches the reference (演奏|一首…, 對
 do split the cues between 4 and 4.5 s. On a learner's vocabulary video, English sentences with
 no confident pause stay one two-line subtitle where they were cut mid-sentence before.
 
+**Pass E counts a head as it will be shown.** Each piece must stay on screen a quarter of the
+cap (1 s), and the head is measured to its release (`align_release` into the pause, stopping
+`align_padding` short of the tail), not to its last character. Measured to the character,
+Doraemon 007's 喺垃圾桶啊復原光線 (6.2 s) had nowhere to cut: 喺垃圾桶啊 is said in 0.92 s
+before a 3.1 s pause, and every other boundary was inside a word. It is shown for 1.56 s.
+
+**Nothing rejoins a cue alignment broke on purpose.** `split_gapped_cues` marks every piece
+after the first `split_break`, and passes A and C never join across one. Distance alone doesn't
+keep them apart: a head is released to `min(last character + align_release, tail − align_padding)`,
+so a pause up to `align_release + align_padding` (0.68 s) leaves the pieces exactly one padding
+apart, which is what pass A joins; a pause CTC folded into the particle leaves them touching.
+The tail still joins what follows it.
+
 **Every cue is at least `align_padding` from the next** on the ASR path. Alignment's
 release/trim pass already does this, but pass E's cut made touching pairs when it cut where
 alignment showed no pause (the head ended where the tail began). Pass E now ends the head

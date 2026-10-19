@@ -1402,6 +1402,7 @@ def align(
             aligned_segments, split_gap, punctuation.split_chars, regions=regions,
             script=script or script_for_language(model_lang),
             release=align_release, padding=align_padding,
+            ends_utterance=punctuation.ends_utterance,
         )
         if breaks:
             logger.info(

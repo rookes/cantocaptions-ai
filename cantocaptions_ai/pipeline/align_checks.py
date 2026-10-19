@@ -15,7 +15,8 @@ on ``find_gapped_cues``' finding by breaking the cue in two, and it is the only 
 that is per align model, enabled by ``AlignProfile.split_gap`` or per run by
 ``--align_split_gap``. Reporting a doubtful cue costs nothing; inventing a cue boundary
 that was not there does, so it only believes a gap the evidence supports (``SPLIT_MIN_PEAK``,
-``SPLIT_MIN_SILENCE``) and never cuts inside a word. The detection is shared -- one scan, two
+``SPLIT_MIN_SILENCE``, or a final particle the ASR left unpunctuated: ``PARTICLE_MIN_PAUSE``)
+and never cuts inside a word. The detection is shared -- one scan, two
 verdicts -- so the two can never disagree about what a gap is.
 
 ``find_silent_starts`` catches a cue whose start time lands on audio where nothing is
@@ -33,7 +34,9 @@ over music beds and room tone, which are speechless but not silent. Treat a clea
 
 import unicodedata
 from dataclasses import dataclass
-from typing import Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Callable, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union,
+)
 
 import numpy as np
 
@@ -93,6 +96,20 @@ SPLIT_INTERNAL_GAP = 1.5
 # evidence either way.
 SPLIT_MIN_PEAK = 0.5
 SPLIT_MIN_SILENCE = 0.8
+
+# A final particle with no punctuation after it (PunctuationConfig.ends_utterance:
+# 喺垃圾桶啊|復原光線) is the transcript's own word that an utterance ended there, so
+# split_gapped_cues cuts there on a pause far shorter than split_gap, and believes it with
+# one side heard rather than both. The pause is the aligned gap or the extra time the particle
+# was held (_held), whichever is longer: CTC often folds the silence into the particle's span.
+# Read (2026-10) over the 96 aligned checkpoints on hand, unpunctuated particle boundaries
+# with a pause of 0.25 s or more were utterance ends 32 of 33 times after 啊 and 130 of 132
+# after the other particles (both misses 啦啦, which ends_utterance now refuses); the
+# boundaries that are not -- the dislocated tag 做咩啊|你, a topic 啊 (所以啲村民啊|將個潭) --
+# sit at a pause of about 0. Each piece must stay on screen PARTICLE_MIN_PIECE (the default
+# min_cue_duration): the cut is final, because cue assembly never rejoins a split_break.
+PARTICLE_MIN_PAUSE = 0.25
+PARTICLE_MIN_PIECE = 0.5
 
 # A frame is silent this far below its region's speech level (or within FLOOR_MARGIN_DB of
 # the floor, whichever is higher). The floor alone does not work on isolated vocals: their
@@ -163,6 +180,53 @@ def _internal_gaps(
         if gap > max_gap:
             yield InternalGap(i, j, round(gap, 3), round(float(before["end"]), 3),
                               before["word"], after["word"])
+
+
+def _held(content: Sequence) -> List[float]:
+    """For each consecutive pair of timed words, how much longer the first was held than this
+    cue's speaker usually holds a character: its onset-to-onset interval less its length in
+    characters times the cue's median per character. ``content`` is (index, word) pairs.
+
+    That is where a pause inside a clause shows. CTC gives each character a span reaching the
+    next, so the aligned gap between two characters reads 0 whatever the audio did; the
+    silence is folded into the earlier character's span (realign measures its bare-boundary
+    pauses onset to onset for the same reason). In bluey's 跟住落嚟我將會演奏一首好出名嘅…,
+    every character runs about 0.16 s and 奏 0.48 s: the pause after 演奏.
+    """
+    def chars(w) -> int:
+        return max(1, len(str(w.get("word", "")).strip()))
+
+    spans = [(float(b["start"]) - float(a["start"]), chars(a))
+             for (_, a), (_, b) in zip(content, content[1:])]
+    if not spans:
+        return []
+    per_char = float(np.median([span / n for span, n in spans]))
+    return [span - n * per_char for span, n in spans]
+
+
+def _spoken(words: Sequence[Mapping], split: set) -> List[Tuple[int, Mapping]]:
+    """(index, word) of every timed word that is not blank or a split mark."""
+    return [(i, w) for i, w in enumerate(words)
+            if w.get("start") is not None and w.get("end") is not None
+            and str(w.get("word", "")).strip() and str(w.get("word", "")).strip() not in split]
+
+
+def _particle_gaps(
+    words: Sequence[Mapping], text: str, offsets: Sequence[Tuple[int, int]], split: set,
+    ends_utterance: Callable[[str, int], bool], min_pause: float,
+) -> Iterator[InternalGap]:
+    """Every boundary right after an unwritten sentence end (``ends_utterance``) where the
+    speaker paused at least ``min_pause``: the aligned gap or the time the particle was held
+    past this cue's usual (:func:`_held`), whichever is longer. ``gap`` carries that pause."""
+    content = _spoken(words, split)
+    held = _held(content)
+    for k, ((i, a), (j, b)) in enumerate(zip(content, content[1:])):
+        if not ends_utterance(text, offsets[j][0]):
+            continue
+        pause = max(float(b["start"]) - float(a["end"]), held[k])
+        if pause >= min_pause:
+            yield InternalGap(i, j, round(pause, 3), round(float(a["end"]), 3),
+                              a["word"], b["word"])
 
 
 def find_gapped_cues(
@@ -256,12 +320,14 @@ def _word_offsets(
 
 
 def _split_one(segment: Mapping, gaps: Sequence[InternalGap],
-               kind: str = "split_gap") -> Optional[List[dict]]:
+               kind: Union[str, Sequence[str]] = "split_gap") -> Optional[List[dict]]:
     """Cut one cue at each of ``gaps``. ``None`` if it cannot be done safely.
 
     ``kind`` names the reason in each piece's note (``split_gap``: a silence;
-    ``segmentation`` also cuts over-long cues here, as ``split_long``).
+    ``split_particle``: a pause after an unwritten sentence end; ``segmentation`` also cuts
+    over-long cues here, as ``split_long``), one for every cut or one per cut.
     """
+    kinds = [kind] * len(gaps) if isinstance(kind, str) else list(kind)
     text = str(segment.get("text", ""))
     words = list(segment.get("words") or [])
     spans = _word_offsets(text, words)
@@ -288,14 +354,14 @@ def _split_one(segment: Mapping, gaps: Sequence[InternalGap],
         out["notes"] = list(segment.get("notes") or [])
         return out
 
-    for gap in gaps:
+    for gap, why in zip(gaps, kinds):
         # Untimed characters between the two neighbours go with the head: they were never
         # placed, so there is no evidence they belong to the clause after the silence.
         head = piece(gap.after_idx, spans[gap.after_idx - 1][1],
                      float(words[gap.before_idx]["end"]))
         if not head["text"].strip():
             return None
-        add_note(head, f"{kind}:{gap.gap:.1f}s after {gap.before}")
+        add_note(head, f"{why}:{gap.gap:.1f}s after {gap.before}")
         pieces.append(head)
         word_from, text_from = gap.after_idx, spans[gap.after_idx][0]
         start = float(words[gap.after_idx]["start"])
@@ -303,7 +369,7 @@ def _split_one(segment: Mapping, gaps: Sequence[InternalGap],
     tail = piece(None, None, float(segment["end"]))
     if not tail["text"].strip() or tail["end"] < tail["start"]:
         return None
-    add_note(tail, f"{kind}:{gaps[-1].gap:.1f}s before {gaps[-1].after}")
+    add_note(tail, f"{kinds[-1]}:{gaps[-1].gap:.1f}s before {gaps[-1].after}")
     pieces.append(tail)
     return pieces
 
@@ -425,9 +491,11 @@ def split_gapped_cues(
     script=None,
     release: float = 0.0,
     padding: float = 0.0,
+    ends_utterance: Optional[Callable[[str, int], bool]] = None,
+    particle_pause: float = PARTICLE_MIN_PAUSE,
 ) -> Tuple[List[dict], int]:
     """Break every cue holding a believable silence of ``min_gap`` or more into one cue per
-    utterance.
+    utterance -- or a pause of ``particle_pause`` right after an unwritten sentence end.
 
     The one place in this module that *repairs* rather than reports — because breaking a cue
     is a bet, where saying "distrust this one" is not. See ``find_gapped_cues`` for the
@@ -444,10 +512,20 @@ def split_gapped_cues(
     ``release``, each head is then released into the pause the way alignment releases a cue
     ending on punctuation, stopping ``padding`` short of the piece after it.
 
+    ``ends_utterance`` (``PunctuationConfig.ends_utterance``) adds the transcript's own
+    evidence: a final particle the ASR wrote no punctuation after (喺垃圾桶啊|復原光線). There
+    a pause of ``particle_pause`` is enough -- the aligned gap or the time the particle was
+    held past the cue's usual, since CTC often folds the silence into the particle -- and one
+    heard side is enough to believe it, but each piece must stay on screen
+    ``PARTICLE_MIN_PIECE``. See ``PARTICLE_MIN_PAUSE`` for the measurement.
+
     The cut is exactly the silence: the head keeps the cue's own start and ends on its last
     timed character before the gap, the tail begins on its first timed character after it
     and keeps the cue's own end. Nothing is retimed and nothing outside the cue moves, so a
-    caller's release/trim pass and the non-overlap guarantee both survive untouched.
+    caller's release/trim pass and the non-overlap guarantee both survive untouched. Every
+    piece after the first carries ``split_break``, and cue assembly never joins across one:
+    a pause short of ``release`` plus the merge distance would otherwise leave the pieces
+    close enough to be glued straight back.
 
     Returns the new cue list (segments are copied, never mutated) and how many breaks were
     made. A cue whose words cannot be located in its own text is passed through whole.
@@ -458,34 +536,50 @@ def split_gapped_cues(
     breaks = 0
     for segment in segments:
         words = list(segment.get("words") or [])
-        candidates = list(_internal_gaps(segment, min_gap, split))
-        if script is not None and candidates:
-            text = str(segment.get("text", ""))
-            offsets = _word_offsets(text, words)
-            if offsets is not None:
-                candidates = [g for g in candidates
-                              if not script.inside_word(text, offsets[g.after_idx][0])]
-        gaps = []
-        for k, gap in enumerate(candidates):
+        text = str(segment.get("text", ""))
+        offsets = _word_offsets(text, words) if script is not None or ends_utterance else None
+        # after_idx -> (gap, a silence of min_gap, after a particle). A silence long enough on
+        # its own keeps its own measure; a particle only marks it.
+        found = {g.after_idx: (g, True, False) for g in _internal_gaps(segment, min_gap, split)}
+        if ends_utterance is not None and offsets is not None:
+            for g in _particle_gaps(words, text, offsets, split, ends_utterance, particle_pause):
+                found[g.after_idx] = (found[g.after_idx][0], True, True) \
+                    if g.after_idx in found else (g, False, True)
+        candidates = [found[k] for k in sorted(found)]
+        if script is not None and offsets is not None:
+            candidates = [c for c in candidates
+                          if not script.inside_word(text, offsets[c[0].after_idx][0])]
+        gaps, kinds = [], []
+        for k, (gap, silent, particle) in enumerate(candidates):
             # Each side is the run of words up to the next candidate gap: the piece this cut
             # would actually make.
-            lo = candidates[k - 1].after_idx if k else 0
-            hi = candidates[k + 1].after_idx if k + 1 < len(candidates) else len(words)
+            lo = candidates[k - 1][0].after_idx if k else 0
+            hi = candidates[k + 1][0].after_idx if k + 1 < len(candidates) else len(words)
             head, tail = _heard(words[lo:gap.after_idx]), _heard(words[gap.after_idx:hi])
-            quiet = silence.share(gap.at, gap.at + gap.gap) if silence is not None else None
-            believed = (head is not False and tail is not False) or (
-                quiet is not None and quiet >= SPLIT_MIN_SILENCE
-                and (head is not False or tail is not False))
+            silent_for = float(words[gap.after_idx]["start"]) - gap.at
+            quiet = (silence.share(gap.at, gap.at + silent_for)
+                     if silence is not None and silent_for > 0 else None)
+            believed = silent and (
+                (head is not False and tail is not False)
+                or (quiet is not None and quiet >= SPLIT_MIN_SILENCE
+                    and (head is not False or tail is not False)))
+            by_particle = not believed and particle and (
+                (head is not False or tail is not False)
+                and _piece_lengths(segment, words, candidates, k, release, padding)
+                >= PARTICLE_MIN_PIECE)
+            believed = believed or by_particle
             logger.debug(
-                "Gap of %.2fs at %.3fs between %r and %r: heard %s/%s, %s silent (%s) -> %s",
-                gap.gap, gap.at, gap.before, gap.after, head, tail,
-                "?" if quiet is None else f"{quiet:.0%}",
-                silence.describe(gap.at, gap.at + gap.gap) if silence is not None else "no audio",
+                "Gap of %.2fs at %.3fs between %r and %r%s: heard %s/%s, %s silent (%s) -> %s",
+                gap.gap, gap.at, gap.before, gap.after, " (particle)" if particle else "",
+                head, tail, "?" if quiet is None else f"{quiet:.0%}",
+                silence.describe(gap.at, gap.at + silent_for)
+                if silence is not None else "no audio",
                 "split" if believed else "kept",
             )
             if believed:
                 gaps.append(gap)
-        pieces = _split_one(segment, gaps) if gaps else None
+                kinds.append("split_particle" if by_particle else "split_gap")
+        pieces = _split_one(segment, gaps, kinds) if gaps else None
         if pieces is None:
             out.append(dict(segment))
             continue
@@ -493,9 +587,26 @@ def split_gapped_cues(
             for head, tail in zip(pieces, pieces[1:]):
                 head["end"] = round(max(head["end"], min(head["end"] + release,
                                                          tail["start"] - padding)), 3)
+        for piece in pieces[1:]:
+            piece["split_break"] = True
         breaks += len(pieces) - 1
         out.extend(pieces)
     return out, breaks
+
+
+def _piece_lengths(segment: Mapping, words: Sequence[Mapping], candidates: Sequence,
+                   k: int, release: float, padding: float) -> float:
+    """How long the shorter of the two pieces candidate ``k`` would make stays on screen: the
+    head from its first character (or the cue's start) to its release, the tail from its first
+    character to the next candidate's last character before it (or the cue's own end)."""
+    gap = candidates[k][0]
+    before, after = words[gap.before_idx], words[gap.after_idx]
+    start = float(words[candidates[k - 1][0].after_idx]["start"]) if k else float(segment["start"])
+    head_end = max(float(before["end"]),
+                   min(float(before["end"]) + release, float(after["start"]) - padding))
+    tail_end = (float(words[candidates[k + 1][0].before_idx]["end"])
+                if k + 1 < len(candidates) else float(segment["end"]))
+    return min(head_end - start, tail_end - float(after["start"]))
 
 
 def extend_to_sound(

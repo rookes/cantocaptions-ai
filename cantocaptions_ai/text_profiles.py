@@ -61,6 +61,36 @@ class PunctuationConfig:
     """Punctuation that drives sentence splitting, alignment token spacing and line merging."""
     split_chars: Tuple[str, ...] = CJK_SPLIT_CHARS
     mergeable_chars: Tuple[str, ...] = CJK_MERGEABLE_CHARS
+    # Sentence ends speech has and a transcript may leave unwritten: Cantonese final particles
+    # (啊, 喇, 㗎). A cue cutter that finds a pause right after one reads it as the end of an
+    # utterance even with no punctuation there (see ends_utterance). Empty -- any language
+    # whose pack sets none -- means the text is no evidence either way.
+    final_particles: Tuple[str, ...] = ()
+    # Characters that continue a particle cluster (㗎咩, 先啦吓) but are ordinary words elsewhere
+    # (咩事, 呢個), so a final particle followed by one is not known to end anything.
+    particle_continuations: Tuple[str, ...] = ()
+    # Words with a final particle inside them that the word check does not know (無啦啦, 喇叭).
+    particle_words: Tuple[str, ...] = ()
+
+    def ends_utterance(self, text: str, at: int) -> bool:
+        """Whether ``text[:at]`` ends on a final particle that nothing after it continues: the
+        boundary 喺垃圾桶啊|復原光線 has, written or not. Only the text's half of the question --
+        whether the speaker paused there is the caller's to measure; a right-dislocated
+        做咩啊|你 passes here and has no pause.
+        """
+        if not self.final_particles or not 0 < at < len(text):
+            return False
+        last, nxt = text[at - 1], text[at]
+        if last not in self.final_particles or nxt.isspace() or nxt in self.split_chars:
+            return False
+        if nxt in self.final_particles or nxt in self.particle_continuations:
+            return False
+        if at >= 2 and text[at - 2] == last:   # 啦啦, 啊啊: a noise, not a sentence end
+            return False
+        return not any(text.startswith(word, lo)
+                       for word in self.particle_words
+                       for lo in range(max(0, at - len(word) + 1), at)
+                       if lo + len(word) > at)
 
     def sentence_spans(self, text: str) -> List[Tuple[int, int]]:
         """Return (start, end) index spans of text between split_chars (never mutates text)."""

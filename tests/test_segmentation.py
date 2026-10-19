@@ -882,6 +882,60 @@ class TestConfidentPause(unittest.TestCase):
         self.assertEqual(len(cues), 2)
 
 
+class TestLongCueHeadAsShown(unittest.TestCase):
+    """Pass E's quarter-cap minimum counts the head as it will be shown, release included."""
+
+    def test_a_short_head_before_a_long_pause_is_cut_off(self):
+        # Doraemon 007: 喺垃圾桶啊 is said in 0.92 s, then 3.1 s pass before 復原光線.
+        words = timed(list("喺垃圾桶啊復原光線"), start=189.877, step=0.184, pauses={4: 3.12})
+        cue = cue_of(words, sep="")
+        cue["end"] = words[-1]["end"] + 0.68
+        self.assertGreater(cue["end"] - cue["start"], 4.0)
+        kept = assemble_cues([dict(cue)], min_cue_duration=0.5, max_cue_duration=4.0)
+        self.assertEqual(texts(kept), ["喺垃圾桶啊復原光線"], "said in under a second")
+        cut = assemble_cues([dict(cue)], min_cue_duration=0.5, max_cue_duration=4.0,
+                            align_padding=0.04, align_release=0.64)
+        self.assertEqual(texts(cut), ["喺垃圾桶啊", "復原光線"])
+
+
+class TestSplitBreak(unittest.TestCase):
+    """A cue alignment broke in two stays broken. A pause after a particle short of the
+    release leaves the pieces exactly a padding apart, which pass A would otherwise join."""
+
+    def _pieces(self):
+        from cantocaptions_ai.languages import get_language_pack
+        from cantocaptions_ai.pipeline.align_checks import split_gapped_cues
+        words = timed(list("唔係啊諗到邊度食飯"), start=1.0, step=0.2, pauses={2: 0.5})
+        for w in words:
+            w["peak"] = 0.9
+        pieces, breaks = split_gapped_cues(
+            [cue_of(words, sep="")], 1.0, ends_utterance=get_language_pack("yue").punctuation
+            .ends_utterance, release=0.64, padding=0.04)
+        self.assertEqual(breaks, 1)
+        self.assertAlmostEqual(pieces[1]["start"] - pieces[0]["end"], 0.04, places=3)
+        return pieces
+
+    def test_pass_a_does_not_rejoin_it(self):
+        cues = assemble_cues(self._pieces(), min_cue_duration=0.5, align_padding=0.04)
+        self.assertEqual(texts(cues), ["唔係啊", "諗到邊度食飯"])
+        unmarked = self._pieces()
+        del unmarked[1]["split_break"]
+        self.assertEqual(len(assemble_cues(unmarked, min_cue_duration=0.5, align_padding=0.04)),
+                         1, "distance alone would have glued them back")
+
+    def test_pass_c_does_not_rescue_across_it(self):
+        head, tail = self._pieces()
+        tail["end"] = tail["start"] + 0.3   # a fragment pass C would try to place
+        cues = assemble_cues([head, tail], min_cue_duration=0.5, align_padding=0.04)
+        self.assertEqual(len(cues), 2)
+
+    def test_the_tail_still_joins_what_follows_it(self):
+        head, tail = self._pieces()
+        after = seg(tail["end"] + 0.04, tail["end"] + 1.0, "未呀")
+        cues = assemble_cues([head, tail, after], min_cue_duration=0.5, align_padding=0.04)
+        self.assertEqual(texts(cues), ["唔係啊", "諗到邊度食飯未呀"])
+
+
 class TestCantoneseWords(unittest.TestCase):
     """languages/yue/words.py: the segmenter's boundaries, its dictionary inside long tokens."""
 

@@ -31,8 +31,6 @@ passes B-D entirely.
 
 from typing import Callable, List, Optional, Sequence
 
-import numpy as np
-
 from cantocaptions_ai.text_profiles import (
     DEFAULT_PUNCTUATION,
     DEFAULT_SCRIPT,
@@ -43,7 +41,9 @@ from cantocaptions_ai.text_profiles import (
     boundary_is_mergeable,
     is_mergeable,
 )
-from cantocaptions_ai.pipeline.align_checks import InternalGap, _split_one, _word_offsets
+from cantocaptions_ai.pipeline.align_checks import (
+    InternalGap, _held, _split_one, _spoken, _word_offsets,
+)
 from cantocaptions_ai.pipeline.speaker_assign import speaker_scope
 from cantocaptions_ai.utils.log_utils import get_logger
 from cantocaptions_ai.utils.schema import SingleAlignedSegment, merge_segments
@@ -210,6 +210,10 @@ def _adjacency_merge(
 ) -> List[SingleAlignedSegment]:
     """Pass A: greedily join touching neighbours with a clean join boundary.
 
+    Never across a ``split_break`` (nor does pass C): alignment broke that cue in two on
+    purpose (``align_checks.split_gapped_cues``), and a pause after a final particle short of
+    the release leaves the pieces touching, so only the mark keeps them apart.
+
     Two exceptions, both too-short cues held back for the rescue pass instead of being
     absorbed backwards. This pass accumulates strictly left to right, so it would otherwise
     decide before anything got to weigh the other direction:
@@ -246,6 +250,7 @@ def _adjacency_merge(
         # alone: everything else about this join already reads cleanly.
         mergeable = (
             not defer
+            and not segment.get("split_break")
             and gap <= threshold + GAP_EPS
             and _within_cap(prev, segment, max_cue_duration)
             and is_mergeable(_text(prev), _text(segment), punctuation, max_chars=max_chars,
@@ -330,6 +335,8 @@ def _rescue_short_cues(
                 if left_idx < 0 or left_idx + 1 >= len(cues):
                     continue
                 left, right = cues[left_idx], cues[left_idx + 1]
+                if right.get("split_break"):
+                    continue
                 if script.width(script.join(_text(left), _text(right))) > rescue_max_chars:
                     continue
                 if not _within_cap(left, right, max_cue_duration):
@@ -385,34 +392,16 @@ ONE_LINE_MIN_PAUSE = 0.5
 CONFIDENT_PAUSE = 0.25
 
 
-def _held(content: Sequence) -> List[float]:
-    """For each consecutive pair of timed words, how much longer the first was held than this
-    cue's speaker usually holds a character: its onset-to-onset interval less its length in
-    characters times the cue's median per character.
-
-    That is where a pause inside a clause shows. CTC gives each character a span reaching the
-    next, so the aligned gap between two characters reads 0 whatever the audio did; the
-    silence is folded into the earlier character's span (realign measures its bare-boundary
-    pauses onset to onset for the same reason). In bluey's 跟住落嚟我將會演奏一首好出名嘅…,
-    every character runs about 0.16 s and 奏 0.48 s: the pause after 演奏.
-    """
-    def chars(w) -> int:
-        return max(1, len(str(w.get("word", "")).strip()))
-
-    spans = [(float(b["start"]) - float(a["start"]), chars(a))
-             for (_, a), (_, b) in zip(content, content[1:])]
-    if not spans:
-        return []
-    per_char = float(np.median([span / n for span, n in spans]))
-    return [span - n * per_char for span, n in spans]
-
-
 def _best_cut(seg: SingleAlignedSegment, punctuation: PunctuationConfig,
               min_piece: float, script: Optional[ScriptConfig] = None,
-              fits: Optional[str] = None) -> Optional[InternalGap]:
+              fits: Optional[str] = None, align_release: float = 0.0,
+              align_padding: float = 0.0) -> Optional[InternalGap]:
     """Where to cut *seg*, or None: never inside a word of ``script``'s (樂觀 is two CJK
-    "words" to alignment but one to a reader), at least ``min_piece`` seconds from either end,
-    and only where something says the speaker broke off -- a punctuation mark, or a confident
+    "words" to alignment but one to a reader), leaving each piece on screen at least
+    ``min_piece`` seconds -- the head as it will be shown, released into the pause by up to
+    ``align_release`` and stopping ``align_padding`` short of the tail (喺垃圾桶啊 is said in
+    0.92 s and shown for 1.56) -- and only where something says the speaker broke off -- a
+    punctuation mark, or a confident
     pause. A pause is the aligned gap or the extra time the earlier word was held
     (:func:`_held`), whichever is longer, and it is confident at ``CONFIDENT_PAUSE``. Of
     those, the longest pause wins (a punctuation mark adds ``PUNCTUATION_BONUS``), the middle
@@ -428,17 +417,15 @@ def _best_cut(seg: SingleAlignedSegment, punctuation: PunctuationConfig,
     split = set(punctuation.split_chars)
     words = seg.get("words") or []
     offsets = _word_offsets(str(seg.get("text", "")), words) if script is not None else None
-    content = [
-        (i, w) for i, w in enumerate(words)
-        if w.get("start") is not None and w.get("end") is not None
-        and str(w.get("word", "")).strip() and str(w.get("word", "")).strip() not in split
-    ]
+    content = _spoken(words, split)
     held = _held(content)
     start, end = float(seg["start"]), float(seg["end"])
     duration = end - start
     best, best_score = None, None
     for k, ((i, a), (j, b)) in enumerate(zip(content, content[1:])):
-        head, tail = float(a["end"]) - start, end - float(b["start"])
+        shown_until = max(float(a["end"]), min(float(a["end"]) + align_release,
+                                               float(b["start"]) - align_padding))
+        head, tail = shown_until - start, end - float(b["start"])
         if head < min_piece or tail < min_piece:
             continue
         if offsets is not None and script.inside_word(str(seg["text"]), offsets[j][0]):
@@ -471,8 +458,9 @@ def _split_long_cues(
 ) -> List[SingleAlignedSegment]:
     """Pass E: cut every cue longer than ``max_cue_duration`` until its pieces fit.
 
-    Each cut leaves at least a quarter of the cap (a second, at 4 s) on either side, so a cue
-    is never shaved into a fragment for pass D to stretch. A cue with nowhere to cut -- no
+    Each cut leaves at least a quarter of the cap (a second, at 4 s) on screen either side --
+    the head counted with its release -- so a cue is never shaved into a fragment for pass D
+    to stretch. A cue with nowhere to cut -- no
     word timings, or no boundary far enough from both ends -- is left as it is. The cut
     itself is ``align_checks._split_one``'s, so text, words and characters stay in step.
 
@@ -503,7 +491,8 @@ def _split_long_cues(
                 else "line" if line_width is not None and width <= line_width
                 else "screen" if screen_width is not None and width <= screen_width
                 else None)
-        cut = _best_cut(seg, punctuation, min_piece, script, fits=fits)
+        cut = _best_cut(seg, punctuation, min_piece, script, fits=fits,
+                        align_release=align_release, align_padding=align_padding)
         pieces = _split_one(seg, [cut], kind="split_long") if cut is not None else None
         if not pieces:
             out.append(seg)

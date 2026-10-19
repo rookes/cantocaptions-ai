@@ -396,6 +396,111 @@ class TestSplitGuard(unittest.TestCase):
         self.assertEqual(split_gapped_cues([cue], 1.0, script=CJK_SCRIPT)[1], 0)
 
 
+class TestParticleSplit(unittest.TestCase):
+    """A final particle the ASR wrote no punctuation after is the transcript's own word that an
+    utterance ended there: a pause at it is cut on far less evidence than a bare gap."""
+
+    def setUp(self):
+        from cantocaptions_ai.languages import get_language_pack
+        self.ends = get_language_pack("yue").punctuation.ends_utterance
+
+    def _cue(self, *spans, start=None, end=None):
+        return {"start": spans[0][1] if start is None else start,
+                "end": spans[-1][2] if end is None else end,
+                "text": "".join(s[0] for s in spans),
+                "words": [{"word": w, "start": a, "end": b, "peak": p}
+                          for w, a, b, p in spans]}
+
+    def _doraemon(self):
+        # Doraemon 007, as aligned: 3.1 s after 啊, but the gadget call 復原光線 went unheard
+        # (median peak 0.14) and the gap is only half silent, so the silence route kept it.
+        return self._cue(("喺", 189.877, 189.997, 0.001), ("垃", 189.997, 190.157, 0.786),
+                         ("圾", 190.157, 190.357, 0.92), ("桶", 190.357, 190.637, 0.632),
+                         ("啊", 190.637, 190.797, 0.231), ("復", 193.917, 194.157, 0.1),
+                         ("原", 194.157, 194.397, 0.187), ("光", 194.397, 194.717, 0.052),
+                         ("線", 194.717, 194.757, 0.83), ("，", 194.757, 194.797, 1.0),
+                         end=195.437)
+
+    def test_the_doraemon_case_is_cut_after_the_particle(self):
+        cue = self._doraemon()
+        self.assertEqual(split_gapped_cues([cue], 1.0, "，")[1], 0, "one side unheard")
+        out, breaks = split_gapped_cues([cue], 1.0, "，", ends_utterance=self.ends,
+                                        release=0.64, padding=0.04)
+        self.assertEqual([c["text"] for c in out], ["喺垃圾桶啊", "復原光線，"])
+        self.assertEqual(out[0]["notes"], ["split_particle:3.1s after 啊"])
+        self.assertTrue(out[1]["split_break"])
+        self.assertNotIn("split_break", out[0])
+
+    def test_a_pause_folded_into_the_particle_is_found(self):
+        # CTC let 啊 run on to 諗, so the aligned gap is 0; only the hold shows the pause.
+        spans = [("唔", 1.0, 1.2, 0.9), ("係", 1.2, 1.4, 0.9), ("啊", 1.4, 2.1, 0.8),
+                 ("諗", 2.1, 2.3, 0.9), ("到", 2.3, 2.5, 0.9), ("邊", 2.5, 2.7, 0.9),
+                 ("度", 2.7, 2.9, 0.9), ("食", 2.9, 3.1, 0.9), ("飯", 3.1, 3.3, 0.9)]
+        out, _ = split_gapped_cues([self._cue(*spans)], 1.0, ends_utterance=self.ends)
+        self.assertEqual([c["text"] for c in out], ["唔係啊", "諗到邊度食飯"])
+        self.assertEqual(split_gapped_cues([self._cue(*spans)], 1.0)[1], 0,
+                         "without the particle a 0 s gap is no gap")
+
+    def test_no_pause_no_cut(self):
+        # 做咩啊你: the right-dislocated subject passes the text test and is said in one breath.
+        cue = self._cue(("做", 1.0, 1.2, 0.9), ("咩", 1.2, 1.4, 0.9), ("啊", 1.4, 1.6, 0.9),
+                        ("你", 1.6, 1.8, 0.9), ("講", 1.8, 2.0, 0.9), ("嘢", 2.0, 2.2, 0.9))
+        self.assertEqual(split_gapped_cues([cue], 1.0, ends_utterance=self.ends)[1], 0)
+
+    def test_no_particle_no_cut(self):
+        cue = self._cue(("我", 1.0, 1.2, 0.9), ("哋", 1.2, 1.4, 0.9), ("返", 1.4, 2.1, 0.9),
+                        ("屋", 2.1, 2.3, 0.9), ("企", 2.3, 2.5, 0.9), ("食", 2.5, 2.7, 0.9))
+        self.assertEqual(split_gapped_cues([cue], 1.0, ends_utterance=self.ends)[1], 0)
+
+    def test_both_sides_unheard_is_no_evidence(self):
+        cue = self._cue(("好", 1.0, 1.2, 0.1), ("正", 1.2, 1.4, 0.1), ("啊", 1.4, 1.6, 0.1),
+                        ("下", 2.6, 2.8, 0.1), ("次", 2.8, 3.0, 0.1), ("見", 3.0, 3.2, 0.1))
+        self.assertEqual(split_gapped_cues([cue], 1.0, ends_utterance=self.ends)[1], 0)
+
+    def test_a_piece_too_short_to_read_is_not_cut_off(self):
+        cue = self._cue(("好", 1.0, 1.1, 0.9), ("啊", 1.1, 1.2, 0.9),
+                        ("下", 1.6, 1.8, 0.9), ("次", 1.8, 2.0, 0.9), ("見", 2.0, 2.4, 0.9))
+        self.assertEqual(split_gapped_cues([cue], 1.0, ends_utterance=self.ends)[1], 0)
+        self.assertEqual(split_gapped_cues([cue], 1.0, ends_utterance=self.ends,
+                                           release=0.64, padding=0.04)[1], 1,
+                         "the head counts as shown, released into the pause")
+
+
+class TestEndsUtterance(unittest.TestCase):
+    """The text's half of the particle test: does a sentence end before ``at``?"""
+
+    def setUp(self):
+        from cantocaptions_ai.languages import get_language_pack
+        self.punct = get_language_pack("yue").punctuation
+
+    def check(self, text, before):
+        return self.punct.ends_utterance(text, text.index(before) + len(before))
+
+    def test_a_particle_followed_by_a_new_sentence(self):
+        self.assertTrue(self.check("喺垃圾桶啊復原光線", "啊"))
+        self.assertTrue(self.check("我到喇拜拜", "喇"))
+        self.assertTrue(self.check("我會㗎喇知喇拜拜", "知喇"))
+
+    def test_inside_a_particle_cluster(self):
+        self.assertFalse(self.check("我會㗎喇知喇", "㗎"))
+        self.assertFalse(self.check("你嚟㗎咩", "㗎"))
+        self.assertFalse(self.check("你食先啦吓", "啦"))
+
+    def test_words_that_only_contain_a_particle(self):
+        self.assertFalse(self.check("佢無啦啦走咗", "無啦"))
+        self.assertFalse(self.check("佢無啦啦走咗", "無啦啦"))
+        self.assertFalse(self.check("吹喇叭", "喇"))
+        self.assertFalse(self.check("你好囉嗦", "囉"))
+
+    def test_already_punctuated_or_at_an_edge(self):
+        self.assertFalse(self.check("好啊，走啦", "啊"))
+        self.assertFalse(self.punct.ends_utterance("好啊", 2))
+
+    def test_no_particles_no_evidence(self):
+        from cantocaptions_ai.text_profiles import CJK_PUNCTUATION
+        self.assertFalse(CJK_PUNCTUATION.ends_utterance("喺垃圾桶啊復原光線", 5))
+
+
 class TestSplitDefaults(unittest.TestCase):
     """The threshold is per align model: the Cantonese model's is measured, and nothing else
     inherits it."""

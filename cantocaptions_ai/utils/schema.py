@@ -158,6 +158,9 @@ class SingleAlignedSegment(TypedDict):
     # subsegment's values, so on a cue they describe the cue's own start.
     speaker_change: NotRequired[float]
     speaker_break: NotRequired[bool]
+    # Attached by alignment (align_checks.split_gapped_cues) to every piece after the first of
+    # a cue it broke in two: cue assembly never joins this segment to the one before it.
+    split_break: NotRequired[bool]
     # Why this cue's timing is doubtful, from --realign. Written to realign/suspect.srt and
     # summarised at the end of the run; see realign.REASON_HELP.
     realign_reason: NotRequired[str]

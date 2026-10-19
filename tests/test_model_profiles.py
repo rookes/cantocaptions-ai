@@ -33,8 +33,14 @@ class TestForLanguage(unittest.TestCase):
 
     def test_cantonese_keeps_the_cjk_conventions(self):
         profile = get_language_pack("yue").resolve("cantocaptions-cantonese-ASR")
-        self.assertEqual(profile.punctuation, CJK_PUNCTUATION)
+        self.assertEqual(profile.punctuation.split_chars, CJK_PUNCTUATION.split_chars)
+        self.assertEqual(profile.punctuation.mergeable_chars, CJK_PUNCTUATION.mergeable_chars)
         self.assertEqual(profile.script, CJK_SCRIPT)
+
+    def test_only_cantonese_reads_final_particles(self):
+        self.assertIn("啊", get_language_pack("yue").resolve(None).punctuation.final_particles)
+        self.assertEqual(CJK_PUNCTUATION.final_particles, ())
+        self.assertEqual(get_language_pack("zh").resolve(None).punctuation.final_particles, ())
 
     def test_a_space_separated_language_gets_latin_conventions(self):
         profile = get_language_pack("en").resolve("some/english-model")
@@ -100,7 +106,7 @@ class TestGetModelProfile(unittest.TestCase):
         self.assertIsNone(profile.normalization.opencc_config)
         self.assertFalse(profile.normalization.chars_hk)
         self.assertEqual(dict(profile.spotchecks), {})
-        self.assertEqual(profile.punctuation, PunctuationConfig())
+        self.assertEqual(profile.punctuation, get_language_pack("yue").punctuation)
         # Cue assembly matches Qwen's: the fine-tune clauses off 嗱/喂 the same way.
         self.assertEqual(
             profile.segmentation, get_language_pack("yue").resolve("Qwen3-ASR").segmentation,
