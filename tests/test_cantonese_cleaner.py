@@ -57,10 +57,8 @@ class TestRuleLoader(unittest.TestCase):
     def test_default_manifest_is_the_conservative_subset(self):
         """The default manifest holds exactly these steps, in pipeline_qwen order.
 
-        Guards two ordering constraints documented in pipeline.toml: comma_conjunctions
-        matches the full-width punctuation that punctuation.toml normalizes to, and
-        chinese_numbers must come after punctuation.toml (see the half-width comma test
-        below).
+        Guards the ordering constraint documented in pipeline.toml: chinese_numbers must
+        come after punctuation.toml (see the half-width comma test below).
         """
         cleaner = SubtitleCleaner(max_line_count=2)
         self.assertEqual(
@@ -68,7 +66,6 @@ class TestRuleLoader(unittest.TestCase):
             [
                 "punctuation.toml",
                 "chars_hk.toml",
-                "comma_conjunctions.toml",
                 "chinese_numbers",
                 "interjection_noise.toml",
                 "repeated_speech_strict.toml",
@@ -77,15 +74,22 @@ class TestRuleLoader(unittest.TestCase):
             ],
         )
 
-    def test_both_manifests_insert_clause_commas_before_alignment(self):
-        for name in ("pipeline.toml", "pipeline_qwen.toml"):
-            with self.subTest(manifest=name):
-                cleaner = SubtitleCleaner(manifest=name, max_line_count=2)
-                self.assertEqual(
-                    [name for name, _ in cleaner._pre_align_steps],
-                    ["comma_conjunctions.toml"],
-                )
-                self.assertEqual(cleaner.pre_align("係咁嘅話我哋走先"), "係咁嘅話，我哋走先")
+    def test_qwen_manifest_inserts_clause_commas_before_alignment(self):
+        cleaner = SubtitleCleaner(manifest="pipeline_qwen.toml", max_line_count=2)
+        self.assertEqual(
+            [name for name, _ in cleaner._pre_align_steps],
+            ["comma_conjunctions.toml"],
+        )
+        self.assertEqual(cleaner.pre_align("係咁嘅話我哋走先"), "係咁嘅話，我哋走先")
+        self.assertEqual(cleaner.clean("好攰雖然做完"), "好攰，雖然做完")
+
+    def test_default_manifest_leaves_clause_commas_to_the_model(self):
+        """A fine-tune punctuates its own clauses: no comma is added before or after alignment."""
+        cleaner = SubtitleCleaner(max_line_count=2)
+        self.assertEqual(cleaner._pre_align_steps, [])
+        self.assertEqual(cleaner.pre_align("係咁嘅話我哋走先"), "係咁嘅話我哋走先")
+        self.assertEqual(cleaner.clean("係咁嘅話我哋走先"), "係咁嘅話我哋走先")
+        self.assertEqual(cleaner.clean("好攰雖然做完"), "好攰雖然做完")
 
     def test_manifest_without_pre_align_is_a_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -689,7 +693,8 @@ class TestPreAlignClean(unittest.TestCase):
 
         seg = {"start": 1.0, "end": 3.0, "text": "係咁嘅話我哋走先"}
         items = [{"audio_path": "a.wav", "result": {"segments": [seg]}}]
-        out = _pre_align_clean(items, SubtitleCleaner(max_line_count=2))
+        out = _pre_align_clean(
+            items, SubtitleCleaner(max_line_count=2, manifest="pipeline_qwen.toml"))
 
         self.assertEqual(
             out[0]["result"]["segments"],

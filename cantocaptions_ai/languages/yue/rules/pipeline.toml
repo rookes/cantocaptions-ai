@@ -14,11 +14,15 @@
 # selected via the model profile's `cleaning` field.
 #
 # The order below is the relative order these same steps hold in pipeline_qwen.toml,
-# and is load-bearing for the same reason: comma_conjunctions matches against the
-# full-width punctuation that punctuation.toml normalizes to, and chinese_numbers has
-# to follow punctuation.toml because it groups values >= 10,000 with *half-width*
-# commas (45,010) and punctuation.toml rewrites ',' -> '，'. Nothing after it here
-# touches a half-width comma, which is what lets that grouping reach the subtitle.
+# and is load-bearing for the same reason: chinese_numbers has to follow
+# punctuation.toml because it groups values >= 10,000 with *half-width* commas (45,010)
+# and punctuation.toml rewrites ',' -> '，'. Nothing after it here touches a half-width
+# comma, which is what lets that grouping reach the subtitle.
+#
+# comma_conjunctions.toml is left out, both here and as a `pre_align` step: a
+# fine-tuned checkpoint punctuates its own clauses, so the commas it wrote (or didn't)
+# around 嘅話/雖然/但係/首先 stand. With no `pre_align` steps, alignment sees the ASR
+# text exactly as the model wrote it.
 #
 # Repeats are handled by repeated_speech_strict.toml, not the Qwen chain's
 # repeated_speech.toml: a fine-tuned checkpoint writes "X，X" for an utterance said twice
@@ -28,15 +32,6 @@
 # linebreak and trim are layout, not dialect correction, so they close this chain
 # exactly as they close the Qwen one: without them a long cue went out as a single
 # over-width line, and a comma left on the end of a cue was never stripped.
-#
-# `pre_align` steps run on the raw ASR text before alignment, in the same format.
-# comma_conjunctions goes there so the clause commas it adds (嘅話，/，雖然) are
-# boundaries alignment can end or start a cue on; it also stays in `steps`, where it
-# is a no-op on commas already inserted.
-
-[[pre_align]]
-type = "rules"
-file = "comma_conjunctions.toml"
 
 [[steps]]
 type = "rules"
@@ -45,10 +40,6 @@ file = "punctuation.toml"
 [[steps]]
 type = "rules"
 file = "chars_hk.toml"
-
-[[steps]]
-type = "rules"
-file = "comma_conjunctions.toml"
 
 [[steps]]
 type = "builtin"
