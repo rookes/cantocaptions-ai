@@ -161,10 +161,21 @@ class TestRuleLoader(unittest.TestCase):
             ("快啲啦，快啲啦，快啲啦…", "快啲啦…"),
             ("喂喂喂？", "喂…？"),
             ("好啦，喂，喂，喂，行啦", "好啦，喂…行啦"),
+            # ... including inside a clause, with text glued on either side
+            ("遲到咗好多好多好多，差唔多成個鐘", "遲到咗好多…差唔多成個鐘"),
+            ("遲到咗好多，好多，好多，差唔多成個鐘", "遲到咗好多…差唔多成個鐘"),
+            ("佢話我哋走啦我哋走啦我哋走啦", "佢話我哋走啦…"),
+            # ... and a last copy glued to the next word stays with it
+            ("遲到咗好多好多好多時間", "遲到咗好多…好多時間"),
+            ("遲到咗好多，好多，好多時間", "遲到咗好多…好多時間"),
+            ("好多好多好多好多時間", "好多…好多時間"),
+            ("唔好，唔好，唔好食", "唔好…唔好食"),
+            ("你你你佢", "你…你佢"),
             # reduced: the model's own "more than twice" form
             ("喂，喂…", "喂…"),
             ("快啲啦，快啲啦…", "快啲啦…"),
             ("好啦，快啲啦，快啲啦…行啦", "好啦，快啲啦…行啦"),
+            ("遲到咗好多，好多…差唔多成個鐘", "遲到咗好多…差唔多成個鐘"),
             # left alone: once, twice, and words that happen to double
             ("喂", "喂"),
             ("喂，喂", "喂，喂"),
@@ -173,8 +184,7 @@ class TestRuleLoader(unittest.TestCase):
             ("媽媽", "媽媽"),
             ("大佬大佬", "大佬大佬"),
             ("唔好，唔好食", "唔好，唔好食"),
-            ("唔好，唔好，唔好食", "唔好，唔好，唔好食"),  # the third is another utterance
-            ("你你你佢", "你你你佢"),
+            ("遲到咗好多，好多，差唔多成個鐘", "遲到咗好多，好多，差唔多成個鐘"),
         ]:
             with self.subTest(text=text):
                 self.assertEqual(default.clean(text), expected)

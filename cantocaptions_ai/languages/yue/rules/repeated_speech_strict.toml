@@ -14,16 +14,21 @@
 # (single-quoted) strings: backslashes are verbatim.
 #
 # X is the *shortest* run that repeats (lazy `+?`), so 喂喂喂喂喂喂 reduces to 喂… and not
-# 喂喂…. The run must be a whole clause: not glued to a character before it, and not
-# followed by one. "唔好，唔好，唔好食" ends in a different utterance (唔好食), so it stays.
-# A trailing [，…] is consumed because the ellipsis now stands in for it; a following
-# question mark is kept (喂喂喂？ -> 喂…？).
+# 喂喂…. The run may follow text it is glued to (遲到咗好多好多好多，差唔多成個鐘 ->
+# 遲到咗好多…差唔多成個鐘). A trailing [，…] is consumed because the ellipsis now stands
+# in for it; a following question mark is kept (喂喂喂？ -> 喂…？).
 
 [[rules]]
-pattern = '(?<![一-鿿])([一-鿿]+?)(?:，?\1){2,}(?![一-鿿])[，…]*'
+pattern = '([一-鿿]+?)(?:，?\1){2,}(?![一-鿿])[，…]*'
 replace = '\1…'
+
+# A run whose last copy is glued to the next word keeps that copy, since it belongs to
+# what follows: 遲到咗好多好多好多時間 -> 遲到咗好多…好多時間.
+[[rules]]
+pattern = '([一-鿿]+?)(?:，?\1){2,}(?=[一-鿿])'
+replace = '\1…\1'
 
 # Must follow the rule above: X，X，X… contains X，X… and would otherwise be half-matched.
 [[rules]]
-pattern = '(?<![一-鿿])([一-鿿]+?)，\1…'
+pattern = '([一-鿿]+?)，\1…'
 replace = '\1…'
