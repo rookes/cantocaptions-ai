@@ -32,7 +32,8 @@ uv sync
 This installs all dependencies into an isolated virtual environment and pins exact versions; every ASR
 family (Qwen3-ASR, Whisper, CTC) runs on it. Torch is pulled from the PyTorch CUDA 12.8 index on Linux
 and Windows; the CPU build is used on macOS. Optional extras: `compile` (triton, for `--compile`),
-`ensemble`, `llm`, `flash-attn`, `proofread` (the hosted-LLM clients for `--proofread`), or `full` for all of them. `transformers_qwen` is the old name of
+`ensemble`, `llm`, `flash-attn`, `proofread` (the hosted-LLM clients for `--proofread`), `ocr` (PaddleOCR, for
+image subtitle tracks; see "Embedded reference subtitles"), or `full` for all of them. `transformers_qwen` is the old name of
 `compile` and still works.
 
 ## Basic Usage
@@ -202,6 +203,31 @@ or both can be on. `speaker_change_threshold` (default 0.8) trades splits for re
 
 Diarization requires a gated model download, so you need to accept its terms on HuggingFace and supply a 
 token (see below).
+
+### Embedded reference subtitles
+
+A video file often carries subtitle tracks of its own, and a Chinese one makes a good reference
+subtitle for the ASR context, the proofreader or any later review. `--extract_references` writes an
+input's tracks out beside its subtitles before transcription starts, and `--references_only` does
+just that, with no speech models:
+
+```bash
+uv run cantocaptions_ai bluray.mkv --references_only            # bluray.ref.zh-Hant.srt, ...
+uv run cantocaptions_ai bluray.mkv --reference_subtitle embedded --asr_context
+```
+
+Each track becomes `NAME.ref.LANG.srt`, and `NAME.references.json` lists every subtitle stream found,
+how each was read and why any was skipped. `--reference_tracks` picks the tracks: `chinese` (the
+default), `all`, or stream indices. `--reference_subtitle embedded` extracts them and uses the best
+Chinese one as the reference: a complete track before a signs-only one, a text track before an OCR'd
+one, Traditional before Simplified.
+
+Text tracks (SRT, ASS, WebVTT, mov_text) are converted as they are. Image tracks (Blu-ray PGS, DVB and
+DVD VobSub) are read by OCR, which needs the `ocr` extra (`uv sync --inexact --extra ocr`). OCR runs on
+the GPU in a process of its own and finishes before any speech model loads, so it does not compete
+with them for memory; expect well under a minute per episode. OCR is not perfect: expect the occasional
+misread character, which matters little for a reference read for its meaning. Without the extra, image
+tracks are skipped with a warning.
 
 ### Online proofreading (opt-in)
 

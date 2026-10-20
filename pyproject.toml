@@ -53,6 +53,14 @@ transformers_qwen = [
 flash-attn = [
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+# PaddleOCR for image-based (PGS, DVB, VobSub) embedded subtitle tracks, read by
+# --extract_references / --references_only. It runs in a child process, never beside torch.
+ocr = [
+    "paddleocr>=3.7",
+    "pillow>=10.0",
+    "paddlepaddle-gpu==3.3.1; sys_platform != 'darwin'",
+    "paddlepaddle==3.3.1; sys_platform == 'darwin'",
+]
 # The SDKs for the LLM proofreading stage (--proofread). Installing them turns nothing on:
 # the stage stays off, and the pipeline offline, until it is enabled per run or in user.cfg.
 proofread = ["google-genai>=2.0", "anthropic>=1.0"]
@@ -65,6 +73,10 @@ full = [
     "flash-attn>=2.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "google-genai>=2.0",
     "anthropic>=1.0",
+    "paddleocr>=3.7",
+    "pillow>=10.0",
+    "paddlepaddle-gpu==3.3.1; sys_platform != 'darwin'",
+    "paddlepaddle==3.3.1; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
@@ -91,6 +103,12 @@ environments = [
 override-dependencies = [
     "torchcodec>=0.6.0; sys_platform != 'linux' or platform_machine != 'x86_64'",
 ]
+# The `ocr` extra's paddlex caps numpy below 2.4, and the lock holds one numpy for every extra.
+# Left alone, uv then settles on the 2.2 line for every Python; this keeps 3.11+ on the newest
+# release paddlex allows.
+constraint-dependencies = [
+    "numpy>=2.3; python_version >= '3.11'",
+]
 
 [tool.uv.sources]
 torch = [
@@ -105,10 +123,24 @@ torchaudio = [
   { index = "pytorch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
   { index = "pytorch", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
 ]
+paddlepaddle-gpu = [
+  { index = "paddle-cu129", marker = "sys_platform == 'win32'" },
+  { index = "paddle-cu118", marker = "sys_platform == 'linux'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "paddle-cu129"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu129/"
+explicit = true
+
+[[tool.uv.index]]
+name = "paddle-cu118"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
 explicit = true
 
 [[tool.uv.index]]

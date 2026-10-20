@@ -292,6 +292,23 @@ class PipelineConfig:
     # default, the same timeline a reference has in every non-realign run.
     reference_timing: Optional[str] = "media"
 
+    # Embedded reference subtitles (cantocaptions_ai/references/). Before VAD, write the
+    # input's own subtitle tracks out as reference SRTs: text tracks converted, image tracks
+    # (PGS, DVB, VobSub) read by OCR in a worker process. reference_subtitle = "embedded"
+    # turns this on too and uses the best Chinese track as the reference.
+    extract_references: bool = False
+    # Which tracks: "chinese" (every Chinese one), "all", or ffmpeg stream indices ("3,5").
+    reference_tracks: str = "chinese"
+    # "auto" reads image tracks when an OCR engine is installed (the `ocr` extra) and skips
+    # them with a warning otherwise; "off" never runs OCR.
+    reference_ocr: str = "auto"
+    reference_ocr_device: str = "auto"
+    # "line": the recogniser alone on each cut-out text line (see references/ocr.py);
+    # "detect": the full detect-then-recognise pipeline on each picture.
+    reference_ocr_mode: str = "line"
+    # A PaddleOCR language overriding the one each track's tags imply.
+    reference_ocr_lang: Optional[str] = None
+
     # Reference subtitle as ASR context (experimental). Routes the same
     # --reference_subtitle file into Qwen3-ASR's context-biasing system prompt and,
     # separately, into the VAD timeline. See pipeline/reference_context.py.
@@ -433,6 +450,7 @@ SECTION_TITLES: Mapping[str, str] = MappingProxyType({
     "vad": "vad",
     "vocal_isolation": "vocal isolation",
     "ensemble": "ensemble & LLM correction",
+    "references": "embedded reference subtitles",
     "asr_context": "asr context (experimental)",
     "alignment": "alignment",
     "cues": "cue timing",
@@ -465,6 +483,10 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     "ensemble": (
         "ensemble_model", "llm_correction", "llm_model", "llm_model_dir", "reference_subtitle",
         "reference_correction_semantic", "reference_offset", "reference_timing",
+    ),
+    "references": (
+        "extract_references", "reference_tracks", "reference_ocr", "reference_ocr_device",
+        "reference_ocr_mode", "reference_ocr_lang",
     ),
     "asr_context": (
         "asr_context", "asr_context_template", "asr_context_scope", "asr_context_neighbours",

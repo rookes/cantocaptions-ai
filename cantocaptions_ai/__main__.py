@@ -138,10 +138,19 @@ def build_parser() -> argparse.ArgumentParser:
     ensemble_grp.add_argument("--llm_correction", action="store_true", default=argparse.SUPPRESS, help="run LLM-based per-segment particle correction and full-document name normalization after transcription")
     ensemble_grp.add_argument("--llm_model", type=str, default=argparse.SUPPRESS, help="HuggingFace model ID for LLM correction (used with --llm_correction)")
     ensemble_grp.add_argument("--llm_model_dir", type=str, default=argparse.SUPPRESS, help="local path to LLM weights; uses HF cache if not set")
-    ensemble_grp.add_argument("--reference_subtitle", type=str, default=argparse.SUPPRESS, metavar="SUBTITLE_FILE", help="same-content subtitle file in another language (SRT/VTT), used as reference by --llm_correction and/or --asr_context; fixes homophone errors in proper nouns, idioms, etc. (requires one of those two)")
+    ensemble_grp.add_argument("--reference_subtitle", type=str, default=argparse.SUPPRESS, metavar="SUBTITLE_FILE", help="same-content subtitle file in another language (SRT/VTT), used as reference by --llm_correction, --asr_context and --proofread; fixes homophone errors in proper nouns, idioms, etc. (requires one of those). 'embedded' uses the input's own Chinese subtitle track (see --extract_references)")
     ensemble_grp.add_argument("--reference_correction_semantic", action="store_true", default=argparse.SUPPRESS, help="also attempt semantic fixes from the reference subtitle (e.g. missing negations, punctuation); higher false-positive risk, requires --reference_subtitle")
     ensemble_grp.add_argument("--reference_offset", type=float, default=argparse.SUPPRESS, metavar="SECONDS", help="shift every --reference_subtitle cue by this many seconds before use (negative = earlier); for a reference that runs consistently early or late against the audio. If the offset drifts rather than being constant, use --realign with --realign_mode sync, which fits a transform instead of a single shift")
     ensemble_grp.add_argument("--reference_timing", type=str, default=argparse.SUPPRESS, choices=["subtitle", "media"], help="with --realign: which timeline --reference_subtitle follows. 'subtitle': the --realign input's own timings, so proofreading runs first, on the input, and realign places the corrected text. 'media': the audio/video's timings, so proofreading runs after realign, on the realigned cues. Default 'media'. Every proofread checks that the reference really lines up with the cues it is paired with, and sends nothing if it does not")
+
+    refs_grp = parser.add_argument_group("embedded reference subtitles")
+    refs_grp.add_argument("--extract_references", action="store_true", default=argparse.SUPPRESS, help="before transcribing, write each input's own subtitle tracks out as reference subtitles beside the output (NAME.ref.LANG.srt, plus NAME.references.json listing every track and what became of it). Text tracks are converted; image tracks (Blu-ray PGS, DVB, DVD VobSub) are read by OCR, which needs pip install 'cantocaptions_ai[ocr]'. --reference_subtitle embedded does this too")
+    refs_grp.add_argument("--references_only", action="store_true", default=argparse.SUPPRESS, help="only extract the inputs' embedded subtitle tracks (as --extract_references), with no VAD, ASR or GPU speech models")
+    refs_grp.add_argument("--reference_tracks", type=str, default=argparse.SUPPRESS, metavar="TRACKS", help="which subtitle tracks to extract: 'chinese' (every Chinese-language track), 'all', or ffmpeg stream indices such as 3,5")
+    refs_grp.add_argument("--reference_ocr", type=str, default=argparse.SUPPRESS, choices=["auto", "off"], help="'auto' reads image subtitle tracks when an OCR engine is installed and skips them with a warning otherwise; 'off' extracts text tracks only")
+    refs_grp.add_argument("--reference_ocr_device", type=str, default=argparse.SUPPRESS, choices=["auto", "cuda", "cpu"], help="device for OCR, which runs in a process of its own before any speech model loads")
+    refs_grp.add_argument("--reference_ocr_mode", type=str, default=argparse.SUPPRESS, choices=["line", "detect"], help="'line' reads each line of a subtitle picture with the text recogniser alone; 'detect' runs text detection first, for pictures that are not plain lines of text")
+    refs_grp.add_argument("--reference_ocr_lang", type=str, default=argparse.SUPPRESS, metavar="LANG", help="PaddleOCR language for every image track (e.g. chinese_cht, ch, en, japan), instead of the one each track's language tag implies")
 
     ctx_grp = parser.add_argument_group("asr context (experimental)")
     ctx_grp.add_argument("--asr_context", action="store_true", default=argparse.SUPPRESS, help="feed --reference_subtitle into Qwen3-ASR's context-biasing system prompt so each VAD segment decodes with its matching reference cues as background knowledge (experimental; measure with scripts/eval_asr_context.py)")
@@ -278,6 +287,7 @@ def _run(parser, explicit: dict, merged: dict) -> None:
         from cantocaptions_ai.pipeline.transcribe import proofread_task
         proofread_task(merged, parser, proofread_input)
         return
+    references_only = merged.pop("references_only", False)
     if audio and input_dir:
         parser.error("positional audio files and --input_dir are mutually exclusive")
     if not audio and not input_dir:
@@ -288,6 +298,11 @@ def _run(parser, explicit: dict, merged: dict) -> None:
         except ValueError as e:
             parser.error(str(e))
     merged["audio"] = audio
+
+    if references_only:
+        from cantocaptions_ai.pipeline.transcribe import references_task
+        references_task(merged, parser, input_dir=input_dir)
+        return
 
     from cantocaptions_ai.pipeline.transcribe import transcribe_task
 

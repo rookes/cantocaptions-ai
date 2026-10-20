@@ -6,7 +6,7 @@ What `--debug_dir` writes and what `--load_debug_dir` reloads.
 `--debug_dir DIR` saves intermediate outputs (WAV segments + JSON) after each stage.  
 `--load_debug_dir DIR` loads saved stages, skipping recomputation — useful for iterating on later stages without re-running expensive models.
 
-Stage checkpoints: `vad`, `isolation`, `transcription`, `ensemble`, `llm_correction`, `diarization`, `realign`, `proofread`.
+Stage checkpoints: `references`, `vad`, `isolation`, `transcription`, `ensemble`, `llm_correction`, `diarization`, `realign`, `proofread`.
 
 Each run's log (`{output_dir}/logs/`, or `--log_file`) is the place to read what a replay did: it
 has every DEBUG line, so every checkpoint loaded or written, and why a stale one was recomputed.
@@ -20,6 +20,11 @@ wants to re-run anyway. It also doubles as the diagnostic dump: the per-line sco
 view into how well the transcript matched the recording.
 
 A file whose `vocal_isolation` checkpoint is cached skips the VAD stage entirely on replay (no model load, no reading the VAD WAVs back): the isolation checkpoint carries the same segment boundaries plus the audio ASR actually consumes, and stage 2 replaces `vad_segments` wholesale. The decision is per file, so a mixed `--input_dir` still runs VAD for the files that need it.
+
+`references/` holds the reference subtitles `--extract_references` (or `--reference_subtitle
+embedded`) wrote, and their `NAME.references.json`. On replay they are copied back into the output
+directory instead of being extracted again, as long as the media file (path, size, modification
+time) and the `reference_*` track and OCR settings are unchanged; OCR is the slow part.
 
 `diarization/` holds one loadable checkpoint (`result.json`: scope, speaker labels, exclusive turns, overlapping turns, the per-VAD-segment `segment_speakers` breakdown under segment scope, optional embeddings) plus two snapshots that are *not* reloaded — `assignments.json` and `{stem}.srt`, both showing the per-subsegment speaker, confidence and `!MULTI` flag. Assignment is cheap and must re-run so threshold changes apply on replay.
 

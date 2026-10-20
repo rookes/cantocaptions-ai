@@ -796,6 +796,10 @@ def validate_config(cfg) -> None:
         raise ConfigError("reference_subtitle requires llm_correction, asr_context or proofread")
     if cfg.reference_correction_semantic and not cfg.reference_subtitle:
         _advise("reference_correction_semantic has no effect without reference_subtitle")
+    _validate_references(cfg)
+    if cfg.reference_subtitle == "embedded" and cfg.reference_timing == "subtitle":
+        raise ConfigError("reference_subtitle embedded comes from the media itself, so it "
+                          "follows the media's timeline: use reference_timing media")
     if cfg.asr_context and not cfg.reference_subtitle:
         raise ConfigError("asr_context requires reference_subtitle")
     if cfg.asr_context:
@@ -1041,6 +1045,64 @@ def _cleanup_temp_files(paths: List[str]) -> None:
             logger.warning("Could not remove temp clip file: %s", p)
 
 
+def _use_embedded_reference(cfg, result, name: str):
+    """*cfg* with reference_subtitle set to the input's best extracted Chinese track."""
+    from cantocaptions_ai.errors import InputError
+    best = getattr(result, "best_chinese", None)
+    if not best:
+        raise InputError(
+            f"reference_subtitle embedded: {name} has no Chinese subtitle track that could be "
+            "extracted (see its .references.json); give a reference file instead")
+    logger.debug("Reference subtitle: the embedded track %s", best)
+    return dataclasses.replace(cfg, reference_subtitle=best)
+
+
+def references_task(args: dict, parser: argparse.ArgumentParser,
+                    input_dir: Optional[str] = None) -> None:
+    """CLI adapter for --references_only: extract each input's embedded subtitle tracks into
+    ``cfg.output_dir`` and stop, with no VAD, ASR or speech model."""
+    from cantocaptions_ai.errors import ConfigError
+    from cantocaptions_ai.pipeline.config import PipelineConfig
+    from cantocaptions_ai.references import step as references_step
+    from cantocaptions_ai.utils.output import output_names
+
+    audio_paths = args.pop("audio")
+    cfg = PipelineConfig.from_args(args)
+    try:
+        _validate_references(cfg)
+        names = output_names(audio_paths, input_dir)
+    except ConfigError as e:
+        parser.error(str(e))
+    missing = [p for p in audio_paths if not os.path.isfile(p)]
+    if missing:
+        parser.error(f"input file not found: {missing[0]}")
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    summary = TranscriptionSummary(enabled=cfg.print_progress, title="References complete")
+    start = time.perf_counter()
+    _setup_title(f"cantocaptions references {glyph('dot')} {_describe_inputs(audio_paths)}", summary)
+    _setup_rows([("Output", os.path.normpath(cfg.output_dir))])
+    references_step.extract_for_inputs(cfg, audio_paths, names, summary)
+    summary.print_summary(process_elapsed=time.perf_counter() - start)
+
+
+def _validate_references(cfg) -> None:
+    from cantocaptions_ai.errors import ConfigError
+    from cantocaptions_ai.references.ocr import OCR_MODES
+    spec = (cfg.reference_tracks or "").strip().lower()
+    if spec not in ("chinese", "all") and not (spec and all(
+            part.strip().isdigit() for part in spec.split(",") if part.strip())):
+        raise ConfigError("reference_tracks must be chinese, all or stream indices such as 3,5; "
+                          f"got {cfg.reference_tracks!r}")
+    if cfg.reference_ocr not in ("auto", "off"):
+        raise ConfigError(f"reference_ocr must be auto or off, got {cfg.reference_ocr!r}")
+    if cfg.reference_ocr_device not in ("auto", "cuda", "cpu"):
+        raise ConfigError("reference_ocr_device must be auto, cuda or cpu, "
+                          f"got {cfg.reference_ocr_device!r}")
+    if cfg.reference_ocr_mode not in OCR_MODES:
+        raise ConfigError(f"reference_ocr_mode must be one of {', '.join(OCR_MODES)}, "
+                          f"got {cfg.reference_ocr_mode!r}")
+
+
 def transcribe_task(args: dict, parser: argparse.ArgumentParser, input_dir: Optional[str] = None):
     """CLI adapter: build a PipelineConfig from parsed args and run the pipeline.
 
@@ -1060,10 +1122,15 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser, input_dir: Opti
     cfg = PipelineConfig.from_args(args)
     try:
         validate_config(cfg)
+        if cfg.reference_subtitle == "embedded" and len(audio_paths) > 1:
+            raise ConfigError("reference_subtitle embedded uses one input's own subtitle "
+                              "tracks; pass one file (extract_references writes every "
+                              "input's tracks without using them)")
         names = output_names(audio_paths, input_dir)
     except ConfigError as e:
         parser.error(str(e))
 
+    from cantocaptions_ai.errors import InputError
     paths, display_paths, temp_files = _prepare_clips(audio_paths, cfg)
     try:
         _execute_pipeline(
@@ -1072,6 +1139,8 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser, input_dir: Opti
             display_paths=display_paths,
             names=names,
         )
+    except InputError as e:
+        parser.error(str(e))
     finally:
         _cleanup_temp_files(temp_files)
 
@@ -1120,11 +1189,6 @@ def _execute_pipeline(
         names = output_names(originals)
     name_of = {p: names[orig] for p, orig in zip(audio_paths, originals)}
 
-    # The settings each stage's debug checkpoint must have been made with to be replayed;
-    # carried on every item so the stages can check what they read (utils/checkpoints.py).
-    from cantocaptions_ai.utils.checkpoints import checkpoint_settings
-    checkpoints = checkpoint_settings(cfg)
-
     align_language = cfg.language
 
     # The language pack, resolved for the ASR model, drives the downstream path: post-ASR
@@ -1152,6 +1216,22 @@ def _execute_pipeline(
     summary = TranscriptionSummary(enabled=cfg.print_progress)
     process_start = time.perf_counter()
     _setup_title(f"cantocaptions {glyph('dot')} {_describe_inputs(originals)}", summary)
+
+    # Embedded reference subtitles, before anything that reads a reference (VAD expansion,
+    # ASR context) and before any speech model takes the GPU. See references/step.py.
+    from cantocaptions_ai.references import step as references_step
+    if references_step.wanted(cfg):
+        extracted = references_step.extract_for_inputs(
+            cfg, originals, {orig: name_of[p] for p, orig in zip(audio_paths, originals)},
+            summary, progress)
+        if cfg.reference_subtitle == references_step.EMBEDDED:
+            cfg = _use_embedded_reference(cfg, extracted.get(originals[0]), name_of[audio_paths[0]])
+
+    # The settings each stage's debug checkpoint must have been made with to be replayed;
+    # carried on every item so the stages can check what they read (utils/checkpoints.py).
+    # Taken after the reference step, which may have set reference_subtitle.
+    from cantocaptions_ai.utils.checkpoints import checkpoint_settings
+    checkpoints = checkpoint_settings(cfg)
 
     realign_mode = None
     if cfg.realign:
