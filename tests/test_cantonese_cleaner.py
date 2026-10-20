@@ -71,7 +71,7 @@ class TestRuleLoader(unittest.TestCase):
                 "comma_conjunctions.toml",
                 "chinese_numbers",
                 "interjection_noise.toml",
-                "repeated_speech.toml",
+                "repeated_speech_strict.toml",
                 "linebreak",
                 "trim",
             ],
@@ -127,15 +127,13 @@ class TestRuleLoader(unittest.TestCase):
                 self.assertEqual(default.clean(text), expected)
                 self.assertEqual(qwen.clean(text), expected)
 
-    def test_line_final_repeats_collapse_in_both_manifests(self):
+    def test_line_final_repeats_collapse_in_qwen_manifest(self):
         """repeated_speech.toml must not depend on another step adding a trailing comma.
 
         Its multi-character rules consume a trailing [，…] as part of the repeat, which
         only question_post.toml supplied -- so a line-final repeat survived any manifest
-        without that step. The `$`-anchored rules make the file self-contained; both
-        chains must agree.
+        without that step. The `$`-anchored rules make the file self-contained.
         """
-        default = SubtitleCleaner(line_max_length=21, max_line_count=2)
         qwen = SubtitleCleaner(
             line_max_length=21, max_line_count=2, manifest="pipeline_qwen.toml"
         )
@@ -148,8 +146,38 @@ class TestRuleLoader(unittest.TestCase):
             ("係咁多啦…係咁多啦，唔該", "係咁多啦…唔該"),  # mid-line: unchanged
         ]:
             with self.subTest(text=text):
-                self.assertEqual(default.clean(text), expected)
                 self.assertEqual(qwen.clean(text), expected)
+
+    def test_default_manifest_reduces_only_three_or_more_repeats(self):
+        """A fine-tune writes X / X，X / X，X… itself; only 3+ copies and X，X… reduce."""
+        default = SubtitleCleaner(line_max_length=21, max_line_count=2)
+        for text, expected in [
+            # reduced: X three or more times, with or without commas
+            ("喂喂喂", "喂…"),
+            ("喂，喂，喂", "喂…"),
+            ("喂喂喂喂喂喂", "喂…"),            # the shortest repeating unit, not 喂喂…
+            ("唔該唔該唔該", "唔該…"),
+            ("唔該，唔該，唔該，唔該", "唔該…"),
+            ("快啲啦，快啲啦，快啲啦…", "快啲啦…"),
+            ("喂喂喂？", "喂…？"),
+            ("好啦，喂，喂，喂，行啦", "好啦，喂…行啦"),
+            # reduced: the model's own "more than twice" form
+            ("喂，喂…", "喂…"),
+            ("快啲啦，快啲啦…", "快啲啦…"),
+            ("好啦，快啲啦，快啲啦…行啦", "好啦，快啲啦…行啦"),
+            # left alone: once, twice, and words that happen to double
+            ("喂", "喂"),
+            ("喂，喂", "喂，喂"),
+            ("快啲啦，快啲啦", "快啲啦，快啲啦"),
+            ("喂喂", "喂喂"),
+            ("媽媽", "媽媽"),
+            ("大佬大佬", "大佬大佬"),
+            ("唔好，唔好食", "唔好，唔好食"),
+            ("唔好，唔好，唔好食", "唔好，唔好，唔好食"),  # the third is another utterance
+            ("你你你佢", "你你你佢"),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(default.clean(text), expected)
 
     def test_order_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:

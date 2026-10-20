@@ -20,10 +20,10 @@
 # commas (45,010) and punctuation.toml rewrites ',' -> '，'. Nothing after it here
 # touches a half-width comma, which is what lets that grouping reach the subtitle.
 #
-# repeated_speech used to need a trailing comma that only question_post.toml supplied,
-# which made a line-final repeat ("係咁多啦…係咁多啦") pass through this manifest
-# untouched. That dependency now lives in repeated_speech.toml itself as a pair of
-# `$`-anchored rules, so this chain collapses the same runs the Qwen one does.
+# Repeats are handled by repeated_speech_strict.toml, not the Qwen chain's
+# repeated_speech.toml: a fine-tuned checkpoint writes "X，X" for an utterance said twice
+# and "X，X…" for more than twice, so only X three or more times and the "X，X…" form
+# are reduced (both to "X…").
 #
 # linebreak and trim are layout, not dialect correction, so they close this chain
 # exactly as they close the Qwen one: without them a long cue went out as a single
@@ -60,7 +60,7 @@ file = "interjection_noise.toml"
 
 [[steps]]
 type = "rules"
-file = "repeated_speech.toml"
+file = "repeated_speech_strict.toml"
 
 [[steps]]
 type = "builtin"

@@ -1,0 +1,29 @@
+# Collapse repeated speech for a fine-tuned checkpoint, in only two cases.
+#
+# The fine-tune is trained to write a repeated utterance X faithfully:
+#   X        said once
+#   X，X     said twice
+#   X，X…    said more than twice
+# so a repeat it wrote on purpose is left as it is. repeated_speech.toml (the Qwen chain's
+# file) folds any adjacent or comma-separated pair of repeats, which would undo exactly
+# that. Here only these are reduced, both to "X…":
+#   1. X written three or more times, with or without commas (XXX, X，X，X)
+#   2. the model's own "more than twice" form (X，X…)
+# Two adjacent copies (媽媽, 唔好唔好) and a plain "X，X" are real wording and stay.
+# Rules apply in order, one re.sub pass each. Patterns/replacements use TOML literal
+# (single-quoted) strings: backslashes are verbatim.
+#
+# X is the *shortest* run that repeats (lazy `+?`), so 喂喂喂喂喂喂 reduces to 喂… and not
+# 喂喂…. The run must be a whole clause: not glued to a character before it, and not
+# followed by one. "唔好，唔好，唔好食" ends in a different utterance (唔好食), so it stays.
+# A trailing [，…] is consumed because the ellipsis now stands in for it; a following
+# question mark is kept (喂喂喂？ -> 喂…？).
+
+[[rules]]
+pattern = '(?<![一-鿿])([一-鿿]+?)(?:，?\1){2,}(?![一-鿿])[，…]*'
+replace = '\1…'
+
+# Must follow the rule above: X，X，X… contains X，X… and would otherwise be half-matched.
+[[rules]]
+pattern = '(?<![一-鿿])([一-鿿]+?)，\1…'
+replace = '\1…'
