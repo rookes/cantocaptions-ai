@@ -41,7 +41,10 @@ def media(tmp_path_factory):
          "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "5",
          "-i", str(d / "zh.srt"), "-i", str(d / "en.ass"),
          "-map", "0:v", "-map", "1:a", "-map", "2:s", "-map", "3:s",
-         "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-c:s", "copy",
+         # PCM, not AAC: AAC's encoder delay makes older ffmpeg (Ubuntu's 6.x) start the audio
+         # at -0.064 s and shift every stream to keep timestamps non-negative, so the cues
+         # land 64 ms later in the file than written. Newer muxers store the delay instead.
+         "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "pcm_s16le", "-c:s", "copy",
          "-metadata:s:s:0", "language=chi", "-metadata:s:s:0", "title=繁體",
          "-metadata:s:s:1", "language=eng", "-shortest", str(out)],
         check=True)
