@@ -24,8 +24,10 @@ RE_DELIMITING_PUNCTUATION = re.compile(r'[，？！…。：；]')
 # point inside a number or an abbreviation does not.
 _ASCII_DELIMITERS = ",?!.;:"
 
-_RE_LEADING_TRIM = re.compile(r'^[，,\s]+', re.MULTILINE)
-_RE_TRAILING_TRIM = re.compile(r'[，,\s]+$', re.MULTILINE)
+# The list comma 、 goes with them: the breaker doesn't count it as punctuation, so a break
+# can land on either side of one, and it is as stray at a line's end or start as ，.
+_RE_LEADING_TRIM = re.compile(r'^[，,、\s]+', re.MULTILINE)
+_RE_TRAILING_TRIM = re.compile(r'[，,、\s]+$', re.MULTILINE)
 
 
 def _inside_words(text: str) -> Set[int]:
@@ -136,7 +138,7 @@ def _mid_word(text: str, i: int) -> bool:
 
 
 def trim(text: str) -> str:
-    """Strip leading/trailing commas and whitespace from every line."""
+    """Strip leading/trailing commas (list commas included) and whitespace from every line."""
     text = _RE_LEADING_TRIM.sub('', text)
     text = _RE_TRAILING_TRIM.sub('', text)
     return text

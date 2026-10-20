@@ -110,6 +110,19 @@ class TestRuleLoader(unittest.TestCase):
         cleaner = SubtitleCleaner(max_line_count=2)
         self.assertEqual(cleaner.clean("我哋今日要走，"), "我哋今日要走")
 
+    def test_no_line_starts_or_ends_on_a_list_comma(self):
+        """The breaker can land beside a 、, which trim strips like a ，."""
+        cleaner = SubtitleCleaner(max_line_count=2)
+        for text, expected in [
+            ("佢鍾意游水、跑步、踩單車、打波、行山、睇戲同埋唱歌",
+             "佢鍾意游水、跑步、踩單車\n打波、行山、睇戲同埋唱歌"),
+            ("我哋要買蘋果、橙、香蕉、提子、士多啤梨、西瓜同埋菠蘿",
+             "我哋要買蘋果、橙、香蕉、提子\n士多啤梨、西瓜同埋菠蘿"),
+            ("我買咗蘋果、橙、", "我買咗蘋果、橙"),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(cleaner.clean(text), expected)
+
     def test_grouped_number_commas_survive_the_default_chain(self):
         """A converted value >= 10,000 keeps its half-width commas.
 
