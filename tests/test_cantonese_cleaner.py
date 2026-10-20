@@ -185,6 +185,14 @@ class TestRuleLoader(unittest.TestCase):
             ("大佬大佬", "大佬大佬"),
             ("唔好，唔好食", "唔好，唔好食"),
             ("遲到咗好多，好多，差唔多成個鐘", "遲到咗好多，好多，差唔多成個鐘"),
+            # left alone: Latin letters are never a repeat, however many
+            ("brrr", "brrr"),
+            ("shhh", "shhh"),
+            ("hmmm", "hmmm"),
+            ("oooh", "oooh"),
+            ("no, no, no", "no, no, no"),
+            ("nonono", "nonono"),
+            ("佢話brrr，好凍", "佢話brrr，好凍"),
         ]:
             with self.subTest(text=text):
                 self.assertEqual(default.clean(text), expected)
