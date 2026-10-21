@@ -122,6 +122,9 @@ class SingleSegment(TypedDict):
     # Where --realign placed each cue, index-aligned with cue_spans. Carried onto the cue as
     # ``realign_placement`` so mode adjust can hold the final alignment to its leash.
     cue_placements: NotRequired[List[Tuple[float, float]]]
+    # (start, end, note) on the file's timeline: notes about a stretch of the chunk (ASR
+    # repair's), landed on the cues overlapping it by attach_timed_notes.
+    notes_at: NotRequired[List[Tuple[float, float, str]]]
 
 
 class SegmentData(TypedDict):
@@ -271,6 +274,29 @@ def add_note(segment: SingleAlignedSegment, note: str) -> None:
     notes = segment.setdefault("notes", [])
     if note not in notes:
         notes.append(note)
+
+
+def attach_timed_notes(segment: dict, pieces: List[SingleAlignedSegment]) -> None:
+    """Land a pre-alignment segment's ``notes_at`` on the cues it became.
+
+    ``notes_at`` holds ``(start, end, note)`` on the file's timeline: a note about one
+    stretch of an ASR chunk (that its loop was trimmed, that a piece of it was Italian), kept
+    by time rather than by character because text cleaning edits the text in between. Each
+    note goes to every piece that overlaps its range by at least half the piece or 0.3 s
+    (a cue whose edge only grazes the range is not about it), else to the nearest piece.
+    """
+    timed = segment.get("notes_at") or ()
+    if not timed or not pieces:
+        return
+    for start, end, note in timed:
+        hits = [p for p in pieces
+                if min(p["end"], end) - max(p["start"], start)
+                >= min(0.3, 0.5 * (p["end"] - p["start"]))]
+        if not hits:
+            mid = (start + end) / 2
+            hits = [min(pieces, key=lambda p: abs((p["start"] + p["end"]) / 2 - mid))]
+        for piece in hits:
+            add_note(piece, note)
 
 
 def merge_segments(

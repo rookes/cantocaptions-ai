@@ -194,6 +194,9 @@ def test_join_clauses_marks_unpunctuated_boundaries_in_the_languages_own_marks()
                             CJK_PUNCTUATION, CJK_SCRIPT) == "來吧，天竺，好呀！Hello there, Desmond"
     assert asr.join_clauses(["hello there.", "how are you", " fine "],
                             LATIN_PUNCTUATION, SPACED_SCRIPT) == "hello there. how are you, fine"
+    # An accented letter is still Latin: its clause keeps its own marks.
+    assert asr.join_clauses(["Rosé, até. Il nasce", "Si può. Basta"],
+                            CJK_PUNCTUATION, CJK_SCRIPT) == "Rosé, até. Il nasce，Si può. Basta"
 
 
 def test_whisper_loader_takes_the_common_load_arguments():

@@ -119,7 +119,34 @@ Only the fine-tune is tuned for Cantonese subtitles; the others are there for ot
 A Qwen3-ASR chunk that uses up its whole token budget without finishing is stuck in a repetition loop. For
 example, a sung "da da da" can come out as one 噔 after another until the budget runs out. Such a chunk is
 generated again once with `asr_loop_retry_penalty` (default 1.1, `0` turns it off), and the log warns when it
-happens.
+happens. A chunk that starts repeating itself is stopped right there (`asr_loop_stop`) rather than left to run
+out its budget, which would also hold up every other chunk transcribed alongside it.
+
+### ASR repair (`[asr_repair]`)
+
+After transcription, chunks that went wrong in a recognisable way are transcribed again:
+
+- **Repetition loops.** A chunk that repeats one phrase five or more times in a row
+  (`asr_loop_min_copies`), or that the retry above didn't fix, is cut at its longest pause and
+  each piece is transcribed again. A piece that still loops is cut again (`asr_split_depth`,
+  default 3). Whatever still loops after that is written once, as `phrase…` (`asr_loop_trim`).
+- **Speech in another language.** The Cantonese model writes Italian, say, as invented
+  Cantonese or not at all. Chunks that loop, come out empty, or hold another language's text are
+  checked by a multilingual model, base Qwen3-ASR (`asr_foreign_model`). It loads only when
+  some chunk needs it. What happens to speech in a language other than Cantonese, other Chinese
+  or English (`asr_native_languages`) is set by `asr_foreign`:
+  - `transcribe` (default): it is written in its own language.
+  - `drop`: it is left out.
+  - `note`: it is only marked in the debug notes.
+  - `none`: no check at all.
+
+  Clean Cantonese is never replaced on the second model's word alone. The Cantonese alignment model can't
+  follow other languages, so their words are spread evenly over the speech they came from and cut into
+  sentences, rather than aligned.
+
+The log lists every chunk that was changed. With `--debug_dir`, `notes/notes.srt` marks each cue
+involved (`asr_lang:Italian`, `asr_loop:...`). A run with nothing to repair costs nothing. Details
+and measurements are in [docs/asr-repair.md](docs/asr-repair.md).
 
 ### Speech detection (VAD)
 
@@ -178,7 +205,7 @@ After alignment, subtitles are split and re-merged to maintain output standards.
 * `max_cue_duration` (default: 4) — the longest a subtitle may run: neighbours are not merged past it, and a
   longer cue (usually a clause the ASR never punctuated) is cut at its longest internal pause. `0` turns it off
 * `max_line_width` / `max_line_count` (default: the language's width / 2) — control forced line breaks and how text is
-  wrapped. Unset, the width is the language's own: 18 characters for Chinese, 42 for space-separated scripts. `0` never
+  wrapped. Unset, the width is the language's own: 17.5 characters for Chinese, 42 for space-separated scripts. `0` never
   breaks a line. Width is measured as displayed: in a Chinese line, English letters, digits and spaces count half a
   character, and an English word is never broken across lines or subtitles
 

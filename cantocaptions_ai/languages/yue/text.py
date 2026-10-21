@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 _OPENCC_DIR = Path(__file__).parent / "opencc"  # == paths.OPENCC_DIR
 
-MAX_CHARS = 18
+MAX_CHARS = 17.5
 
 # To understand how we process final particles, see the preprocess/postprocess particles function below
 PARTICLE_CHARS = [

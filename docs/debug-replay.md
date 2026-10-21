@@ -6,7 +6,7 @@ What `--debug_dir` writes and what `--load_debug_dir` reloads.
 `--debug_dir DIR` saves intermediate outputs (WAV segments + JSON) after each stage.  
 `--load_debug_dir DIR` loads saved stages, skipping recomputation — useful for iterating on later stages without re-running expensive models.
 
-Stage checkpoints: `references`, `vad`, `isolation`, `transcription`, `ensemble`, `llm_correction`, `diarization`, `realign`, `proofread`.
+Stage checkpoints: `references`, `vad`, `isolation`, `transcription`, `asr_repair`, `ensemble`, `llm_correction`, `diarization`, `realign`, `proofread`.
 
 Each run's log (`{output_dir}/logs/`, or `--log_file`) is the place to read what a replay did: it
 has every DEBUG line, so every checkpoint loaded or written, and why a stale one was recomputed.
@@ -27,6 +27,16 @@ directory instead of being extracted again, as long as the media file (path, siz
 time) and the `reference_*` track and OCR settings are unchanged; OCR is the slow part.
 
 `diarization/` holds one loadable checkpoint (`result.json`: scope, speaker labels, exclusive turns, overlapping turns, the per-VAD-segment `segment_speakers` breakdown under segment scope, optional embeddings) plus two snapshots that are *not* reloaded — `assignments.json` and `{stem}.srt`, both showing the per-subsegment speaker, confidence and `!MULTI` flag. Assignment is cheap and must re-run so threshold changes apply on replay.
+
+`transcription/result.json` also records, per chunk, how generation ended (`budget_hit`,
+`retried`, `retry_budget_hit`), the language the model said it heard when that isn't the one it
+was asked for (`asr_language`), and the text before the processor folded a loop away
+(`raw_text`). `asr_repair/result.json` is the whole transcription again, after repair. Each
+repaired chunk carries `repair` (why), `pieces` (each stretch's own text, the multilingual
+model's reading, which was kept, and any text it replaced), `notes_at`, and `foreign_spans` (the
+other-language stretches alignment times by spreading). Writing a surviving
+loop once and stripping broken characters re-run after every load (`asr_loop_trim` is not part of
+the checkpoint); see [asr-repair.md](asr-repair.md).
 
 `notes/notes.srt` is a snapshot, not a checkpoint: every cue carrying a `notes` entry, on its
 final timings, prefixed with them. Written on any run with a debug dir — nothing about it is

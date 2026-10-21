@@ -42,7 +42,7 @@ class SubtitleCleaner:
     def __init__(
         self,
         rules_dir: Union[str, Path],
-        line_max_length: int = 18,
+        line_max_length: float = 17.5,
         max_line_count: Optional[int] = 1,
         manifest: str = DEFAULT_CLEANING.manifest,
         builtin_steps: Optional[Mapping[str, Callable[[str], str]]] = None,

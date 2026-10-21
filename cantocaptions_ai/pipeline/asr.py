@@ -92,8 +92,12 @@ def join_clauses(pieces: List[str], punctuation: PunctuationConfig, script: Scri
     return text
 
 
+# "Non-Latin" is anything but ASCII and the accented Latin letters (Latin-1 Supplement through
+# Latin Extended Additional): Italian's "Rosé, até." is a Latin clause, and turning its marks
+# into ，and 。 cut it into one-word cues that cue assembly would never rejoin.
 _ASCII_AFTER_NON_LATIN = re.compile(
-    r"(?<=[^\x00-\x7f])\s*([" + re.escape("".join(LATIN_SPLIT_CHARS)) + r"])\s*")
+    r"(?<=[^\x00-\x7fÀ-ɏḀ-ỿ])\s*(["
+    + re.escape("".join(LATIN_SPLIT_CHARS)) + r"])\s*")
 
 
 def _native_punctuation(text: str, punctuation: PunctuationConfig) -> str:
@@ -208,7 +212,7 @@ class BatchedAsrStage(AsrStage):
         size) and mutate no shared state before the model call.
         """
 
-    def _segments(self, segs, texts) -> List[SingleSegment]:
+    def _segments(self, segs, texts, language: Optional[str] = None) -> List[SingleSegment]:
         from cantocaptions_ai.languages.yue.text import normalize_segment_text
         out = []
         for seg, text in zip(segs, texts):
@@ -216,11 +220,35 @@ class BatchedAsrStage(AsrStage):
                 {'text': str(text or ''), 'start': seg['start'], 'end': seg['end']}, self.normalization)
             # A backend may mark how generation ended (_asr_native.AsrText). Recorded only
             # when set, so ordinary segments -- and their checkpoints -- are unchanged.
-            for flag in ('budget_hit', 'retried'):
+            for flag in ('budget_hit', 'retried', 'retry_budget_hit'):
                 if getattr(text, flag, False):
                     segment[flag] = True
+            # The language the model said it heard, when that is not the one it was asked
+            # for ("none": it heard no speech), and the text before the processor folded a
+            # loop away. Both are diagnostics for ASR repair (asr_repair.py).
+            label = getattr(text, 'language', None)
+            if label and label.lower() != str(language).lower():
+                segment['asr_language'] = label.lower() if label.lower() == "none" else label
+            raw = getattr(text, 'raw', None)
+            if raw:
+                segment['raw_text'] = raw
             out.append(segment)
         return out
+
+    def _warn_loops(self, results: List[TranscriptionResult]) -> None:
+        """One warning listing every chunk that looped, and whether the retry recovered it."""
+        from cantocaptions_ai.utils.output import format_timestamp
+
+        lines = []
+        for result in results:
+            for seg in result['segments']:
+                if seg.get('budget_hit'):
+                    tail = ("still looped after a retry" if seg.get('retry_budget_hit')
+                            else "recovered by a retry" if seg.get('retried') else "not retried")
+                    lines.append(f"  {format_timestamp(seg['start'])}  {seg['end'] - seg['start']:.1f} s, {tail}")
+        if lines:
+            logger.warning("ASR: %d chunk(s) fell into a repetition loop:\n%s",
+                           len(lines), "\n".join(lines))
 
     def run(self, items, *, debug_dir=None, load_debug_dir=None, progress_callback: ProgressCallback = None):
         """Transcribe all files, batching VAD segments across file boundaries.
@@ -262,10 +290,11 @@ class BatchedAsrStage(AsrStage):
         computed = {}
         for idx, buf in buffers.items():
             result: TranscriptionResult = {
-                "segments": self._segments(buf['segs'], buf['texts']), "language": language,
+                "segments": self._segments(buf['segs'], buf['texts'], language), "language": language,
             }
             computed[idx] = result
             write_checkpoint(self, buf['item'], result, debug_dir)
+        self._warn_loops(list(computed.values()))
 
         result_items = []
         for idx, item in enumerate(items):
@@ -298,7 +327,7 @@ class BatchedAsrStage(AsrStage):
             order_key=lambda i: len(input[i]['audio']),
         ).run(jobs, infer_fn, reporter=progress_callback)
 
-        return {"segments": self._segments(input, texts), "language": language}
+        return {"segments": self._segments(input, texts, language), "language": language}
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +413,7 @@ def load_model(
     processor=None,
     normalization=None,
     loop_retry_penalty: float = 1.1,
+    loop_stop: bool = True,
 ) -> AsrStage:
     """Load the ASR model and the backend that runs it (see :func:`backend_for`).
 
@@ -415,4 +445,5 @@ def load_model(
     if backend.name == "qwen3-asr":
         kwargs["compile_enabled"] = compile_enabled
         kwargs["loop_retry_penalty"] = loop_retry_penalty
+        kwargs["loop_stop"] = loop_stop
     return backend.load(**kwargs)

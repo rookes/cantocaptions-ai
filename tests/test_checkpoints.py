@@ -33,7 +33,15 @@ class TestWhatInvalidatesWhat:
         assert _changed(vad_onset=0.3) == set(cp.STAGES)
 
     def test_asr_model_invalidates_transcription_and_its_consumers_only(self):
-        assert _changed(model="Qwen3-ASR") == {"transcription", "llm_correction"}
+        assert _changed(model="Qwen3-ASR") == {"transcription", "asr_repair", "llm_correction"}
+
+    def test_repair_settings_invalidate_repair_and_its_consumers_only(self):
+        assert _changed(asr_foreign="drop") == {"asr_repair", "llm_correction"}
+        assert _changed(asr_split_depth=1) == {"asr_repair", "llm_correction"}
+
+    def test_loop_trimming_reruns_on_replay(self):
+        # AsrRepairStage._tidy applies it after every cache load; no checkpoint holds it.
+        assert _changed(asr_loop_trim=False) == set()
 
     def test_vocal_isolation_invalidates_what_reads_its_audio(self):
         assert _changed(vocal_isolation_method="mbroformer") == set(cp.STAGES) - {"vad"}

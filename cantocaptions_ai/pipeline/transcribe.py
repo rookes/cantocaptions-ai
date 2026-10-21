@@ -97,7 +97,7 @@ def _merge_and_write(
     script=DEFAULT_SCRIPT,
     min_cue_duration: float = 0.5,
     merge_gap: float = 0.25,
-    max_line_width: Optional[int] = None,
+    max_line_width: Optional[float] = None,
     max_line_count: Optional[int] = None,
     merge: bool = True,
     max_cue_duration: float = 0.0,
@@ -797,6 +797,7 @@ def validate_config(cfg) -> None:
     if cfg.reference_correction_semantic and not cfg.reference_subtitle:
         _advise("reference_correction_semantic has no effect without reference_subtitle")
     _validate_references(cfg)
+    _validate_asr_repair(cfg)
     if cfg.reference_subtitle == "embedded" and cfg.reference_timing == "subtitle":
         raise ConfigError("reference_subtitle embedded comes from the media itself, so it "
                           "follows the media's timeline: use reference_timing media")
@@ -1083,6 +1084,21 @@ def references_task(args: dict, parser: argparse.ArgumentParser,
     _setup_rows([("Output", os.path.normpath(cfg.output_dir))])
     references_step.extract_for_inputs(cfg, audio_paths, names, summary)
     summary.print_summary(process_elapsed=time.perf_counter() - start)
+
+
+def _validate_asr_repair(cfg) -> None:
+    from cantocaptions_ai.errors import ConfigError
+    from cantocaptions_ai.pipeline.asr_repair import FOREIGN_MODES
+
+    if cfg.asr_foreign not in FOREIGN_MODES:
+        raise ConfigError(f"asr_foreign must be one of {', '.join(FOREIGN_MODES)}, "
+                          f"got {cfg.asr_foreign!r}")
+    if cfg.asr_loop_min_copies < 2:
+        raise ConfigError(f"asr_loop_min_copies must be at least 2, got {cfg.asr_loop_min_copies}")
+    if cfg.asr_split_depth < 0:
+        raise ConfigError(f"asr_split_depth must be 0 (off) or more, got {cfg.asr_split_depth}")
+    if cfg.asr_split_min_piece <= 0:
+        raise ConfigError(f"asr_split_min_piece must be positive, got {cfg.asr_split_min_piece}")
 
 
 def _validate_references(cfg) -> None:

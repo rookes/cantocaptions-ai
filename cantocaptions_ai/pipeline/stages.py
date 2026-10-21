@@ -5,6 +5,7 @@
 re-exports the names other code imports from there.
 """
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -27,6 +28,7 @@ from cantocaptions_ai.utils.schema import (
     ProcessingItem,
     ProgressCallback,
     VadItem,
+    attach_timed_notes,
     item_name,
 )
 
@@ -149,7 +151,10 @@ def _extract_timestamps(items: list) -> List[ProcessingItem]:
             s_start = stamps[0]['start'] if stamps else segment['start']
             s_end = stamps[-1]['end'] if stamps else segment['end']
             # Cue assembly merges on `words`; an unaligned segment simply has none.
-            segments.append({'words': [], **segment, 'start': s_start, 'end': s_end})
+            out = {'words': [], **segment, 'start': s_start, 'end': s_end}
+            out.pop('notes_at', None)
+            attach_timed_notes(segment, [out])
+            segments.append(out)
         # Preserve the rest of the carrier (audio_track, vad_segments): diarization
         # needs both, and --no_align routes through here instead of _run_alignment.
         extracted_items.append({**item, 'result': {**result, 'segments': segments}})
@@ -629,6 +634,16 @@ class RunContext:
     realign_punct: Any = None
     cleaner: Any = None
     layout: Any = None
+    # The ASR model the transcription stage kept loaded for ASR repair to re-transcribe
+    # with, rather than freeing it only for repair to load it again. Repair frees it.
+    resident_asr: Any = None
+    # Whether the repair stage is in this run's stage list (run_stages sets it).
+    repair_follows: bool = False
+
+    def release_resident_asr(self) -> None:
+        if self.resident_asr is not None:
+            self.resident_asr = None
+            flush_vram()
 
     @property
     def align_language(self) -> str:
@@ -1100,42 +1115,270 @@ class TranscriptionStage(_CachedAsrPath):
 
     def compute(self, ctx, items, timer):
         from cantocaptions_ai.pipeline.asr import load_model
-        from cantocaptions_ai.utils.model_utils import model_scope
 
-        cfg = ctx.cfg
         timer.status("loading model")
-        with model_scope(
-            load_model,
-            ctx.profile.model,
-            normalization=ctx.profile.normalization,
-            device=cfg.device,
-            device_index=cfg.device_index,
-            download_root=cfg.model_dir,
-            compute_type=cfg.asr_compute_type,
-            attn_implementation=cfg.attn_implementation,
-            language=cfg.language,
-            local_files_only=cfg.model_cache_only,
-            threads=ctx.qwen_threads,
-            use_auth_token=cfg.hf_token,
-            batch_size=cfg.batch_size,
-            compile_enabled=cfg.compile,
-            print_progress=cfg.print_progress,
-            verbose=cfg.verbose,
-            vram_checks=cfg.vram_checks,
-            vram_headroom_mb=cfg.vram_headroom_mb,
-            loop_retry_penalty=cfg.asr_loop_retry_penalty,
-        ) as model:
+        model = load_with_offline_fallback(load_model, ctx.profile.model, **_asr_load_kwargs(ctx))
+        try:
             timer.mark_inference_start()
             items = _stage_run(model, ctx, items, timer)
-            # Drop this frame's reference so model_scope's exit frees the model; a
-            # name bound by `as` outlives the block and held the ASR model on the
-            # GPU through alignment and diarization.
+        except BaseException:
             del model
+            flush_vram()
+            raise
+        if ctx.repair_follows and AsrRepairStage.retranscribes(ctx):
+            # Repair runs next and may re-transcribe with this very model: hand it over.
+            ctx.resident_asr = model
+        # Drop this frame's reference; otherwise a name that outlives its use held the ASR
+        # model on the GPU through alignment and diarization.
+        del model
+        if ctx.resident_asr is None:
+            flush_vram()
         return items
 
     def from_cache(self, ctx, items):
         from cantocaptions_ai.pipeline.asr import AsrStage
         return AsrStage.load_cache(items, ctx.cfg.load_debug_dir)
+
+
+def _asr_load_kwargs(ctx: RunContext, **overrides) -> dict:
+    """load_model's arguments for this run's ASR model, less the model name."""
+    cfg = ctx.cfg
+    kwargs = dict(
+        normalization=ctx.profile.normalization,
+        device=cfg.device,
+        device_index=cfg.device_index,
+        download_root=cfg.model_dir,
+        compute_type=cfg.asr_compute_type,
+        attn_implementation=cfg.attn_implementation,
+        language=cfg.language,
+        local_files_only=cfg.model_cache_only,
+        threads=ctx.qwen_threads,
+        use_auth_token=cfg.hf_token,
+        batch_size=cfg.batch_size,
+        compile_enabled=cfg.compile,
+        print_progress=cfg.print_progress,
+        verbose=cfg.verbose,
+        vram_checks=cfg.vram_checks,
+        vram_headroom_mb=cfg.vram_headroom_mb,
+        loop_retry_penalty=cfg.asr_loop_retry_penalty,
+        loop_stop=cfg.asr_loop_stop,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _repair_settings(ctx: RunContext):
+    from cantocaptions_ai.pipeline.asr_repair import LoopRule, RepairSettings
+
+    cfg = ctx.cfg
+    if cfg.asr_native_languages:
+        native = tuple(n.strip() for n in cfg.asr_native_languages.split(",") if n.strip())
+    else:
+        native = ctx.pack.native_languages()
+    return RepairSettings(
+        rule=LoopRule(min_copies=cfg.asr_loop_min_copies, min_chars=cfg.asr_loop_min_chars),
+        native=native, foreign=cfg.asr_foreign, split_depth=cfg.asr_split_depth,
+        split_min_piece=cfg.asr_split_min_piece,
+    )
+
+
+@contextmanager
+def _held(model):
+    """model_scope for a model that is already loaded: yields it, frees it after."""
+    try:
+        yield model
+    finally:
+        del model
+        flush_vram()
+
+
+class _AsrRepairCheckpoint:
+    """The asr_repair checkpoint, in the shape model_utils' cache helpers take."""
+
+    debug_stage = "asr_repair"
+
+    @staticmethod
+    def read_debug(name, debug_dir):
+        from cantocaptions_ai.utils.debug import load_asr_repair_debug
+        return load_asr_repair_debug(name, debug_dir)
+
+    @staticmethod
+    def write_debug(name, result, debug_dir):
+        from cantocaptions_ai.utils.debug import write_asr_repair_debug
+        write_asr_repair_debug(name, result, debug_dir)
+
+
+# Generation budget floor for a repair piece: a few seconds of audio needs far fewer tokens
+# than the 200 a whole chunk gets, and a piece that loops spends whatever it is given.
+_REPAIR_TOKEN_FLOOR = 64
+
+
+class AsrRepairStage(_CachedAsrPath):
+    """Repair the chunks the first pass looped on, left empty, or wrote another language's
+    text for (see pipeline/asr_repair.py), then tidy what any ASR left behind.
+
+    Repair plans from the transcription alone, then loads at most two models, each only if
+    some chunk needs it: the run's own ASR model to re-transcribe looping chunks piece by
+    piece, and a multilingual one to say what language each piece is in. A run with nothing
+    to repair loads neither. Its result is the ``asr_repair`` checkpoint.
+
+    The tidy-up re-runs after every cache load, like text cleaning: broken characters
+    (U+FFFD) a token budget left are removed, and a loop that survived is written once
+    (``asr_loop_trim``). Here, before alignment, rather than in cleaning, which runs per
+    cue -- by then a loop has been spread over half a dozen cues, none repeating enough to
+    fold.
+    """
+
+    name = "ASR repair"
+    key = "asr_repair"
+    checkpoint = "asr_repair"
+
+    def active(self, ctx):
+        # Under --realign the transcript replaces the ASR text, so there is nothing to repair.
+        return super().active(ctx) and not ctx.cfg.realign
+
+    @staticmethod
+    def repairs(ctx) -> bool:
+        """Whether this run re-transcribes anything, or only tidies."""
+        return ctx.cfg.asr_split_depth > 0 or ctx.cfg.asr_foreign != "none"
+
+    def needs_compute(self, ctx):
+        return self.repairs(ctx) and super().needs_compute(ctx)
+
+    def status(self, ctx):
+        return super().status(ctx) if self.repairs(ctx) else None
+
+    @classmethod
+    def retranscribes(cls, ctx) -> bool:
+        """Whether this run's repair may re-transcribe with the run's own ASR model."""
+        return cls().active(ctx) and ctx.cfg.asr_split_depth > 0
+
+    def run(self, ctx, items):
+        try:
+            if not self.repairs(ctx):
+                return self._tidy(ctx, items)
+            return super().run(ctx, items)
+        finally:
+            ctx.release_resident_asr()
+
+    def compute(self, ctx, items, timer):
+        from cantocaptions_ai.languages.yue.text import normalize_segment_text
+        from cantocaptions_ai.pipeline import asr_repair
+        from cantocaptions_ai.pipeline.asr import join_clauses, load_model
+        from cantocaptions_ai.utils.debug import _debug_stage_exists
+        from cantocaptions_ai.utils.model_utils import (
+            model_scope, read_checkpoint, write_checkpoint)
+        from cantocaptions_ai.utils.output import format_timestamp
+
+        cfg = ctx.cfg
+        settings = _repair_settings(ctx)
+        cached, to_compute = {}, []
+        for idx, item in enumerate(items):
+            if cfg.load_debug_dir and _debug_stage_exists(item_name(item), self.checkpoint,
+                                                          cfg.load_debug_dir):
+                result = read_checkpoint(_AsrRepairCheckpoint, item, cfg.load_debug_dir)
+                if result is not None:
+                    cached[idx] = result
+                    continue
+            to_compute.append((idx, item))
+        results = [{**item["result"], "segments": list(item["result"]["segments"])}
+                   for _, item in to_compute]
+        chunks = asr_repair.plan_chunks(
+            [(result, item["vad_segments"]) for result, (_, item) in zip(results, to_compute)],
+            settings)
+
+        split = [c for c in chunks if c.split]
+        if not split:
+            ctx.release_resident_asr()
+        else:
+            timer.status(f"re-transcribing {len(split)} looping chunk(s)")
+            norm = ctx.profile.normalization
+            resident, ctx.resident_asr = ctx.resident_asr, None
+            with (_held(resident) if resident is not None
+                  else model_scope(load_model, ctx.profile.model, **_asr_load_kwargs(ctx))) as model:
+                del resident
+                if hasattr(model, "transcribe"):
+                    hint = model._backend_language(cfg.language)
+                    asr_repair.run_ladder(
+                        split,
+                        lambda wavs: model.transcribe(wavs, hint, token_floor=_REPAIR_TOKEN_FLOOR),
+                        settings,
+                        normalize=lambda t: normalize_segment_text(
+                            {"text": t, "start": 0.0, "end": 0.0}, norm)["text"],
+                    )
+                else:
+                    logger.debug("ASR repair: the %s backend cannot re-transcribe pieces",
+                                 type(model).__name__)
+                del model
+
+        if settings.check_language and chunks:
+            timer.status(f"checking the language of {len(chunks)} chunk(s)")
+            try:
+                with model_scope(load_model, cfg.asr_foreign_model,
+                                 **_asr_load_kwargs(ctx, compile_enabled=False)) as model:
+                    if hasattr(model, "transcribe"):
+                        hint = model._backend_language(cfg.language)
+                        asr_repair.run_language_check(
+                            chunks,
+                            lambda wavs: model.transcribe(wavs, None, token_floor=_REPAIR_TOKEN_FLOOR),
+                            settings.native,
+                            lambda wavs: model.transcribe(wavs, hint, token_floor=_REPAIR_TOKEN_FLOOR))
+                    else:
+                        logger.warning("ASR repair: %s cannot identify languages (it is not a "
+                                       "Qwen3-ASR model); other-language speech was not checked",
+                                       cfg.asr_foreign_model)
+                    del model
+            except (OSError, ValueError, ImportError) as e:
+                logger.warning("ASR repair: could not load %s (%s); other-language speech was "
+                               "not checked", cfg.asr_foreign_model, e)
+
+        rows = asr_repair.finish(
+            chunks, results, settings,
+            lambda texts: join_clauses(texts, ctx.profile.punctuation, ctx.profile.script))
+        changed = [r for r in rows if not r[2].endswith(": unchanged")]
+        if changed:
+            many = len(to_compute) > 1
+            lines = []
+            for f, t, line in sorted(changed, key=lambda r: (r[0], r[1])):
+                where = f"{item_name(to_compute[f][1])}  " if many else ""
+                lines.append(f"  {where}{format_timestamp(t)}  {line}")
+            logger.info("ASR repair: %d of %d chunk(s) checked were changed or noted\n%s",
+                        len(changed), len(rows), "\n".join(lines))
+        elif rows:
+            logger.info("ASR repair: %d chunk(s) checked, none changed", len(rows))
+
+        out = list(items)
+        for (idx, item), result in zip(to_compute, results):
+            write_checkpoint(_AsrRepairCheckpoint, item, result, cfg.debug_dir)
+            out[idx] = {**item, "result": result}
+        for idx, result in cached.items():
+            out[idx] = {**items[idx], "result": result}
+        return self._tidy(ctx, out)
+
+    def from_cache(self, ctx, items):
+        from cantocaptions_ai.utils.debug import load_asr_repair_debug
+        items = [{**item, "result": load_asr_repair_debug(item_name(item), ctx.cfg.load_debug_dir)}
+                 for item in items]
+        return self._tidy(ctx, items)
+
+    def _tidy(self, ctx, items):
+        from cantocaptions_ai.pipeline.asr_repair import sanitize_segment
+        from cantocaptions_ai.utils.output import format_timestamp
+
+        rule = _repair_settings(ctx).rule
+        trimmed = []
+        for item in items:
+            segments = []
+            for seg in item["result"]["segments"]:
+                seg, loop = sanitize_segment(seg, rule, trim=ctx.cfg.asr_loop_trim)
+                if loop is not None:
+                    trimmed.append(f"  {format_timestamp(seg['start'])}  {loop.copies}x {loop.phrase}")
+                segments.append(seg)
+            item["result"] = {**item["result"], "segments": segments}
+        if trimmed:
+            logger.info("ASR: wrote %d repetition loop(s) once\n%s",
+                        len(trimmed), "\n".join(trimmed))
+        return items
 
 
 class EnsembleStage(_CachedAsrPath):
@@ -1407,7 +1650,7 @@ class SpeakerChangeStage(Stage):
 
 DEFAULT_STAGES = (
     VadStage, VocalIsolationStage, RealignAcousticStage, AsrContextStage, TranscriptionStage,
-    EnsembleStage, ReferenceMatchStage, LlmCorrectionStage, RealignAsrStage,
+    AsrRepairStage, EnsembleStage, ReferenceMatchStage, LlmCorrectionStage, RealignAsrStage,
     PreAlignCleanStage, AlignmentStage, TimestampsStage, DiarizationStage, SpeakerAssignStage,
     SpeakerChangeStage,
 )
@@ -1448,6 +1691,15 @@ def run_stages(ctx: RunContext, stages: Sequence[Stage], items: List[dict]) -> L
     A timed stage's StageTimer draws its section; a stage read back from the debug cache is
     one line; any other stage (speaker assignment, ASR context) gets an untimed section.
     """
+    ctx.repair_follows = any(isinstance(stage, AsrRepairStage) for stage in stages)
+    try:
+        return _run_each(ctx, stages, items)
+    finally:
+        # A caller's stage list may leave out the repair stage that frees it.
+        ctx.release_resident_asr()
+
+
+def _run_each(ctx: RunContext, stages: Sequence[Stage], items: List[dict]) -> List[dict]:
     enabled = ctx.summary.enabled
     for stage in stages:
         if stage.timed_in(ctx):

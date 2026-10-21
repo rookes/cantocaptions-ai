@@ -146,6 +146,7 @@ def _debug_stage_exists(name: str, stage: str, debug_dir: str) -> bool:
     stage_dir = os.path.join(debug_dir, stem, stage)
     marker = {
         "transcription": "result.json",
+        "asr_repair": "result.json",
         "llm_correction": "result.json",
         "diarization": "result.json",
         "ensemble": "texts.json",
@@ -210,6 +211,35 @@ def load_transcription_debug(name: str, debug_dir: str) -> Optional[Transcriptio
     result: TranscriptionResult = {"segments": data["segments"], "language": data.get("language")}
     logger.debug(f"Loaded transcription ({len(result['segments'])} segments) from {json_path}")
     return result
+
+
+def write_asr_repair_debug(name: str, result: TranscriptionResult, debug_dir: str) -> None:
+    """Write the repaired transcription to {debug_dir}/{stem}/asr_repair/result.json.
+
+    The whole result, not just the chunks repair touched: each of those carries ``repair``
+    (why), ``pieces`` (what each stretch of it ended up saying, and what the multilingual
+    model heard) and ``notes_at``.
+    """
+    stage_dir = _stage_dir(name, "asr_repair", debug_dir)
+    output = {"name": name, "language": result.get("language"), "segments": result["segments"]}
+    json_path = os.path.join(stage_dir, "result.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    logger.debug(f"ASR repair debug output written to {json_path}")
+
+
+def load_asr_repair_debug(name: str, debug_dir: str) -> Optional[TranscriptionResult]:
+    """Load a repaired transcription from a previous debug run. Returns None if not present."""
+    json_path = os.path.join(debug_dir, _stem(name), "asr_repair", "result.json")
+    if not os.path.isfile(json_path):
+        return None
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    for seg in data["segments"]:
+        if "notes_at" in seg:
+            seg["notes_at"] = [tuple(n) for n in seg["notes_at"]]
+    logger.debug(f"Loaded ASR repair ({len(data['segments'])} segments) from {json_path}")
+    return {"segments": data["segments"], "language": data.get("language")}
 
 
 def write_ensemble_debug(name: str, texts: List[str], debug_dir: str) -> None:

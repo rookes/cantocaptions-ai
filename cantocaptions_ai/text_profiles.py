@@ -24,7 +24,14 @@ LANGUAGES_WITHOUT_SPACES = ("ja", "zh", "yue")
 # its own words: code-switched English in a Cantonese line. Alignment keeps each match as one
 # word, so nothing that cuts a cue between words can cut inside it, and the line breaker never
 # breaks inside one. An apostrophe, hyphen or point joins two runs (you've, open-minded, 3.5).
-LATIN_WORD = re.compile(r"[A-Za-z0-9]+(?:['’\-.][A-Za-z0-9]+)*")
+# Accented Latin letters belong to the word (café, Pokémon, the Italian può): left out, each
+# was a word of its own, and a cue could be cut between "pu" and "ò".
+_LATIN_LETTERS = "A-Za-z0-9\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u1e00-\u1eff"
+LATIN_WORD = re.compile(rf"[{_LATIN_LETTERS}]+(?:['’\-.][{_LATIN_LETTERS}]+)*")
+# Where ScriptConfig.join spaces two runs of Latin text: one ends in a letter, digit or ASCII
+# clause mark, the other starts with a letter or digit.
+_LATIN_END = re.compile(rf"[{_LATIN_LETTERS},.?!;:'\"]$")
+_LATIN_START = re.compile(rf"[{_LATIN_LETTERS}]")
 
 
 @lru_cache(maxsize=4096)
@@ -125,7 +132,9 @@ class ScriptConfig:
     whose cell is one letter (so a Chinese character counts two).
     """
     word_separator: str = ""
-    line_width: int = 18
+    # 17.5, not 18: the CantoCaptions style guide's "single line max length is 17.5
+    # characters" -- 18 full-width characters is one too many, 17 plus a half-width one fits.
+    line_width: float = 17.5
     layout: str = "cjk"
     cell_columns: int = 2
 
@@ -145,8 +154,17 @@ class ScriptConfig:
         return check(text, at) if check is not None else False
 
     def join(self, left: str, right: str) -> str:
-        """Join two pieces of text the way this script writes them."""
-        if not self.word_separator or not left or not right:
+        """Join two pieces of text the way this script writes them.
+
+        A script without spaces still spaces two runs of Latin text it joins: merging the cues
+        "So, do you believe him?" and "Naturally" must not give "him?Naturally". Latin beside
+        Chinese stays unspaced, as written (我嚟到cafe喇).
+        """
+        if not left or not right:
+            return left + right
+        if not self.word_separator:
+            if _LATIN_END.search(left) and _LATIN_START.match(right):
+                return left + " " + right
             return left + right
         if left.endswith(self.word_separator) or right.startswith(self.word_separator):
             return left + right
@@ -233,7 +251,7 @@ def is_mergeable(
     text1: str,
     text2: str,
     punctuation: PunctuationConfig = DEFAULT_PUNCTUATION,
-    max_chars: int = DEFAULT_SCRIPT.line_width,
+    max_chars: float = DEFAULT_SCRIPT.line_width,
     script: ScriptConfig = DEFAULT_SCRIPT,
 ) -> bool:
     """Returns true if text1 and text2 can be acceptably merged into a single line.

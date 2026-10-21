@@ -204,6 +204,18 @@ class LanguagePack:
     # with the neutral standard_for() fallback (meaning only, no conventions).
     proofreading: Mapping[str, ProofreadStandard] = field(default_factory=dict)
     default_proofreading: Optional[str] = None
+    # The languages (as Qwen3-ASR names them) a run keeps whatever ASR repair's language check
+    # says: speech in any other is transcribed in its own language or dropped (asr_foreign).
+    # Empty: only the pack's own language, and English.
+    native_asr_languages: Tuple[str, ...] = ()
+
+    def native_languages(self) -> Tuple[str, ...]:
+        """The languages ASR repair never replaces or drops (see native_asr_languages)."""
+        if self.native_asr_languages:
+            return self.native_asr_languages
+        from cantocaptions_ai.utils.output import LANGUAGES
+        own = LANGUAGES.get(self.code, self.code)
+        return (own[:1].upper() + own[1:].lower(), "English")
 
     def standard_for(self, name: Optional[str]) -> ProofreadStandard:
         """The named proofreading standard, this language's default, or a neutral one."""

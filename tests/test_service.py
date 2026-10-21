@@ -319,8 +319,8 @@ class TestLanguageDefaults(unittest.TestCase):
         validate_config(cfg)
         return cfg.max_line_width
 
-    def test_cantonese_keeps_its_18(self):
-        self.assertEqual(self._width(), 18)
+    def test_cantonese_keeps_its_17_5(self):
+        self.assertEqual(self._width(), 17.5)
 
     def test_a_space_separated_language_gets_42(self):
         self.assertEqual(self._width(language="en", model="some/asr", no_clean_text=True), 42)

@@ -25,8 +25,10 @@ from cantocaptions_ai.utils.schema import (
     ProgressCallback,
     VadAudioSegment,
     add_note,
+    attach_timed_notes,
     interpolate_nans,
 )
+from cantocaptions_ai.pipeline.asr_repair import spread_foreign
 from cantocaptions_ai.text_profiles import (
     DEFAULT_PUNCTUATION,
     LATIN_WORD,
@@ -1342,6 +1344,7 @@ def align(
 
         if t1 >= MAX_DURATION:
             logger.warning(f'Failed to align segment ("{text}"): original start time longer than audio duration, skipping')
+            attach_timed_notes(segment, [base_seg])
             aligned_segments.append(base_seg)
             continue
 
@@ -1352,6 +1355,7 @@ def align(
         emission, frame_times = found if found is not None else (None, None)
         if emission is None:
             logger.warning(f'Failed to align segment ("{text}"): no VAD segment found for start time {t1}, skipping')
+            attach_timed_notes(segment, [base_seg])
             aligned_segments.append(base_seg)
             continue
 
@@ -1361,6 +1365,10 @@ def align(
             t1, t2, interpolate_method, return_char_alignments,
             spotchecks, punctuation, frame_times=frame_times, script=script,
         )
+        # Other-language text this align model cannot follow is timed by spreading instead.
+        line_script = script or script_for_language(model_lang)
+        subsegments = spread_foreign(segment, subsegments, line_script.line_width, line_script.width)
+        attach_timed_notes(segment, subsegments)
         aligned_segments += subsegments
 
         if progress_callback is not None:

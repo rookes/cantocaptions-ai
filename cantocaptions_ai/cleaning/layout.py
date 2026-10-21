@@ -11,7 +11,7 @@ from typing import Callable, Mapping, Optional
 from cantocaptions_ai.text_profiles import LATIN_WORD, word_wrap
 
 
-def _cjk(text: str, line_max_length: int) -> str:
+def _cjk(text: str, line_max_length: float) -> str:
     # Imported on first use: the Cantonese breaker loads pycantonese, which the rest of
     # this module (and every non-CJK run) never needs.
     from cantocaptions_ai.languages.yue.linebreak import linebreak
@@ -42,7 +42,7 @@ WORD_CHECKS: Mapping[str, Callable[[str, int], bool]] = {
 
 
 def linebreak_step(
-    line_max_length: int, max_line_count: Optional[int], layout: str = "cjk",
+    line_max_length: float, max_line_count: Optional[int], layout: str = "cjk",
 ) -> Optional[Callable[[str], str]]:
     """The line-layout step for these line limits, or None where no break is allowed.
 

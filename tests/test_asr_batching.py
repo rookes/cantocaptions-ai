@@ -324,3 +324,141 @@ class TestNormalizeLanguage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _LabellingProcessor(_FakeProcessor):
+    """Decodes each marker to a scripted reply: ``language <label><asr_text><raw>`` undecorated,
+    and the text after the processor's repetition pass for ``transcription_only``."""
+
+    def __init__(self, replies):
+        self.replies = replies  # marker -> (label, raw, folded text)
+        self.languages = []
+
+    def apply_transcription_request(self, audio, language):
+        self.languages.append(language)
+        return super().apply_transcription_request(audio, language)
+
+    def decode(self, sequences, return_format="raw", **kwargs):
+        out = []
+        for k in range(sequences.shape[0]):
+            label, raw, folded = self.replies[int(sequences[k, 0])]
+            out.append(folded if return_format == "transcription_only"
+                       else f"language {label}<asr_text>{raw}")
+        return out
+
+
+class TestAsrDiagnostics(unittest.TestCase):
+    """The ASR stage records the language the model said it heard and the text before the
+    processor folded a loop away -- diagnostics for ASR repair, never a change of text."""
+
+    def _segments(self, replies, markers):
+        processor = _LabellingProcessor(replies)
+        pipe = QwenPipelineNative(model=_FakeModel(fail_first_call=False), processor=processor,
+                                  device="cpu", language="yue", batch_size=4)
+        return pipe.process(_make_marked_segments(markers))["segments"], pipe, processor
+
+    def test_a_label_other_than_the_requested_language_is_recorded(self):
+        segs, _, _ = self._segments({2: ("Cantonese", "你好", "你好"), 4: ("Italian", "Ciao", "Ciao"),
+                                     6: ("None", "", "")}, [2, 4, 6])
+        self.assertNotIn("asr_language", segs[0])
+        self.assertEqual(segs[1]["asr_language"], "Italian")
+        self.assertEqual(segs[2]["asr_language"], "none")
+        self.assertEqual([s["text"] for s in segs], ["你好", "Ciao", ""])
+
+    def test_a_folded_loop_keeps_its_raw_text(self):
+        segs, _, _ = self._segments({2: ("Cantonese", "噔" * 30, "噔"), 4: ("Cantonese", "好", "好")},
+                                    [2, 4])
+        self.assertEqual((segs[0]["text"], segs[0]["raw_text"]), ("噔", "噔" * 30))
+        self.assertNotIn("raw_text", segs[1])
+
+    def test_transcribe_can_leave_the_language_to_the_model(self):
+        _, pipe, processor = self._segments({2: ("Italian", "Ciao", "Ciao")}, [2])
+        texts = pipe.transcribe([np.full(8, 2.0, dtype=np.float32)], None)
+        self.assertEqual(processor.languages[-1], None)
+        self.assertEqual((str(texts[0]), texts[0].language), ("Ciao", "Italian"))
+
+
+class TestRetryBudgetHit(unittest.TestCase):
+    def test_a_retry_that_still_loops_says_so(self):
+        model = _LoopingModel(loops_under_penalty=True)
+        pipe = QwenPipelineNative(model=model, processor=_FakeProcessor(), device="cpu",
+                                  language="yue", batch_size=4, loop_retry_penalty=1.1)
+        seg = pipe.process(_make_marked_segments([5]))["segments"][0]
+        self.assertTrue(seg["retry_budget_hit"])
+
+    def test_a_retry_that_recovers_does_not(self):
+        pipe = QwenPipelineNative(model=_LoopingModel(), processor=_FakeProcessor(), device="cpu",
+                                  language="yue", batch_size=4, loop_retry_penalty=1.1)
+        seg = pipe.process(_make_marked_segments([5]))["segments"][0]
+        self.assertTrue(seg["retried"])
+        self.assertNotIn("retry_budget_hit", seg)
+
+
+class _SteppingModel:
+    """Decodes one token per step and honours ``stopping_criteria`` the way generate() does:
+    a row the criteria end is padded (with an EOS id, as Qwen3-ASR pads) from then on.
+    Rows with an odd marker repeat a three-token phrase forever; even ones say 5 then EOS."""
+
+    EOS = 99
+
+    def __init__(self):
+        self.device = torch.device("cpu")
+        self.dtype = torch.float32
+        self.generation_config = type("GC", (), {"eos_token_id": [self.EOS]})()
+        self.steps = 0
+
+    def generate(self, **kwargs):
+        ids = kwargs["input_ids"]
+        criteria = kwargs.get("stopping_criteria") or []
+        done = torch.zeros(ids.shape[0], dtype=torch.bool)
+        for step in range(kwargs["max_new_tokens"]):
+            nxt = []
+            for r, marker in enumerate(ids[:, 0].tolist()):
+                if done[r]:
+                    nxt.append(self.EOS)
+                elif marker % 2:
+                    nxt.append(7 + step % 3)
+                else:
+                    nxt.append(5 if step == 0 else self.EOS)
+            ids = torch.cat([ids, torch.tensor(nxt).unsqueeze(1)], dim=1)
+            self.steps += 1
+            done |= torch.tensor([t == self.EOS for t in nxt])
+            for c in criteria:
+                done |= c(ids, None)
+            if done.all():
+                break
+        return ids
+
+
+class TestLoopStop(unittest.TestCase):
+    def test_a_looping_row_is_stopped_and_flagged(self):
+        model = _SteppingModel()
+        pipe = QwenPipelineNative(model=model, processor=_FakeProcessor(), device="cpu",
+                                  language="yue", batch_size=4, loop_retry_penalty=0)
+        segs = pipe.process(_make_marked_segments([2, 3]))["segments"]
+        self.assertLess(model.steps, 40, "the loop ran on toward its token budget")
+        self.assertTrue(segs[1]["budget_hit"])
+        self.assertNotIn("budget_hit", segs[0])
+
+    def test_off_runs_the_whole_budget(self):
+        model = _SteppingModel()
+        pipe = QwenPipelineNative(model=model, processor=_FakeProcessor(), device="cpu",
+                                  language="yue", batch_size=4, loop_retry_penalty=0,
+                                  loop_stop=False)
+        segs = pipe.process(_make_marked_segments([3]))["segments"]
+        self.assertEqual(model.steps, pipe.max_new_tokens)
+        self.assertTrue(segs[0]["budget_hit"])
+
+    def test_the_rule(self):
+        from cantocaptions_ai.pipeline._asr_native import _LoopStop
+
+        stop = _LoopStop(n_input=1, eos_ids={99})
+
+        def rows(*tails):
+            return torch.tensor([[0] + list(t) for t in tails])
+
+        phrase = [7, 8, 9, 10]
+        self.assertTrue(stop(rows(phrase * 6))[0])            # 24 tokens, 6 copies
+        self.assertFalse(stop(rows([1] * 3 + phrase * 4 + [2] * 7))[0])  # 4 copies, then on
+        self.assertFalse(stop(rows([5] + [99] * 30))[0])      # finished: padding repeats
+        self.assertFalse(stop(rows(list(range(30))))[0])

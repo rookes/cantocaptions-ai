@@ -41,30 +41,39 @@ def names(ctx) -> list:
 # --- which stages a config runs -------------------------------------------------------
 
 def test_the_default_run():
-    assert names(ctx_for()) == ["VadStage", "TranscriptionStage", "AlignmentStage"]
+    assert names(ctx_for()) == [
+        "VadStage", "TranscriptionStage", "AsrRepairStage", "AlignmentStage"]
 
 
 def test_cleaning_adds_its_pre_alignment_steps():
     assert names(ctx_for(cleaner=object())) == [
-        "VadStage", "TranscriptionStage", "PreAlignCleanStage", "AlignmentStage"]
+        "VadStage", "TranscriptionStage", "AsrRepairStage", "PreAlignCleanStage",
+        "AlignmentStage"]
 
 
 def test_no_align_takes_the_asr_timings_instead():
-    assert names(ctx_for(no_align=True)) == ["VadStage", "TranscriptionStage", "TimestampsStage"]
+    assert names(ctx_for(no_align=True)) == [
+        "VadStage", "TranscriptionStage", "AsrRepairStage", "TimestampsStage"]
 
 
 def test_vocal_isolation_and_diarization():
     assert names(ctx_for(vocal_isolation_method="mbroformer", diarize=True)) == [
-        "VadStage", "VocalIsolationStage", "TranscriptionStage", "AlignmentStage",
-        "DiarizationStage", "SpeakerAssignStage"]
+        "VadStage", "VocalIsolationStage", "TranscriptionStage", "AsrRepairStage",
+        "AlignmentStage", "DiarizationStage", "SpeakerAssignStage"]
 
 
 def test_the_optional_second_opinions_follow_transcription():
     ctx = ctx_for(ensemble_model="tiny", llm_correction=True)
     ctx.reference_cues = [{"start": 0.0, "end": 1.0, "text": "x"}]
     assert names(ctx) == [
-        "VadStage", "TranscriptionStage", "EnsembleStage", "ReferenceMatchStage",
-        "LlmCorrectionStage", "AlignmentStage"]
+        "VadStage", "TranscriptionStage", "AsrRepairStage", "EnsembleStage",
+        "ReferenceMatchStage", "LlmCorrectionStage", "AlignmentStage"]
+
+
+def test_asr_repair_only_tidies_when_repair_is_off():
+    ctx = ctx_for(asr_split_depth=0, asr_foreign="none")
+    assert "AsrRepairStage" in names(ctx)
+    assert "ASR repair [" not in describe_plan(ctx, build_stages(ctx))
 
 
 def test_asr_context_needs_a_reference():
@@ -100,7 +109,7 @@ def test_the_plan_says_what_will_be_computed_and_what_read_back(tmp_path):
     ctx = ctx_for(load_debug_dir=str(tmp_path))
     _checkpoint(ctx, "a.wav", "vad", tmp_path)
     plan = describe_plan(ctx, build_stages(ctx))
-    assert plan == "VAD [cached] → Transcription [compute] → Alignment"
+    assert plan == "VAD [cached] → Transcription [compute] → ASR repair [compute] → Alignment"
 
     _checkpoint(ctx, "a.wav", "transcription", tmp_path, marker="result.json")
     assert "Transcription [cached]" in describe_plan(ctx, build_stages(ctx))
@@ -167,7 +176,7 @@ def test_a_stage_inserted_through_the_hook_runs_in_place(tmp_path, monkeypatch, 
     with caplog.at_level(logging.INFO):
         watched = _execute_pipeline([media], cfg, collect=True,
                                     stages=after_transcription)[0]["result"]["segments"]
-    assert "Transcription [compute] → Witness → Alignment" in caplog.text
+    assert "Transcription [compute] → Witness → ASR repair [compute] → Alignment" in caplog.text
     # It ran between ASR and alignment: it saw the ASR text, with no word timings yet.
     assert [seg["text"] for seg in witness.seen] == [t for _, t in scripted.script]
     assert not any(seg.get("words") for seg in witness.seen)
@@ -183,13 +192,14 @@ def test_plan_entries_carry_stable_keys_and_what_will_run(tmp_path):
     assert plan_entries(ctx, build_stages(ctx)) == [
         {"key": "vad", "label": "VAD", "timed": True, "cached": False},
         {"key": "transcription", "label": "Transcription", "timed": True, "cached": False},
+        {"key": "asr_repair", "label": "ASR repair", "timed": True, "cached": False},
         {"key": "alignment", "label": "Alignment", "timed": True, "cached": None},
     ]
 
     cached = ctx_for(load_debug_dir=str(tmp_path))
     _checkpoint(cached, "a.wav", "vad", tmp_path)
     _checkpoint(cached, "a.wav", "transcription", tmp_path, marker="result.json")
-    vad, asr, _ = plan_entries(cached, build_stages(cached))
+    vad, asr, _, _ = plan_entries(cached, build_stages(cached))
     assert (vad["cached"], vad["timed"]) == (True, True)   # VAD's timer covers its cache load
     assert (asr["cached"], asr["timed"]) == (True, False)  # a cached model stage runs no timer
 
@@ -243,8 +253,8 @@ def test_a_sink_with_plan_gets_it_once_before_the_first_stage(tmp_path, monkeypa
 
     sink = Sink()
     _execute_pipeline([media], cfg, collect=True, progress=sink)
-    assert sink.events[0][:2] == ("plan", ["vad", "transcription", "pre_align_clean",
-                                           "alignment"])
+    assert sink.events[0][:2] == ("plan", ["vad", "transcription", "asr_repair",
+                                           "pre_align_clean", "alignment"])
     assert [e for e in sink.events if e[0] == "plan"] == [sink.events[0]]
     started = [e[1] for e in sink.events if e[0] == "start"]
     assert started == sink.events[0][2]   # every timed stage reports, by its plan label

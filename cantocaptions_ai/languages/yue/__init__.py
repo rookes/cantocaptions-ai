@@ -131,4 +131,8 @@ YUE = LanguagePack(
     char_readings=_char_readings,
     proofreading={CANTOCAPTIONS.name: CANTOCAPTIONS},
     default_proofreading=CANTOCAPTIONS.name,
+    # Cantonese films and TV switch into English and Mandarin as a matter of course; those
+    # stay as the ASR wrote them. Qwen3-ASR names every Chinese variety other than Cantonese
+    # "Chinese" (asr_repair.is_native matches any label naming Chinese).
+    native_asr_languages=("Cantonese", "Chinese", "English"),
 )

@@ -7,7 +7,7 @@ The pyannote VAD segmentation weights ship vendored in ``cantocaptions_ai/assets
 so they are NOT fetched here — only the models the pipeline downloads from HF.
 
 Usage:
-    python scripts/download_models.py                 # always-on models (ASR + alignment)
+    python scripts/download_models.py                 # always-on models (ASR, ASR repair, alignment)
     python scripts/download_models.py --full          # + roformer, ensemble, LLM, diarization
     python scripts/download_models.py --hf-token hf_xxx --cache-dir /models
 
@@ -91,6 +91,17 @@ def _asr_repos(model_name=None, every=False) -> list:
     return repos
 
 
+def _repair_repos(asr_repos: list) -> list:
+    """The multilingual model ASR repair loads for speech in another language
+    (``asr_foreign_model``, default Qwen3-ASR). It loads only when a chunk needs it, but a
+    default run can need it, and the pipeline must still run offline then."""
+    from cantocaptions_ai.pipeline.config import PipelineConfig
+    from cantocaptions_ai.pipeline.model_profiles import get_model_profile
+
+    hf_id = get_model_profile(PipelineConfig.asr_foreign_model).hf_id
+    return [hf_id] if _is_hub_id(hf_id) and hf_id not in asr_repos else []
+
+
 def _xet_status() -> str:
     """One line on whether Xet-backed downloads are active.
 
@@ -134,7 +145,8 @@ def main() -> int:
 
     print(f"[info] {_xet_status()}", flush=True)
 
-    repos = list(_asr_repos(args.model, every=args.all_asr)) + list(ALWAYS_REPOS)
+    asr = list(_asr_repos(args.model, every=args.all_asr))
+    repos = asr + _repair_repos(asr) + list(ALWAYS_REPOS)
     files = []
     if args.full:
         repos += FULL_REPOS

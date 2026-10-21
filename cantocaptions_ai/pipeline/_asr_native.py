@@ -29,26 +29,106 @@ logger = get_logger(__name__)
 # over the densest observed speech.
 _TOKENS_PER_SECOND = 8
 
+# A row whose last tokens are one pattern of up to _LOOP_MAX_PERIOD tokens repeated
+# _LOOP_REPEATS times (over at least _LOOP_MIN_TOKENS) is stopped there: it is looping, and
+# would otherwise run to the end of its budget -- holding every other row of its batch,
+# finished or not, to the same number of decode steps. On Triumph in the Skies E01 (98 chunks,
+# 5 loops) this took the pass from 182 s to 114 s, every non-looping chunk's text identical.
+# Five repeats, like asr_repair's text rule: real speech repeats a phrase three or four times.
+_LOOP_REPEATS = 5
+_LOOP_MIN_TOKENS = 24
+_LOOP_MAX_PERIOD = 24
+
+
+class _LoopStop:
+    """A per-row ``StoppingCriteria`` for ``generate``: True for a row whose generated tail
+    repeats itself (see _LOOP_REPEATS). Rows that already emitted an EOS are left alone --
+    their padding repeats too. ``stopped`` collects which rows it ended."""
+
+    def __init__(self, n_input: int, eos_ids, repeats: int = _LOOP_REPEATS,
+                 min_tokens: int = _LOOP_MIN_TOKENS, max_period: int = _LOOP_MAX_PERIOD):
+        self.n_input = n_input
+        self.eos_ids = sorted(eos_ids)
+        self.repeats, self.min_tokens, self.max_period = repeats, min_tokens, max_period
+        self.stopped: Optional[torch.Tensor] = None
+
+    def __call__(self, input_ids: torch.Tensor, scores=None, **kwargs) -> torch.Tensor:
+        gen = input_ids[:, self.n_input:]
+        n = gen.shape[1]
+        done = torch.zeros(gen.shape[0], dtype=torch.bool, device=gen.device)
+        for period in range(1, self.max_period + 1):
+            span = max(period * self.repeats, self.min_tokens)
+            if span > n:
+                break
+            tail = gen[:, n - span:]
+            done |= (tail[:, period:] == tail[:, :-period]).all(dim=1)
+        if self.eos_ids and n:
+            done &= ~torch.isin(gen, torch.tensor(self.eos_ids, device=gen.device)).any(dim=1)
+        self.stopped = done if self.stopped is None else (self.stopped | done)
+        return done
+
 
 class AsrText(str):
     """A decoded transcription that also says how generation ended.
 
-    ``budget_hit``: generation spent every allowed token without an EOS -- on this model
-    that is a repetition loop, not a long line (a sung "da da da" decoding to 噔 over and
-    over until the cap, which the processor's repetition pass then folds back to a single
-    噔). ``retried``: the row was re-generated with a repetition penalty because of it.
+    ``budget_hit``: generation never finished -- it spent every allowed token without an
+    EOS, or was stopped looping (``_LoopStop``). On this model that is a repetition loop, not
+    a long line (a sung "da da da" decoding to 噔 over and over, which the processor's
+    repetition pass then folds back to a single 噔). ``retried``: the row was re-generated
+    with a repetition penalty because of it, and ``retry_budget_hit`` says the retry looped
+    as well.
+
+    ``language`` is the label the model wrote ahead of the text (``language Italian<asr_text>``):
+    None when it wrote none (the context path prefills it), ``"None"`` for what it took to be
+    no speech. Without a context the requested language is only a system-prompt hint, so the
+    label is the model's own call. ``raw`` is the text before the processor's repetition
+    pass, kept only when that pass changed it -- i.e. when it folded a loop away.
     A plain ``str`` everywhere else, so callers that only want text see no change.
     """
 
     budget_hit: bool = False
     retried: bool = False
+    retry_budget_hit: bool = False
+    language: Optional[str] = None
+    raw: Optional[str] = None
 
     @classmethod
-    def of(cls, text: str, *, budget_hit: bool = False, retried: bool = False) -> "AsrText":
+    def of(cls, text: str, *, budget_hit: bool = False, retried: bool = False,
+           retry_budget_hit: bool = False, language: Optional[str] = None,
+           raw: Optional[str] = None) -> "AsrText":
         out = cls(text)
         out.budget_hit = budget_hit
         out.retried = retried
+        out.retry_budget_hit = retry_budget_hit
+        out.language = language
+        out.raw = raw
         return out
+
+
+_ASR_TEXT_MARKER = "<asr_text>"
+
+
+def _split_label(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    """(language label, transcription) from one undecorated decode, with no repetition pass.
+
+    Mirrors the processor's own parse (``language <Name><asr_text>text``) except that the
+    label of an empty-audio reply is kept as ``"None"`` rather than dropped, and the text is
+    left as generated. With no label at all (the context path prefills it) the label is None
+    and the whole reply is the text.
+    """
+    raw = (raw or "").strip()
+    if "assistant\n" in raw:
+        raw = raw.split("assistant\n", 1)[-1]
+    if _ASR_TEXT_MARKER not in raw:
+        return None, raw
+    prefix, text = raw.split(_ASR_TEXT_MARKER, 1)
+    label = None
+    for line in prefix.splitlines():
+        line = line.strip()
+        if line:
+            label = line[len("language "):].strip() if line.lower().startswith("language ") else line
+            break
+    return label or None, text.strip()
 
 
 def _compile_and_warmup(model, processor, language: str, batch_size: Optional[int]) -> None:
@@ -129,6 +209,7 @@ class QwenPipelineNative(BatchedAsrStage):
     """
 
     backend_label = "native"
+    loop_stop = True
 
     def __init__(
         self,
@@ -143,6 +224,7 @@ class QwenPipelineNative(BatchedAsrStage):
         vram_checks: bool = True,
         normalization: TextNormalization = DEFAULT_NORMALIZATION,
         loop_retry_penalty: float = 1.1,
+        loop_stop: bool = True,
     ):
         super().__init__(
             device=device, language=language, batch_size=batch_size,
@@ -153,6 +235,7 @@ class QwenPipelineNative(BatchedAsrStage):
         self.processor = processor
         self.max_new_tokens = max_new_tokens
         self.loop_retry_penalty = loop_retry_penalty
+        self.loop_stop = loop_stop
         eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
         self._eos_ids = set(eos if isinstance(eos, (list, tuple)) else [eos]) - {None}
 
@@ -204,34 +287,88 @@ class QwenPipelineNative(BatchedAsrStage):
         It is re-generated once with ``repetition_penalty`` = ``loop_retry_penalty``
         (0 disables the retry). On the Bluey fixture's sung opening the loop decodes to a
         lone 噔, and the retry recovers the whole chunk. Every text comes back as an
-        :class:`AsrText` carrying ``budget_hit``/``retried``.
+        :class:`AsrText` carrying how generation ended and the language label it wrote.
 
         Raises RuntimeError on CUDA OOM (caught and retried at a smaller batch size by
         BatchExecutor); no shared state is mutated before the model call.
         """
-        texts, hits = self._generate(wavs, language, contexts)
-        out = [AsrText.of(t, budget_hit=h) for t, h in zip(texts, hits)]
-        looped = [i for i, h in enumerate(hits) if h]
-        if looped and self.loop_retry_penalty:
-            retry_texts, retry_hits = self._generate(
-                [wavs[i] for i in looped], language,
-                [contexts[i] for i in looped] if contexts is not None else None,
-                repetition_penalty=self.loop_retry_penalty,
-            )
-            for i, text, hit in zip(looped, retry_texts, retry_hits):
-                logger.warning(
-                    "ASR: a %.1f s chunk spent the whole token budget (repetition loop: %r); "
-                    "re-generated with repetition_penalty=%s%s",
-                    len(wavs[i]) / SAMPLE_RATE, str(out[i])[:20], self.loop_retry_penalty,
-                    " -- it still looped" if hit else "")
-                out[i] = AsrText.of(text, budget_hit=True, retried=True)
+        return self._transcribe_batch(wavs, language, contexts)
+
+    def transcribe(self, wavs: List, language: Optional[str],
+                   contexts: Optional[List[Optional[str]]] = None, *,
+                   retry_penalty: Optional[float] = None,
+                   repetition_penalty: Optional[float] = None,
+                   token_floor: Optional[int] = None,
+                   progress_callback=None) -> List[AsrText]:
+        """Transcribe audio arrays of the caller's choosing, batched like the stage itself.
+
+        For ASR repair, which re-runs chunks and pieces of chunks: ``language`` None lets the
+        model identify the language itself (no system hint; incompatible with contexts),
+        ``repetition_penalty`` applies to the first generation, and ``retry_penalty``
+        overrides ``loop_retry_penalty`` for the loop retry (0 disables it), and
+        ``token_floor`` replaces the generation budget's floor (``max_new_tokens``) -- a
+        few seconds of audio needs far fewer than a whole chunk, and a loop spends all it
+        is given. Batches run longest-first and halve on CUDA OOM.
+        """
+        from cantocaptions_ai.utils.model_utils import BatchExecutor
+
+        out: List[Optional[AsrText]] = [None] * len(wavs)
+
+        def infer_fn(batch):
+            texts = self._transcribe_batch(
+                [wavs[i] for i in batch], language,
+                [contexts[i] for i in batch] if contexts is not None else None,
+                retry_penalty=retry_penalty, repetition_penalty=repetition_penalty,
+                token_floor=token_floor)
+            for i, text in zip(batch, texts):
+                out[i] = text
+
+        BatchExecutor(self._batch_size, order_key=lambda i: len(wavs[i])).run(
+            list(range(len(wavs))), infer_fn, reporter=progress_callback)
         return out
 
-    def _generate(self, wavs: List, language: str,
+    def _transcribe_batch(self, wavs: List, language: Optional[str],
+                          contexts: Optional[List[Optional[str]]] = None, *,
+                          retry_penalty: Optional[float] = None,
+                          repetition_penalty: Optional[float] = None,
+                          token_floor: Optional[int] = None) -> List[AsrText]:
+        """One batch through the model, retrying looped rows: :meth:`_infer_batch`'s body."""
+        retry_penalty = self.loop_retry_penalty if retry_penalty is None else retry_penalty
+        extra = {} if repetition_penalty is None else {"repetition_penalty": repetition_penalty}
+        if token_floor is not None:
+            extra["token_floor"] = token_floor
+        rows = self._generate(wavs, language, contexts, **extra)
+        out = [AsrText.of(t, budget_hit=h, language=lab, raw=r) for t, h, lab, r in rows]
+        looped = [i for i, (_, h, _, _) in enumerate(rows) if h]
+        if looped and retry_penalty:
+            retry_rows = self._generate(
+                [wavs[i] for i in looped], language,
+                [contexts[i] for i in looped] if contexts is not None else None,
+                repetition_penalty=retry_penalty,
+                **({"token_floor": token_floor} if token_floor is not None else {}),
+            )
+            for i, (text, hit, label, raw) in zip(looped, retry_rows):
+                logger.debug(
+                    "ASR: a %.1f s chunk spent the whole token budget (repetition loop: %r); "
+                    "re-generated with repetition_penalty=%s%s",
+                    len(wavs[i]) / SAMPLE_RATE, str(out[i])[:20], retry_penalty,
+                    " -- it still looped" if hit else "")
+                out[i] = AsrText.of(text, budget_hit=True, retried=True, retry_budget_hit=hit,
+                                    language=label, raw=raw)
+        return out
+
+    def _generate(self, wavs: List, language: Optional[str],
                   contexts: Optional[List[Optional[str]]] = None,
-                  **generate_kwargs) -> Tuple[List[str], List[bool]]:
-        """One ``generate`` over a batch: (decoded texts, per-row budget_hit)."""
+                  token_floor: Optional[int] = None,
+                  **generate_kwargs) -> List[Tuple[str, bool, Optional[str], Optional[str]]]:
+        """One ``generate`` over a batch: per row (text, budget_hit, language label, raw).
+
+        ``raw`` is the text before the processor's repetition pass, or None when that pass
+        changed nothing (see :class:`AsrText`).
+        """
         if contexts is not None and any(contexts):
+            if language is None:
+                raise ValueError("a context prompt needs a language; auto-detection has none")
             prompts = self._build_context_prompts(contexts, language)
             for prompt in prompts:
                 logger.debug("[PROMPT] %s", prompt)
@@ -247,7 +384,8 @@ class QwenPipelineNative(BatchedAsrStage):
         # nothing when generation stops at EOS -- but note it also lets a context
         # recitation loop run longer, which is a separate defect.
         longest_s = max(len(w) for w in wavs) / SAMPLE_RATE
-        max_new = max(self.max_new_tokens, int(longest_s * _TOKENS_PER_SECOND))
+        floor = self.max_new_tokens if token_floor is None else token_floor
+        max_new = max(floor, int(longest_s * _TOKENS_PER_SECOND))
         if max_new > self.max_new_tokens:
             logger.debug("[BUDGET] longest=%.1fs -> max_new_tokens=%d (default %d)",
                          longest_s, max_new, self.max_new_tokens)
@@ -255,6 +393,11 @@ class QwenPipelineNative(BatchedAsrStage):
         if self.device.type == "cuda" and self.policy.enabled:
             _warn_vram(inputs, len(wavs), self.model, max_new, self.device, self.policy)
 
+        n_input = inputs["input_ids"].shape[1]
+        stop = _LoopStop(n_input, self._eos_ids) if self.loop_stop else None
+        if stop is not None:
+            from transformers import StoppingCriteriaList
+            generate_kwargs["stopping_criteria"] = StoppingCriteriaList([stop])
         with torch.inference_mode():
             generated = self.model.generate(
                 **inputs, max_new_tokens=max_new, do_sample=False, **generate_kwargs
@@ -262,14 +405,16 @@ class QwenPipelineNative(BatchedAsrStage):
 
         # generate() returns a plain tensor by default; handle both for safety
         sequences = generated if isinstance(generated, torch.Tensor) else generated.sequences
-        n_input = inputs["input_ids"].shape[1]
         new_tokens = sequences[:, n_input:]
         logger.debug("[TOKENS] batch=%d, new_tokens=%d, max=%d", len(wavs), new_tokens.shape[1], self.max_new_tokens)
         # A row that finished early carries its EOS (then pad, itself an EOS id on
-        # Qwen3-ASR) somewhere in it; a row that never did ran the full budget.
-        hits = [new_tokens.shape[1] >= max_new
-                and not any(int(t) in self._eos_ids for t in row)
-                for row in new_tokens]
+        # Qwen3-ASR) somewhere in it; a row that never did ran the full budget. A row the
+        # loop stop ended is padded the same way, so it says so itself.
+        stopped = (stop.stopped.tolist() if stop is not None and stop.stopped is not None
+                   else [False] * len(wavs))
+        hits = [bool(was_stopped) or (new_tokens.shape[1] >= max_new
+                                      and not any(int(t) in self._eos_ids for t in row))
+                for row, was_stopped in zip(new_tokens, stopped)]
 
         # Qwen3ASRProcessor.decode(return_format="transcription_only") strips the
         # "language <LANG><asr_text>" prefix and applies the same repetition-collapsing
@@ -280,11 +425,19 @@ class QwenPipelineNative(BatchedAsrStage):
             return_format="transcription_only",
             clean_up_tokenization_spaces=False,
         )
+        # The same tokens undecorated: the language label the model wrote, and the text
+        # before the repetition pass -- which folds a loop away without a trace.
+        raws = self.processor.decode(
+            new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+        )
         del inputs, generated
 
-        for raw in texts:
+        rows = []
+        for text, hit, raw in zip(texts, hits, raws):
             logger.debug("[RAW] %s", raw)
-        return texts, hits
+            label, unfolded = _split_label(raw) if isinstance(raw, str) else (None, None)
+            rows.append((text, hit, label, unfolded if unfolded and unfolded != text else None))
+        return rows
 
 
 def load_model_native(
@@ -306,6 +459,7 @@ def load_model_native(
     processor=None,
     normalization=None,
     loop_retry_penalty: float = 1.1,
+    loop_stop: bool = True,
 ) -> QwenPipelineNative:
     """Build the native ASR pipeline, loading whatever the caller did not supply.
 
@@ -389,4 +543,5 @@ def load_model_native(
         vram_checks=vram_checks,
         normalization=normalization,
         loop_retry_penalty=loop_retry_penalty,
+        loop_stop=loop_stop,
     )

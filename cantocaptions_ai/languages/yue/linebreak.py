@@ -49,7 +49,7 @@ def _split(text: str, i: int) -> str:
     return text[:i + 1].rstrip(' ') + '\n' + text[i + 1:].lstrip(' ')
 
 
-def linebreak(text: str, line_max_length: int = 21, line_break_threshold: int = 1) -> str:
+def linebreak(text: str, line_max_length: float = 21, line_break_threshold: int = 1) -> str:
     """Split text into two lines if it is wider than ``line_max_length``."""
     if '\n' in text:
         # Rule files are user-editable, so a replacement could introduce a newline;

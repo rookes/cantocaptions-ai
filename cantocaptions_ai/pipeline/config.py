@@ -58,6 +58,9 @@ class PipelineConfig:
     # repetition loop (a sung "da da da" decoding to 噔噔噔... until the cap); it is
     # re-generated once with this repetition_penalty. 0 disables the retry.
     asr_loop_retry_penalty: float = 1.1
+    # Stop a chunk's generation as soon as it starts repeating one pattern (5 copies), instead
+    # of letting it run out the token budget and hold its whole batch that long.
+    asr_loop_stop: bool = True
 
     # Model loading
     # The ASR model; None uses the language pack's own (cantocaptions-cantonese-ASR for yue).
@@ -111,6 +114,28 @@ class PipelineConfig:
     # work. 0 isolates every segment on its own.
     vocal_isolation_span_gap: float = 1.0
 
+    # ASR repair (pipeline/asr_repair.py). A chunk counts as a repetition loop when one
+    # phrase repeats at least asr_loop_min_copies times over at least asr_loop_min_chars
+    # characters (or the token budget ran out on it); runs of three or four are mostly
+    # real speech (拜拜，拜拜，拜拜), runs of five or more were loops in every checkpoint
+    # looked at (scripts/eval_hallucination.py scan).
+    asr_loop_min_copies: int = 5
+    asr_loop_min_chars: int = 24
+    # Write a loop that survives repair once, as "phrase…".
+    asr_loop_trim: bool = True
+    # A looping chunk is cut at its deepest pause and the pieces re-transcribed; a piece
+    # that still loops is cut again, up to this many times. 0 = no re-transcription.
+    asr_split_depth: int = 3
+    asr_split_min_piece: float = 4.0
+    # Speech in a language the run does not keep (asr_native_languages): "transcribe" it in
+    # its own language with a multilingual model, "drop" it, only "note" it, or "none" (no
+    # language check, and the multilingual model never loads).
+    asr_foreign: str = "transcribe"
+    asr_foreign_model: str = "Qwen3-ASR"
+    # Comma-separated Qwen3-ASR language names never transcribed over or dropped; None = the
+    # language pack's (Cantonese, Chinese, English for yue).
+    asr_native_languages: Optional[str] = None
+
     # Ensemble & LLM correction
     ensemble_model: str = "none"
     llm_correction: bool = False
@@ -156,9 +181,9 @@ class PipelineConfig:
     # Subtitle formatting
     # Line width before text is broken onto the next, in the script's cells (ScriptConfig.width:
     # in Chinese, a half-width character counts half). None: the language's own width
-    # (its script's line_width: 18 for Chinese, 42 for space-separated scripts), filled in by
+    # (its script's line_width: 17.5 for Chinese, 42 for space-separated scripts), filled in by
     # validate_config (see LANGUAGE_DEFAULTED). 0: never break a line.
-    max_line_width: Optional[int] = None
+    max_line_width: Optional[float] = None
     max_line_count: Optional[int] = 2
 
     # Text cleaning
@@ -449,6 +474,7 @@ SECTION_TITLES: Mapping[str, str] = MappingProxyType({
     "audio": "audio",
     "vad": "vad",
     "vocal_isolation": "vocal isolation",
+    "asr_repair": "ASR repair",
     "ensemble": "ensemble & LLM correction",
     "references": "embedded reference subtitles",
     "asr_context": "asr context (experimental)",
@@ -466,6 +492,7 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     "inference": (
         "device", "device_index", "batch_size", "files_per_group", "asr_compute_type",
         "attn_implementation", "threads", "hf_token", "compile", "asr_loop_retry_penalty",
+        "asr_loop_stop",
     ),
     "output": (
         "output_dir", "output_format", "verbose", "print_progress", "vram_checks",
@@ -479,6 +506,10 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     "vocal_isolation": (
         "vocal_isolation_method", "vocal_isolation_batch_size", "vocal_isolation_compute_type",
         "vocal_isolation_segment_mode", "vocal_isolation_compile", "vocal_isolation_span_gap",
+    ),
+    "asr_repair": (
+        "asr_loop_min_copies", "asr_loop_min_chars", "asr_loop_trim", "asr_split_depth",
+        "asr_split_min_piece", "asr_foreign", "asr_foreign_model", "asr_native_languages",
     ),
     "ensemble": (
         "ensemble_model", "llm_correction", "llm_model", "llm_model_dir", "reference_subtitle",
