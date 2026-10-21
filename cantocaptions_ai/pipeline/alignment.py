@@ -28,7 +28,7 @@ from cantocaptions_ai.utils.schema import (
     attach_timed_notes,
     interpolate_nans,
 )
-from cantocaptions_ai.pipeline.asr_repair import spread_foreign
+from cantocaptions_ai.pipeline.asr_repair import place_foreign
 from cantocaptions_ai.text_profiles import (
     DEFAULT_PUNCTUATION,
     LATIN_WORD,
@@ -1365,9 +1365,9 @@ def align(
             t1, t2, interpolate_method, return_char_alignments,
             spotchecks, punctuation, frame_times=frame_times, script=script,
         )
-        # Other-language text this align model cannot follow is timed by spreading instead.
+        # Other-language text this align model cannot follow takes a word aligner's times.
         line_script = script or script_for_language(model_lang)
-        subsegments = spread_foreign(segment, subsegments, line_script.line_width, line_script.width)
+        subsegments = place_foreign(segment, subsegments, line_script.line_width, line_script.width)
         attach_timed_notes(segment, subsegments)
         aligned_segments += subsegments
 

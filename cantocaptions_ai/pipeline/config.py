@@ -177,6 +177,10 @@ class PipelineConfig:
     # (AlignProfile.split_gap, itself None for every shipped model, so: never); 0 forces it
     # off whatever the profile says. See pipeline/align_checks.py:split_gapped_cues.
     align_split_gap: Optional[float] = None
+    # Word aligner for the stretches ASR repair kept in another language, which the
+    # language's own align model cannot follow (pipeline/word_align.py); "none" keeps that
+    # model's timings. Loaded only when a file has such a stretch.
+    align_foreign_model: str = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 
     # Subtitle formatting
     # Line width before text is broken onto the next, in the script's cells (ScriptConfig.width:
@@ -526,7 +530,7 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     "alignment": (
         "align_model", "interpolate_method", "no_align", "return_char_alignments",
         "align_batch_size", "align_compute_type", "align_char_substitution",
-        "align_substitutions", "align_split_gap",
+        "align_substitutions", "align_split_gap", "align_foreign_model",
     ),
     "cues": (
         "align_padding", "align_release", "align_merge_distance", "min_cue_duration",

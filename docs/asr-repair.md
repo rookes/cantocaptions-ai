@@ -224,20 +224,54 @@ the cue cutters trusted the gaps between them:
 
 On E01 this gave cues like `Rosé` / `até` / `Il` and `Si` / `può`.
 
-Instead, `asr_repair.spread_foreign` (called in `align()` right after `_align_segment`) retimes
-the words of each `foreign_spans` stretch:
+Spreading the words evenly over their stretch was tried first, and was worse than the CTC
+guesses. So these stretches now go to a **word aligner** (`pipeline/word_align.py`):
 
 1. Repair records `foreign_spans` for every piece kept as another language: its text as written
-   into the chunk, and its *voiced span* (`voiced_span`: first to last frame within 35 dB of the
-   loudest).
-2. After CTC alignment, the stretch's words are found by their place in the chunk's text. They
-   are spread evenly by character over that span, and their `peak` is dropped.
-3. The cues are cut at each sentence end (`.` `?` `!`), and at a comma only when a sentence is
-   wider than a line. Cue assembly merges sentences back up to a line where they fit.
+   into the chunk, its piece's start and end, and its language.
+2. The alignment stage, before the run's own align model loads, collects every span across all
+   files. It gives each span's audio and its words (`word_align.spoken_tokens`: a Latin run
+   whole, any other letter on its own, the same split alignment makes) to the word aligner
+   (`align_foreign_model`, default `Qwen/Qwen3-ForcedAligner-0.6B-hf`) in one batched pass, then
+   frees it. The times go into `span["words"]`.
+3. After CTC alignment, `asr_repair.place_foreign` gives each span's words those times, matched
+   by their place in the chunk's text, and drops their `peak`. Cue edges come from spoken words
+   only, since spaces and marks keep the CTC times.
+4. Alignment splits a chunk only at the run's own punctuation, so cues are cut at each Latin
+   sentence end (`.` `?` `!`), and at a comma only when a sentence is wider than a line. Cue
+   assembly merges sentences back up to a line where they fit.
 
-If the stretch's text can't be found (pre-alignment cleaning changed it), the CTC timings stand.
+The CTC times stand for any of these:
 
-Two related fixes:
+- a span whose text can't be found (pre-alignment cleaning changed it);
+- a span whose word count doesn't match;
+- a span in a language the aligner doesn't cover;
+- the setting `align_foreign_model none`.
+
+**The word aligner is general.** `WordAligner` takes any audio, any words and a language;
+families are looked up by checkpoint architecture (`WORD_ALIGNERS`, `word_aligner_family`). Today
+only `foreign_spans` use it, but a language with no CTC model of its own could align with one
+outright.
+
+Qwen3-ForcedAligner covers Chinese, Cantonese, English, French, German, Italian, Japanese,
+Korean, Portuguese, Russian and Spanish. It takes up to 5 minutes of audio per job, and answers in
+80 ms steps. Measured on an RTX 3080 in float16:
+
+| Job | Time | Notes |
+|---|---|---|
+| E01's 8 Italian stretches | under 1 s | plus about 8 s to load |
+| All 88 chunks of E01 (30 min of audio) | 5.3 s | peak 3.6 GB at batch 8 |
+| The same chunks, CTC alignment | about 40 s | for comparison |
+
+So it would hold up as a file's main aligner. Batching changes its answers by a mean of 2 ms
+(fp16 noise).
+
+**Piles.** A word the aligner can't place gets the same instant as its neighbours, so four
+words land at once where speech is sung, invented or too fast. `word_align.unpile` spreads each
+such run from that instant towards the next timed word, at no more than 0.4 s a word. Spreading
+to the next word found put `Chinese food? Sì, thank you` ten seconds late.
+
+**Related fixes:**
 
 - **Accented letters are part of the word.** `text_profiles.LATIN_WORD` now covers them
   (`À–ɏ`, `Ḁ–ỿ`); before, `può` was the two words `pu` and `ò`.
@@ -245,27 +279,18 @@ Two related fixes:
   spaces two runs of Latin text (`him?` + `Naturally`), while Latin beside Chinese stays unspaced
   (`我嚟到cafe喇`).
 
-E01, 40:43 onwards:
+**E01 against the previous CTC timings.** Where the earlier stock-model subtitles give a
+reference, the aligner lands closer:
 
-| Before | After |
-|---|---|
-| `Rosé` / `até` / `Il` / `nasce sulle gambe blu` / … | `Rosé, até` / `Il nasce sulle gambe blu` / `la ragazza più rossa` / `e la cantina buia dove noi stiamo al piano piano` |
+| Line | Aligner | CTC | Earlier subtitles |
+|---|---|---|---|
+| `Hey, Aizer!` | 36:29.7–36:30.4 | in a cue stretched over 36:29.8–36:32.9 | — |
+| `Basta che prendi qua` | 39:25.6 | 39:24.1, merged with the next line | 39:25.9 |
+| `Ragazzi vi girate` | 39:26.8 | 39:24.1, merged with the previous line | 39:26.6 |
 
-At 36:29, `Hey` / `Aizer!` / `Aizer` / `vieni!` became `Hey, Aizer!` / `Aizer, vieni!` /
-`Poza, vieni!`.
-
-**TODO: real word timings.** Even spreading puts the text in the right stretch, but not on the
-right syllables. A forced aligner that speaks the language would do better.
-`Qwen/Qwen3-ForcedAligner-0.6B` covers Italian, French, German, Spanish, Portuguese, Russian,
-Japanese and Korean, among others (`FORCED_ALIGNER_LANGUAGES` in transformers'
-`processing_qwen3_asr`). To use it:
-
-- Load it only when `foreign_spans` exist.
-- Align each span's text against its piece of audio.
-- Hand `spread_foreign` the resulting word times instead of spreading.
-
-It is a small model, but one more load per run that has foreign speech; measure before making it
-the default.
+It lands worse where the ASR text is wrong. Chunk 69's `Chinese food? Sì. Thank you`
+was really "Chinese lady? Sì, okay, thank you", around 29:44–29:48. The aligner, made to find
+words that weren't said, put them at 30:00.7; CTC kept them near 29:44.
 
 ## Known limits
 
@@ -274,8 +299,10 @@ the default.
   (`asr_loop:recovered by a retry`). Untried: a cross-check against the align model's own greedy
   CTC decode of the cue, which is already in memory at alignment. The CTC *score* is no
   per-cue trust signal for timing (see known-gotchas), so this would need its own measurement.
-- **Other-language text is timed by spreading, not aligned** (see above). A cue can run long
-  where the text is short for its stretch, e.g. E01's `e la cantina buia dove noi stiamo al
-  piano piano` for 11 s.
+- **A word aligner can only place the words it is given.** Where the ASR text is wrong (E01
+  69), the aligner times invented words somewhere, sometimes far from the real speech.
+- **Pauses in Latin-only text are believed without evidence.** `split_gapped_cues` measures
+  "heard" from Chinese characters only. With aligner times the gaps are mostly real, but a sung
+  line can still be cut mid-phrase (`e la` / `cantina buia dove noi`).
 - **`drop` drops a whole piece.** A piece mixing English and Italian (E01 69:
   `Just gone? … Chinese food? … Thank you`) loses its English too.

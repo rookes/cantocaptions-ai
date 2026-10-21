@@ -22,7 +22,8 @@ multilingual model (base Qwen3-ASR) identifies each piece's language itself, and
 :func:`combine` decides what the piece ends up saying: speech in a language the run does not
 keep (``native``) is transcribed in that language, dropped, or only noted (``asr_foreign``).
 Whatever still loops afterwards is trimmed to the house ``X…`` form by :func:`trim_loop`, in
-the repair stage's tidy-up.
+the repair stage's tidy-up. The stretches kept in another language are recorded
+(``foreign_spans``) for the alignment stage to time with a word aligner.
 
 Everything here but the two model calls is pure (text and numpy arrays in, decisions out),
 so the eval script (``scripts/eval_hallucination.py``) measures exactly what the pipeline
@@ -36,6 +37,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from cantocaptions_ai.text_profiles import LATIN_WORD
+from cantocaptions_ai.utils.log_utils import get_logger
+
+logger = get_logger(__name__)
 
 # What may sit between two copies of a repeated phrase.
 LOOP_SEPARATORS = "，,、…。.！!？? ～~\u3000 "
@@ -397,25 +401,6 @@ def split_point(
     return seg_start + (first + best_mid + 0.5) * hop
 
 
-def voiced_span(start: float, audio: np.ndarray, sample_rate: int = 16000,
-                hop: float = 0.04) -> Tuple[float, float]:
-    """The part of a stretch of audio that has sound in it, on the file's timeline: from the
-    first to the last frame within 35 dB of the loudest (and 6 dB over the quietest tenth).
-    The whole stretch when nothing stands out."""
-    from cantocaptions_ai.pipeline.align_checks import frame_dbfs
-
-    end = start + len(audio) / sample_rate
-    db = frame_dbfs(np.asarray(audio, dtype=np.float32), sample_rate, frame_seconds=hop)
-    if len(db) < 3:
-        return start, end
-    width = max(1, int(round(0.2 / hop)))
-    smooth = _smooth(db, width)
-    loud = np.nonzero(smooth >= max(np.percentile(smooth, 10) + 6.0, smooth.max() - 35.0))[0]
-    if not len(loud):
-        return start, end
-    return start + loud[0] * hop, min(end, start + (loud[-1] + 1) * hop)
-
-
 # --- Repair ---------------------------------------------------------------------------------
 
 FOREIGN_MODES = ("transcribe", "drop", "note", "none")
@@ -760,18 +745,20 @@ def finish(chunks: Sequence[ChunkRepair], results: Sequence[dict], settings: Rep
     return rows
 
 
-def _foreign_spans(chunk: ChunkRepair, text: str, join, sample_rate: int = 16000) -> List[dict]:
-    """The stretches of a chunk's final text that are in another language, each with the
-    time its speech takes up (:func:`voiced_span`): what :func:`spread_foreign` times."""
+def _foreign_spans(chunk: ChunkRepair, text: str, join) -> List[dict]:
+    """The stretches of a chunk's final text that are in another language, each with its
+    piece's time and language: what the alignment stage hands a word aligner
+    (``pipeline/word_align.py``), since the run's own align model cannot follow them."""
     spans, cursor = [], 0
     for piece in chunk.pieces:
-        if _trivial(piece.text) or not (piece.note or "").startswith("asr_lang:"):
+        note = piece.note or ""
+        if _trivial(piece.text) or not note.startswith("asr_lang:"):
             continue
         for written in (join([piece.text]), piece.text.strip()):
             at = text.find(written, cursor) if written else -1
             if at >= 0:
-                t0, t1 = voiced_span(piece.start, chunk.audio_for(piece, sample_rate), sample_rate)
-                spans.append({"text": written, "start": round(t0, 3), "end": round(t1, 3)})
+                spans.append({"text": written, "start": round(piece.start, 3),
+                              "end": round(piece.end, 3), "language": note.split(":", 1)[1]})
                 cursor = at + len(written)
                 break
     return spans
@@ -847,45 +834,37 @@ _SENTENCE_END = re.compile(r"[.!?。！？…]")
 _CLAUSE_END = re.compile(r"[,;:，；：]")
 
 
-def spread_foreign(segment: dict, pieces: List[dict], line_width: float = 17.5,
-                   width: Optional[Callable[[str], float]] = None) -> List[dict]:
-    """Retime the other-language words in one aligned chunk, and cut them into clauses.
+def place_foreign(segment: dict, pieces: List[dict], line_width: float = 17.5,
+                  width: Optional[Callable[[str], float]] = None) -> List[dict]:
+    """Give the other-language words in one aligned chunk the times a word aligner found for
+    them, and cut them into sentences.
 
     The align model for the run's language cannot follow speech in another language (the
-    Cantonese one has no tokens for é, ò, ù, and no ear for Italian): the times it gives
-    those words are guesses, and the gaps between them invented. Cue cutters that trust those
-    gaps cut ``Si | può``. So each ``foreign_spans`` stretch's words are spread evenly by
-    character over the time its speech takes up, and the cues they are in are cut at each
-    sentence end (``.`` ``?`` ``!``), and at a comma only where a sentence is wider than one
-    line (*line_width*, measured by *width*): even timing shows no pauses, so cue assembly's
-    own cutters would otherwise cut such a stretch anywhere. Words are matched to the
-    stretch by their place in the chunk's text; if they cannot be, *pieces* come back as
-    they were.
+    Cantonese one has no tokens for é, ò, ù, and no ear for Italian), so the alignment stage
+    has each ``foreign_spans`` stretch aligned by a word aligner first, which leaves its
+    times in ``span["words"]``: one ``[start, end]`` (or None) per word of
+    :func:`word_align.spoken_tokens`, on the file's timeline. Here those replace the times
+    the align model gave the same words, matched by their place in the chunk's text.
 
-    TODO: a forced aligner that speaks the language (Qwen3-ForcedAligner-0.6B covers Italian,
-    French, German, Spanish, Portuguese, Russian, Japanese, Korean) would give real word
-    times. See docs/asr-repair.md.
+    Alignment splits a chunk into cues only at the run's own punctuation, so a stretch of
+    Italian would be one long cue; its cues are cut at each sentence end (``.`` ``?``
+    ``!``), and at a comma where a sentence is wider than one line (*line_width*, measured
+    by *width*). A stretch with no word times, or whose words cannot be matched, keeps the
+    align model's.
     """
-    spans = segment.get("foreign_spans")
+    from cantocaptions_ai.pipeline.word_align import spoken_tokens
+
+    spans = [span for span in segment.get("foreign_spans") or () if span.get("words")]
     text = str(segment.get("text") or "")
     if not spans or not pieces or not text:
         return pieces
-    ranges, cursor = [], 0
-    for span in spans:
-        at = text.find(span["text"], cursor)
-        if at < 0:
-            continue
-        ranges.append((at, at + len(span["text"]), float(span["start"]), float(span["end"])))
-        cursor = at + len(span["text"])
-    if not ranges:
-        return pieces
 
-    # Every word's place in the chunk's text, across the pieces alignment cut it into.
+    # Every spoken word's place in the chunk's text, across the pieces alignment cut it into.
     places, cursor = [], 0
     for p, piece in enumerate(pieces):
         for w, word in enumerate(piece.get("words") or []):
             token = str(word.get("word", ""))
-            if not token.strip():
+            if not spoken_tokens(token):
                 continue
             at = text.find(token, cursor)
             if at < 0:
@@ -893,37 +872,43 @@ def spread_foreign(segment: dict, pieces: List[dict], line_width: float = 17.5,
             places.append((p, w, at, at + len(token)))
             cursor = at + len(token)
 
-    spread = set()
-    for a, b, t0, t1 in ranges:
-        inside = [pl for pl in places if pl[2] >= a and pl[3] <= b]
-        total = sum(pl[3] - pl[2] for pl in inside)
-        if not total or t1 <= t0:
+    placed = set()
+    cursor = 0
+    for span in spans:
+        at = text.find(span["text"], cursor)
+        if at < 0:
             continue
-        done = 0
-        for p, w, x, y in inside:
+        cursor = at + len(span["text"])
+        inside = [pl for pl in places if pl[2] >= at and pl[3] <= cursor]
+        times = span["words"]
+        if len(inside) != len(times):
+            logger.debug("Foreign span %r: %d aligned words for %d timed ones; keeping the "
+                         "align model's times", span["text"][:30], len(inside), len(times))
+            continue
+        for (p, w, _, _), timed in zip(inside, times):
+            if timed is None:
+                continue
             word = pieces[p]["words"][w]
-            word["start"] = round(t0 + (t1 - t0) * done / total, 3)
-            done += y - x
-            word["end"] = round(t0 + (t1 - t0) * done / total, 3)
-            word.pop("peak", None)  # its peak was measured where the word is not
-            spread.add((p, w))
-    if not spread:
+            word["start"], word["end"] = round(float(timed[0]), 3), round(float(timed[1]), 3)
+            word.pop("peak", None)  # measured by the align model, which could not hear it
+            placed.add((p, w))
+    if not placed:
         return pieces
 
     out = []
     for p, piece in enumerate(pieces):
-        if not any(q == p for q, _ in spread):
+        if not any(q == p for q, _ in placed):
             out.append(piece)
             continue
-        out.extend(_clauses(piece, {w for q, w in spread if q == p}, line_width,
+        out.extend(_clauses(piece, {w for q, w in placed if q == p}, line_width,
                             width or (lambda t: len(t) / 2)))
     return out
 
 
 def _clauses(piece: dict, spread: set, line_width: float,
              width: Callable[[str], float]) -> List[dict]:
-    """*piece* cut before each spread word that a sentence end separates from the spread word
-    before it -- or a comma, inside a sentence too wide for a line -- each part re-edged. In
+    """*piece* cut before each placed word (*spread*) that a sentence end separates from the
+    placed word before it -- or a comma, inside a sentence too wide for a line -- each part re-edged. In
     unspaced text a mark (``?``) is a word of its own, so the mark is looked for in
     everything between the two spoken words, words included."""
     from cantocaptions_ai.pipeline.align_checks import _word_offsets
@@ -981,8 +966,13 @@ def _fill_lines(text: str, offsets, lo: int, hi: int, commas: List[int], line_wi
 
 
 def _edged(piece: dict) -> dict:
-    """A cue's start and end from its timed words, released from its last word."""
-    timed = [w for w in piece.get("words") or [] if w.get("start") is not None]
+    """A cue's start and end from its timed spoken words, released from its last word. Spaces
+    and marks are words too in unspaced text, but keep the align model's times, which for
+    other-language text are the guesses the word aligner replaced."""
+    from cantocaptions_ai.pipeline.word_align import spoken_tokens
+
+    words = [w for w in piece.get("words") or [] if w.get("start") is not None]
+    timed = [w for w in words if spoken_tokens(str(w.get("word", "")))] or words
     if not timed:
         return piece
     piece["start"] = round(min(float(w["start"]) for w in timed), 3)

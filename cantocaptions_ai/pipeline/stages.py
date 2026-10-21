@@ -1522,6 +1522,62 @@ class PreAlignCleanStage(_AsrPath):
 
 # --- Stage 4: alignment (or, under --no_align, the ASR's own timings) ----------------------
 
+def _time_foreign_spans(ctx: RunContext, items: List[dict], stage) -> None:
+    """Have a word aligner time the stretches ASR repair kept in another language
+    (``foreign_spans``), which the run's own align model cannot follow. Their word times go
+    into each span (``span["words"]``) for ``asr_repair.place_foreign`` to apply after CTC
+    alignment. Runs before the align model loads, so the two never share the GPU; costs
+    nothing when no file has such a stretch.
+    """
+    from cantocaptions_ai.pipeline.word_align import WordAlignJob, load_word_aligner, spoken_tokens
+    from cantocaptions_ai.utils.audio import SAMPLE_RATE
+    from cantocaptions_ai.utils.model_utils import model_scope
+
+    cfg = ctx.cfg
+    if not cfg.align_foreign_model or cfg.align_foreign_model == "none":
+        return
+    targets = []
+    for item in items:
+        vads = item.get("vad_segments") or []
+        for seg in item["result"]["segments"]:
+            for span in seg.get("foreign_spans") or ():
+                vad = next((v for v in vads if v["start"] - 1e-3 <= span["start"] < v["end"]), None)
+                if vad is None:
+                    continue
+                a = max(0, int(round((span["start"] - vad["start"]) * SAMPLE_RATE)))
+                b = int(round((span["end"] - vad["start"]) * SAMPLE_RATE))
+                words = [span["text"][x:y] for x, y in spoken_tokens(span["text"])]
+                targets.append((span, float(vad["start"]) + a / SAMPLE_RATE,
+                                WordAlignJob(vad["audio"][a:b], words, span.get("language"))))
+    if not targets:
+        return
+
+    stage.status(f"aligning {len(targets)} other-language stretch(es)")
+    try:
+        with model_scope(
+            load_word_aligner, cfg.align_foreign_model, device=cfg.device,
+            device_index=cfg.device_index, compute_type=cfg.align_compute_type,
+            download_root=cfg.model_dir, local_files_only=cfg.model_cache_only,
+            batch_size=cfg.align_batch_size,
+        ) as aligner:
+            unsupported = sorted({job.language or "?" for _, _, job in targets
+                                  if not aligner.supports(job.language)})
+            times = aligner.align([job for _, _, job in targets])
+            del aligner
+    except (OSError, ValueError, ImportError) as e:
+        logger.warning("Could not load the word aligner %s (%s); other-language speech keeps "
+                       "the align model's timings", cfg.align_foreign_model, e)
+        return
+    timed = 0
+    for (span, offset, _), row in zip(targets, times):
+        if any(t is not None for t in row):
+            span["words"] = [None if t is None else [round(offset + t[0], 3), round(offset + t[1], 3)]
+                             for t in row]
+            timed += 1
+    logger.info("Word aligner: timed %d of %d other-language stretch(es)%s", timed, len(targets),
+                f"; it does not cover {', '.join(unsupported)}" if unsupported else "")
+
+
 class AlignmentStage(_AsrPath):
     name = "Alignment"
     key = "alignment"
@@ -1535,6 +1591,7 @@ class AlignmentStage(_AsrPath):
 
         cfg = ctx.cfg
         with StageTimer(self.name, ctx.summary, progress=ctx.progress) as stage:
+            _time_foreign_spans(ctx, items, stage)
             stage.status("loading alignment model")
             align_model, align_metadata = load_with_offline_fallback(
                 load_align_model,

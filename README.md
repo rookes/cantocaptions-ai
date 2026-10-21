@@ -141,8 +141,9 @@ After transcription, chunks that went wrong in a recognisable way are transcribe
   - `none`: no check at all.
 
   Clean Cantonese is never replaced on the second model's word alone. The Cantonese alignment model can't
-  follow other languages, so their words are spread evenly over the speech they came from and cut into
-  sentences, rather than aligned.
+  follow other languages, so that speech is timed by a multilingual forced aligner instead
+  (`align_foreign_model`, Qwen3-ForcedAligner by default; `none` keeps the Cantonese model's timings). It
+  loads only when there is such speech.
 
 The log lists every chunk that was changed. With `--debug_dir`, `notes/notes.srt` marks each cue
 involved (`asr_lang:Italian`, `asr_loop:...`). A run with nothing to repair costs nothing. Details
