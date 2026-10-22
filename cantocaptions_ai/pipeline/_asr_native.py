@@ -3,6 +3,7 @@
 Loaded lazily by asr.load_model() when native qwen3_asr support is detected
 (transformers>=5.13.0, a base dependency).
 """
+import time
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -14,6 +15,7 @@ from cantocaptions_ai.utils.model_utils import (
     MemoryPolicy,
     ensure_hf_model_downloaded,
     guard_model_load,
+    inductor_usable,
 )
 from cantocaptions_ai.text_profiles import DEFAULT_NORMALIZATION, TextNormalization
 from cantocaptions_ai.pipeline.model_profiles import get_model_profile
@@ -131,51 +133,48 @@ def _split_label(raw: str) -> Tuple[Optional[str], Optional[str]]:
     return label or None, text.strip()
 
 
-def _compile_and_warmup(model, processor, language: str, batch_size: Optional[int]) -> None:
-    """Compile model.forward and run a short warmup so the first real batch isn't the one paying the compile cost.
-
-    Opt-in only (--compile) — benchmarked in scripts/bench_asr_compile.py against this
-    workload's actual shape variance (VAD segments are essentially unique-length) and found
-    to be a net loss in every configuration tried:
-      - Default (graph break allowed): get_audio_cu_seqlens() in the audio tower does
-        `.max().item()` + a Python loop over tensor-derived lengths, which dynamo can't trace.
-        Each new (batch_size, audio_length) shape burns up to `recompile_limit` (8) full
-        compile attempts (~20-30s each) before giving up and falling back to eager for that
-        code location — tens of seconds wasted per distinct shape, for at most a ~2x speedup
-        on the rare batch that repeats an exact prior shape before the budget trips.
-      - dynamic=True: made the first-compile cost dramatically worse (137-408s), not better.
-      - Padding every segment to a fixed shape (chunk_size worth of samples) does eliminate
-        the recompiles and gives a real, stable steady-state speedup once compiled — but only
-        pays off once the workload is already VRAM-healthy; at a starved batch_size, eager
-        itself was 10-50x slower (near-OOM allocator overhead unrelated to compile), which
-        made compile look better than it is. At a batch_size with real headroom, eager alone
-        is already fast and stable, and compile's edge shrinks to ~25-40% against a ~30s+
-        per-process tax.
-      - That per-process tax cannot be cached away: neither torch.compiler.save_cache_artifacts/
-        load_cache_artifacts (torch's "Mega-Cache", meant for cross-machine cache portability)
-        nor the default on-disk Inductor cache avoid it — the dominant cost is TorchDynamo's
-        own bytecode tracing/graph-break handling for this model, which happens once per fresh
-        Python process regardless of what's cached on disk, not the kernel compilation itself.
-
-    Uses a small batch of silent audio at roughly the configured batch size — torch.compile
-    specializes to the shapes it first sees, so warming up near the real batch size avoids an
-    extra recompilation on the first genuine inference call.
-    """
-    model.forward = torch.compile(model.forward)
-    warmup_batch = max(1, min(batch_size or 4, 8))
-    silence = [np.zeros(3 * 16000, dtype=np.float32) for _ in range(warmup_batch)]
-    inputs = processor.apply_transcription_request(audio=silence, language=language)
-    inputs = inputs.to(model.device, model.dtype)
-    with torch.inference_mode():
-        for _ in range(3):
-            model.generate(**inputs, max_new_tokens=8, do_sample=False)
+# torch.compile for the decode step (--compile). generate() runs a prefill over the prompt,
+# audio tower included, then one forward per new token. Compiling model.forward whole was a
+# net loss (scripts/bench_asr_compile.py): the audio tower's get_audio_cu_seqlens breaks the
+# graph on .item(), and with the default growing KV cache every decode step is a new shape.
+# transformers can instead keep the prefill eager and compile only the decode step, whose
+# shape is fixed once the cache is static (cache_implementation="static"), and run it as a
+# CUDA graph (mode="reduce-overhead"). Measured on a 3080 10 GB over 324 chunks
+# (scripts/bench_asr_static_cache.py): at batch 12, decode 12.6 -> 49 steps/s and the stage
+# 290 s -> 95 s; GT CER 8.91% -> 8.95%, inside the 8.90-8.97% that eager spans between batch
+# sizes 8, 12 and 16, which change more chunks' text than compiling does; output identical
+# run to run. The static cache holds batch x _cache_len of KV from the start (~0.8 GB more
+# at batch 12), yet compiled batch 8 (6.1 GB peak) ran 2.5x faster than eager batch 12 (6.4).
+#
+# Every batch size is its own graph (~7 s warm, ~40-60 s the first time on a machine), so
+# only full batches of the configured size take the compiled path; a loop retry, a short
+# last batch, a batch halved after an OOM and a repair call's odd-sized batches run as they
+# always have. One cache length serves the process (sized for a chunk_size chunk), so later
+# file groups and ASR repair's full batches reuse the graph rather than build another.
+#
+# "auto" compiles when a run has _COMPILE_MIN_BATCHES full batches: each saves ~6.6 s at
+# batch 12 against ~10 s for a warm compile (a first-ever one, ~50 s, takes ~8 to repay).
+_COMPILE_MIN_BATCHES = 3
+_COMPILE_SETTINGS = ("auto", "on", "off")
+# Set when a compiled generate fails other than by running out of memory (e.g. a broken
+# Triton), so the process stops trying.
+_COMPILE_FAILED = False
 
 
-def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device, policy: MemoryPolicy) -> None:
+def _compile_config():
+    from transformers import CompileConfig
+    # dynamic=False: one batch size is all the compiled path ever sees, so a shape-generic
+    # graph would only be slower.
+    return CompileConfig(mode="reduce-overhead", dynamic=False)
+
+
+def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device, policy: MemoryPolicy,
+               cache_len: Optional[int] = None) -> None:
     """Estimate one batch's peak VRAM (input tensors + generation KV-cache high-water)
     and log it against real headroom via *policy*. Callers guard on ``policy.enabled``
     so this whole function — including the estimate math below — is skipped when VRAM
     checks are off (measurably faster on the hot path; see the diagnosis findings).
+    ``cache_len`` is a static cache's length, which it holds in full from the start.
     """
     dtype_bytes = next(model.parameters()).element_size()
     seq_len = inputs["input_ids"].shape[1]
@@ -183,7 +182,7 @@ def _warn_vram(inputs, batch_size: int, model, max_new_tokens: int, device, poli
     try:
         text_cfg = model.config.text_config
         kv_bytes = (
-            batch_size * (seq_len + max_new_tokens)
+            batch_size * (cache_len or seq_len + max_new_tokens)
             * text_cfg.num_hidden_layers * 2
             * text_cfg.num_key_value_heads * text_cfg.head_dim
             * dtype_bytes
@@ -225,17 +224,29 @@ class QwenPipelineNative(BatchedAsrStage):
         normalization: TextNormalization = DEFAULT_NORMALIZATION,
         loop_retry_penalty: float = 1.1,
         loop_stop: bool = True,
+        compile: str = "off",
+        chunk_size: Optional[float] = None,
     ):
         super().__init__(
             device=device, language=language, batch_size=batch_size,
             print_progress=print_progress, verbose=verbose, vram_checks=vram_checks,
             normalization=normalization,
         )
+        if compile not in _COMPILE_SETTINGS:
+            raise ValueError(f"unknown ASR compile setting {compile!r} (expected auto, on or off)")
         self.model = model
         self.processor = processor
         self.max_new_tokens = max_new_tokens
         self.loop_retry_penalty = loop_retry_penalty
         self.loop_stop = loop_stop
+        self._compile = compile
+        # The longest chunk a run is expected to hold, which sizes the static KV cache.
+        self._chunk_size = chunk_size
+        # The batch size whose decode step runs compiled (None: none does), the static
+        # cache length every compiled call shares, and whether that graph has run yet.
+        self._compiled_rows: Optional[int] = None
+        self._cache_len: Optional[int] = None
+        self._compiled_ready = False
         eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
         self._eos_ids = set(eos if isinstance(eos, (list, tuple)) else [eos]) - {None}
 
@@ -312,6 +323,7 @@ class QwenPipelineNative(BatchedAsrStage):
         """
         from cantocaptions_ai.utils.model_utils import BatchExecutor
 
+        self._plan_batches(len(wavs))
         out: List[Optional[AsrText]] = [None] * len(wavs)
 
         def infer_fn(batch):
@@ -326,6 +338,111 @@ class QwenPipelineNative(BatchedAsrStage):
         BatchExecutor(self._batch_size, order_key=lambda i: len(wavs[i])).run(
             list(range(len(wavs))), infer_fn, reporter=progress_callback)
         return out
+
+    @property
+    def compiled(self) -> bool:
+        """Whether this model's full batches run the compiled decode step."""
+        return self._compiled_rows is not None
+
+    def _plan_batches(self, n_jobs: int) -> None:
+        """Before *n_jobs* chunks are batched: whether full batches take the compiled decode
+        step (see _COMPILE_MIN_BATCHES). Once this model has compiled it, it keeps it."""
+        if self._compiled_rows is not None or self._compile == "off" or not n_jobs:
+            return
+        reason = self._compile_blocker()
+        full = n_jobs // self._batch_size if self._batch_size else 0
+        if reason is None and self._compile == "auto" and full < _COMPILE_MIN_BATCHES:
+            reason = (f"auto: {n_jobs} chunks make {full} full batch(es), under the "
+                      f"{_COMPILE_MIN_BATCHES} that repay compiling")
+        if reason is not None:
+            # Only news when compiling was asked for; otherwise it is the expected path.
+            (logger.info if self._compile == "on" else logger.debug)(
+                "ASR: running the decode step uncompiled (%s)", reason)
+            return
+        self._compiled_rows = self._batch_size
+        logger.info(
+            "Compiling the ASR decode step for batches of %d. The first run on this machine "
+            "takes about a minute; later runs reuse the compile cache and take about 10 s. "
+            "Pass --compile off to skip it.", self._batch_size)
+
+    def _compile_blocker(self) -> Optional[str]:
+        """Why the decode step can't be compiled here, or None."""
+        if self.device.type != "cuda":
+            return "compiling needs a CUDA device"
+        if not self._batch_size:
+            return "compiling needs a fixed --batch_size"
+        if _COMPILE_FAILED:
+            return "an earlier compile in this process failed"
+        if not inductor_usable(self.device):
+            return "no working Triton; on Windows, install the `compile` extra"
+        return None
+
+    def _static_cache_len(self, needed: int, language: Optional[str]) -> int:
+        """The static KV cache length for a compiled call needing *needed* positions.
+
+        Sized once, for the longest of this call and a chunk_size chunk, so every later
+        call fits the same cache and reuses its graph. A call that needs more (a context
+        prompt, a segment past chunk_size) grows it, costing one new cache and graph.
+        """
+        if self._cache_len is None:
+            hint = 0
+            if self._chunk_size:
+                clip = np.zeros(int(self._chunk_size * SAMPLE_RATE), dtype=np.float32)
+                prompt = self.processor.apply_transcription_request(audio=[clip], language=language)
+                hint = int(prompt["input_ids"].shape[1]) + max(
+                    self.max_new_tokens, int(self._chunk_size * _TOKENS_PER_SECOND))
+            self._cache_len = max(needed, hint)
+        elif needed > self._cache_len:
+            logger.debug("ASR: a call needs %d cache positions, over the %d sized; growing it",
+                         needed, self._cache_len)
+            self._cache_len = needed
+        return self._cache_len
+
+    def _generate_compiled(self, generate, static: dict):
+        """``generate(static)``, under a status while its first call compiles the graph.
+
+        Either way a failure re-runs the batch uncompiled, at the same size, and the model
+        stays uncompiled. Out of memory, that is because the static cache holds the whole
+        KV cache from the start while an uncompiled batch only grows into it, so a batch
+        size that fits uncompiled is kept rather than halved; if it doesn't fit either, the
+        error reaches the caller, which halves. Any other failure is a broken compile, and
+        the rest of the process doesn't try again.
+        """
+        global _COMPILE_FAILED
+        from cantocaptions_ai.utils.model_utils import _stage_status
+
+        started = time.perf_counter()
+        try:
+            if self._compiled_ready:
+                result = generate(static)
+            else:
+                with _stage_status("compiling the decode step"):
+                    result = generate(static)
+        except Exception as e:
+            self._drop_compiled()
+            if "out of memory" in str(e).lower():
+                logger.info("ASR: out of memory with the static KV cache at batches of %d; "
+                            "running the decode step uncompiled from here", self._batch_size)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return generate({})
+            logger.warning("Compiling the ASR decode step failed; running it uncompiled for "
+                           "the rest of this process. %s: %s", type(e).__name__, e)
+            _COMPILE_FAILED = True
+            return generate({})
+        if not self._compiled_ready:
+            self._compiled_ready = True
+            logger.info("Compiled the ASR decode step (its first batch took %.0f s)",
+                        time.perf_counter() - started)
+        return result
+
+    def _drop_compiled(self) -> None:
+        """Run uncompiled from here on, and free the static cache transformers keeps."""
+        self._compiled_rows = None
+        # The static cache, and the compiled call holding its CUDA graphs' memory pool.
+        for attr in ("_cache", "_compiled_call"):
+            if getattr(self.model, attr, None) is not None:
+                delattr(self.model, attr)
 
     def _transcribe_batch(self, wavs: List, language: Optional[str],
                           contexts: Optional[List[Optional[str]]] = None, *,
@@ -390,18 +507,32 @@ class QwenPipelineNative(BatchedAsrStage):
             logger.debug("[BUDGET] longest=%.1fs -> max_new_tokens=%d (default %d)",
                          longest_s, max_new, self.max_new_tokens)
 
-        if self.device.type == "cuda" and self.policy.enabled:
-            _warn_vram(inputs, len(wavs), self.model, max_new, self.device, self.policy)
-
         n_input = inputs["input_ids"].shape[1]
-        stop = _LoopStop(n_input, self._eos_ids) if self.loop_stop else None
-        if stop is not None:
-            from transformers import StoppingCriteriaList
-            generate_kwargs["stopping_criteria"] = StoppingCriteriaList([stop])
-        with torch.inference_mode():
-            generated = self.model.generate(
-                **inputs, max_new_tokens=max_new, do_sample=False, **generate_kwargs
-            )
+        static = {}
+        if self._compiled_rows == len(wavs):
+            static = dict(cache_implementation="static",
+                          max_cache_len=self._static_cache_len(n_input + max_new, language),
+                          compile_config=_compile_config())
+
+        if self.device.type == "cuda" and self.policy.enabled:
+            _warn_vram(inputs, len(wavs), self.model, max_new, self.device, self.policy,
+                       cache_len=static.get("max_cache_len"))
+
+        def generate(extra):
+            # A fresh loop stop per attempt: it records which rows it ended.
+            stop = _LoopStop(n_input, self._eos_ids) if self.loop_stop else None
+            kwargs = {**generate_kwargs, **extra}
+            if stop is not None:
+                from transformers import StoppingCriteriaList
+                kwargs["stopping_criteria"] = StoppingCriteriaList([stop])
+            with torch.inference_mode():
+                return self.model.generate(
+                    **inputs, max_new_tokens=max_new, do_sample=False, **kwargs), stop
+
+        if not static:
+            generated, stop = generate({})
+        else:
+            generated, stop = self._generate_compiled(generate, static)
 
         # generate() returns a plain tensor by default; handle both for safety
         sequences = generated if isinstance(generated, torch.Tensor) else generated.sequences
@@ -451,7 +582,8 @@ def load_model_native(
     download_root: Optional[str] = None,
     local_files_only: bool = False,
     batch_size: Optional[int] = None,
-    compile_enabled: bool = False,
+    compile: str = "off",
+    chunk_size: Optional[float] = None,
     print_progress: bool = False,
     verbose: bool = False,
     vram_checks: bool = True,
@@ -469,6 +601,10 @@ def load_model_native(
     neither base weights nor processor files, so the caller merges the adapter
     and loads the processor from the base itself. When both are supplied nothing
     is downloaded.
+
+    ``compile`` ("auto", "on" or "off") compiles the decode step for full batches on CUDA
+    (see _COMPILE_MIN_BATCHES); ``chunk_size``, the longest chunk expected in seconds,
+    sizes the static KV cache that needs.
     """
     from transformers import AutoModelForMultimodalLM, AutoProcessor
 
@@ -520,17 +656,6 @@ def load_model_native(
     if device == "cuda":
         MemoryPolicy(vram_checks, vram_headroom_mb).cap_after_load(device_index)
 
-    if device == "cuda" and compile_enabled:
-        try:
-            _compile_and_warmup(hf_model, processor, _normalize_language(language), batch_size)
-            logger.info("torch.compile enabled for ASR model")
-        except Exception as e:
-            logger.warning(
-                "torch.compile failed (%s); falling back to eager mode. "
-                "Install the compile extra for triton support.",
-                e,
-            )
-
     return QwenPipelineNative(
         model=hf_model,
         processor=processor,
@@ -544,4 +669,6 @@ def load_model_native(
         normalization=normalization,
         loop_retry_penalty=loop_retry_penalty,
         loop_stop=loop_stop,
+        compile=compile,
+        chunk_size=chunk_size,
     )

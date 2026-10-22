@@ -10,6 +10,7 @@ import torchaudio
 from omegaconf import OmegaConf, DictConfig
 from huggingface_hub import hf_hub_download
 
+from cantocaptions_ai.pipeline.mbroformer.attend import sdpa_backends_for
 from cantocaptions_ai.pipeline.mbroformer.model import MelBandRoformer
 from cantocaptions_ai.utils.audio import SAMPLE_RATE, resolve_device
 from cantocaptions_ai.utils.schema import ProgressCallback, VadAudioSegment
@@ -21,6 +22,7 @@ from cantocaptions_ai.utils.model_utils import (
     check_vram_headroom,
     ensure_hf_file_downloaded,
     guard_model_load,
+    inductor_usable,
     resolve_torch_compute_dtype,
 )
 from cantocaptions_ai.utils.debug import (_PERSISTED_SEGMENT_KEYS, load_isolation_debug,
@@ -60,15 +62,22 @@ _SPAN_MAX_S = 120.0
 # torch.compile for the chunked path (--vocal_isolation_compile). Every chunk is the same
 # (batch, 2, chunk_size) shape, so one static graph serves a whole run, once each file's
 # short last batch is padded up to size. Measured on a 3080 Ti at batch 4: eager ~152
-# ms/chunk, compiled ~77 ms/chunk, output within ~1e-6. That is not batching paying off:
-# eager spends most of its time on many small elementwise kernels and their launch
-# overhead, which compiling fuses away. The cost is paid once per process: ~12 s with a
-# warm Inductor disk cache, ~50 s the first time on a machine. A model loaded again in the
-# same process (the worker's next job) reuses the compiled code in ~0.3 s.
+# ms/chunk, compiled ~77 ms/chunk, output within ~1e-6; at batch 2 (torch 2.11), ~184 vs
+# ~96 ms/chunk. That is not batching paying off: eager spends most of its time on many
+# small elementwise kernels and their launch overhead, which compiling fuses away. The
+# cost is paid once per process: ~14 s with a warm Inductor disk cache (~7 s of it Dynamo
+# tracing, which nothing caches), ~3 minutes the first time on a machine. A model loaded
+# again in the same process (the worker's next job) reuses the compiled code in ~0.3 s.
 #
-# "auto" compiles once a run is long enough to repay a warm compile: ~75 ms saved per
-# chunk against ~12 s is ~160 chunks, so 200 (about 13 minutes of speech at the 4 s
-# step). It always compiles when this process already has, since that costs nothing.
+# The warm figure holds only while both disk caches hit (see _compile_model). Compiling
+# forward whole, the istft graph break made Dynamo trace twice, and einops pack and an
+# in-graph sdpa_kernel made AOTAutograd skip its cache: warm compiles took 31-54 s, which
+# 580-chunk episodes barely repaid. The output is bit-identical either way.
+#
+# "auto" compiles once a run is long enough to repay a warm compile: ~88 ms saved per
+# chunk against ~14 s is ~160 chunks, so 200 (about 11 minutes of speech at the ~3.4 s
+# a chunk averaged on TV episodes). It always compiles when this process already has,
+# since that costs nothing.
 _COMPILE_MIN_CHUNKS = 200
 # (batch, dtype, device) shapes this process has compiled and run.
 _COMPILED_SHAPES: set = set()
@@ -100,19 +109,25 @@ def _deterministic():
 
 
 def _compile_model(model):
-    """torch.compile for one fixed chunk shape. A hook so tests can stand in for it."""
-    return torch.compile(model, dynamic=False)
+    """torch.compile for one fixed chunk shape. A hook so tests can stand in for it.
+
+    Only the model up to its istft is compiled (MelBandRoformer.masked_stft); the istft runs
+    eagerly after it. That is one graph with no break, so Dynamo traces it once rather than
+    tracing to the break and starting over. The attention-kernel restriction is held around
+    the call rather than entered inside the graph (see attend.sdpa_backends_for).
+    """
+    masked_stft = torch.compile(model.masked_stft, dynamic=False)
+
+    def run(batch):
+        with sdpa_backends_for(model, batch.device):
+            stft_repr = masked_stft(batch)
+        return model.reconstruct(stft_repr, batch)
+    return run
 
 
 def _can_compile(device: torch.device) -> bool:
     """Whether "auto" may compile here: CUDA with a Triton that Inductor can use."""
-    if device.type != "cuda" or _COMPILE_FAILED:
-        return False
-    try:
-        from torch.utils._triton import has_triton
-    except ImportError:
-        return False
-    return has_triton()
+    return not _COMPILE_FAILED and inductor_usable(device)
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +559,7 @@ class MbRoformerProcessor(VocalIsolationProcessor):
             logger.info(
                 "Compiling the vocal isolation model for this GPU. The first run on this "
                 "machine can take several minutes; later runs reuse the compile cache and "
-                "take under a minute. Pass --vocal_isolation_compile off to skip it.")
+                "take about 15 s. Pass --vocal_isolation_compile off to skip it.")
             logger.debug("Compiling for %d-chunk batches", self._pad_to)
         # The model's rotary embeddings (rotary_embedding_torch) fill a frequency cache on
         # their first call, and the cache's length is part of what a compiled graph assumes,

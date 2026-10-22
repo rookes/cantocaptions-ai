@@ -53,7 +53,10 @@ class PipelineConfig:
     files_per_group: int = 10
     threads: int = 0
     hf_token: Optional[str] = None
-    compile: bool = False
+    # torch.compile for the ASR decode step, on a static KV cache: about 3x faster
+    # transcription on CUDA, for ~0.8 GB more VRAM at batch 12. "auto" compiles when a run
+    # has enough full batches to repay it; see _asr_native._COMPILE_MIN_BATCHES.
+    compile: str = "auto"
     # A chunk whose generation spends the whole token budget without an EOS is a
     # repetition loop (a sung "da da da" decoding to 噔噔噔... until the cap); it is
     # re-generated once with this repetition_penalty. 0 disables the retry.
@@ -106,7 +109,7 @@ class PipelineConfig:
     # that pass segment_mode=None instead defer to the bundled model yaml.)
     vocal_isolation_segment_mode: str = "chunked"
     # torch.compile for chunked isolation: about 2x faster on CUDA after a one-off compile
-    # (~12 s per process, ~50 s the first time). "auto" compiles when the run is long
+    # (~14 s per process, ~3 minutes the first time). "auto" compiles when the run is long
     # enough to repay it, or the process already has; see vocal_isolation.py.
     vocal_isolation_compile: str = "auto"
     # Isolate VAD segments at most this many seconds apart as one stretch, with the real
@@ -177,6 +180,10 @@ class PipelineConfig:
     # (AlignProfile.split_gap, itself None for every shipped model, so: never); 0 forces it
     # off whatever the profile says. See pipeline/align_checks.py:split_gapped_cues.
     align_split_gap: Optional[float] = None
+    # Word aligner for the stretches ASR repair kept in another language, which the
+    # language's own align model cannot follow (pipeline/word_align.py); "none" keeps that
+    # model's timings. Loaded only when a file has such a stretch.
+    align_foreign_model: str = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 
     # Subtitle formatting
     # Line width before text is broken onto the next, in the script's cells (ScriptConfig.width:
@@ -526,7 +533,7 @@ CONFIG_SECTIONS: Mapping[str, Tuple[str, ...]] = MappingProxyType({
     "alignment": (
         "align_model", "interpolate_method", "no_align", "return_char_alignments",
         "align_batch_size", "align_compute_type", "align_char_substitution",
-        "align_substitutions", "align_split_gap",
+        "align_substitutions", "align_split_gap", "align_foreign_model",
     ),
     "cues": (
         "align_padding", "align_release", "align_merge_distance", "min_cue_duration",

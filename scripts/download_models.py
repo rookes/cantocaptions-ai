@@ -93,13 +93,18 @@ def _asr_repos(model_name=None, every=False) -> list:
 
 def _repair_repos(asr_repos: list) -> list:
     """The multilingual model ASR repair loads for speech in another language
-    (``asr_foreign_model``, default Qwen3-ASR). It loads only when a chunk needs it, but a
-    default run can need it, and the pipeline must still run offline then."""
+    (``asr_foreign_model``, default Qwen3-ASR), and the word aligner that times it. Each
+    loads only when a chunk needs it, but a default run can need them, and the pipeline must
+    still run offline then."""
     from cantocaptions_ai.pipeline.config import PipelineConfig
     from cantocaptions_ai.pipeline.model_profiles import get_model_profile
 
     hf_id = get_model_profile(PipelineConfig.asr_foreign_model).hf_id
-    return [hf_id] if _is_hub_id(hf_id) and hf_id not in asr_repos else []
+    repos = [hf_id] if _is_hub_id(hf_id) and hf_id not in asr_repos else []
+    # ...and the word aligner that times that speech (align_foreign_model).
+    if _is_hub_id(PipelineConfig.align_foreign_model):
+        repos.append(PipelineConfig.align_foreign_model)
+    return repos
 
 
 def _xet_status() -> str:

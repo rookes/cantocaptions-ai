@@ -212,6 +212,10 @@ class BatchedAsrStage(AsrStage):
         size) and mutate no shared state before the model call.
         """
 
+    def _plan_batches(self, n_jobs: int) -> None:
+        """Called before *n_jobs* segments are batched, for a backend whose setup depends on
+        the size of the run (the native backend's decode-step compile)."""
+
     def _segments(self, segs, texts, language: Optional[str] = None) -> List[SingleSegment]:
         from cantocaptions_ai.languages.yue.text import normalize_segment_text
         out = []
@@ -270,6 +274,7 @@ class BatchedAsrStage(AsrStage):
 
         if progress_callback is not None:
             progress_callback.set_total(len(jobs), unit="seg")
+        self._plan_batches(len(jobs))
 
         def infer_fn(batch):
             wavs = [buffers[idx]['segs'][sdx]['audio'] for idx, sdx in batch]
@@ -315,6 +320,7 @@ class BatchedAsrStage(AsrStage):
 
         if progress_callback is not None:
             progress_callback.set_total(len(jobs), unit="seg")
+        self._plan_batches(len(jobs))
 
         def infer_fn(batch):
             wavs = [input[i]['audio'] for i in batch]
@@ -405,7 +411,8 @@ def load_model(
     threads: int = 4,
     use_auth_token: Optional[Union[str, bool]] = None,
     batch_size: Optional[int] = None,
-    compile_enabled: bool = False,
+    compile: str = "off",
+    chunk_size: Optional[float] = None,
     print_progress: bool = False,
     verbose: bool = False,
     vram_checks: bool = True,
@@ -422,8 +429,9 @@ def load_model(
     ``processor`` may be passed pre-built (e.g. a merged LoRA checkpoint).
 
     Qwen3-ASR needs transformers' native qwen3_asr support (transformers>=5.13.0, a base
-    dependency); torch.compile is opt-in for it (compile_enabled /
-    --compile), a net loss by default -- see _asr_native._compile_and_warmup.
+    dependency). For it, ``compile`` ("auto", "on" or "off") compiles the decode step on
+    CUDA, with ``chunk_size`` sizing its static KV cache -- see _asr_native's
+    _COMPILE_MIN_BATCHES. The other backends ignore both.
     """
     backend = backend_for(model_name, language, cache_dir=download_root,
                           local_files_only=local_files_only)
@@ -443,7 +451,8 @@ def load_model(
         vram_headroom_mb=vram_headroom_mb, processor=processor, normalization=normalization,
     )
     if backend.name == "qwen3-asr":
-        kwargs["compile_enabled"] = compile_enabled
+        kwargs["compile"] = compile
+        kwargs["chunk_size"] = chunk_size
         kwargs["loop_retry_penalty"] = loop_retry_penalty
         kwargs["loop_stop"] = loop_stop
     return backend.load(**kwargs)

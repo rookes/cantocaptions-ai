@@ -2,6 +2,7 @@ import warnings
 from functools import wraps, lru_cache
 from packaging import version
 from collections import namedtuple
+from contextlib import nullcontext
 
 import torch
 from torch import nn, einsum
@@ -40,6 +41,20 @@ def _sdpa_backends(config: FlashAttentionConfig):
     if config.enable_math:
         backends.append(_SDPBackend.MATH)
     return _sdpa_kernel(backends)
+
+
+def sdpa_backends_for(module: nn.Module, device: torch.device):
+    """The SDPA restriction module's Attend layers apply on device, as one context manager.
+
+    A compiled caller holds it around the call, since Attend skips its own while compiling.
+    All of a model's Attend layers share one config; a model with none, or one whose Attend
+    layers don't use SDPA, gets a no-op.
+    """
+    attend = next((m for m in module.modules() if isinstance(m, Attend) and m.flash), None)
+    if attend is None:
+        return nullcontext()
+    config = attend.cuda_config if device.type == 'cuda' else attend.cpu_config
+    return _sdpa_backends(config) if config is not None else nullcontext()
 
 
 @lru_cache(maxsize=None)
@@ -136,6 +151,15 @@ class Attend(nn.Module):
         config = self.cuda_config if is_cuda else self.cpu_config
 
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, softmax_scale
+
+        if torch.compiler.is_compiling():
+            # The compiled caller holds the same restriction around the whole call
+            # (sdpa_backends_for): AOTAutograd's cache refuses a graph that enters
+            # sdpa_kernel, so the graph was rebuilt on every run.
+            return F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p = self.dropout if self.training else 0.
+            )
 
         with _sdpa_backends(config):
             out = F.scaled_dot_product_attention(

@@ -34,7 +34,8 @@ was asked for (`asr_language`), and the text before the processor folded a loop 
 (`raw_text`). `asr_repair/result.json` is the whole transcription again, after repair. Each
 repaired chunk carries `repair` (why), `pieces` (each stretch's own text, the multilingual
 model's reading, which was kept, and any text it replaced), `notes_at`, and `foreign_spans` (the
-other-language stretches alignment times by spreading). Writing a surviving
+other-language stretches the alignment stage has a word aligner time; their word times are
+not checkpointed and are recomputed on replay). Writing a surviving
 loop once and stripping broken characters re-run after every load (`asr_loop_trim` is not part of
 the checkpoint); see [asr-repair.md](asr-repair.md).
 

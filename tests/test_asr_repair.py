@@ -8,7 +8,10 @@ checkpoints with scripts/eval_hallucination.py; these tests pin the behaviour ar
 import numpy as np
 import pytest
 
+import torch
+
 from cantocaptions_ai.pipeline import asr_repair as ar
+from cantocaptions_ai.pipeline import word_align as wa
 from cantocaptions_ai.pipeline.asr_repair import (
     ChunkRepair,
     LoopRule,
@@ -370,15 +373,6 @@ class TestTimedNotes:
 
 # --- timing other-language text -------------------------------------------------------------
 
-class TestVoicedSpan:
-    def test_the_silence_around_speech_is_left_out(self):
-        t0, t1 = ar.voiced_span(100.0, _bursts((3, 8), total=12.0))
-        assert t0 == pytest.approx(103.0, abs=0.2) and t1 == pytest.approx(108.0, abs=0.2)
-
-    def test_silence_throughout_keeps_the_whole_stretch(self):
-        assert ar.voiced_span(5.0, np.zeros(4 * SR, dtype=np.float32)) == (5.0, 9.0)
-
-
 def _aligned(text, words, start=0.0, end=10.0):
     """A cue as _align_segment leaves it: *words* (token, start, end) in order."""
     return {"text": text, "start": start, "end": end,
@@ -386,66 +380,179 @@ def _aligned(text, words, start=0.0, end=10.0):
                       for w, a, b in words]}
 
 
-class TestSpreadForeign:
+def _unspaced_words(text, step=0.5):
+    """Words the way alignment makes them in unspaced text: a Latin run whole, every other
+    character (space, mark, Chinese character) on its own; times one *step* apart."""
+    tokens, pos = [], 0
+    for m in LATIN_WORD.finditer(text):
+        tokens += list(text[pos:m.start()]) + [m.group(0)]
+        pos = m.end()
+    tokens += list(text[pos:])
+    return [(t, i * step, i * step + step) for i, t in enumerate(tokens)]
+
+
+class TestPlaceForeign:
     TEXT = "佢以為我係你女朋友，Che peccato, pensavo che era tua ragazza. Mi vedevano"
+    SPAN = "Che peccato, pensavo che era tua ragazza. Mi vedevano"
 
-    def _cue(self):
-        # The align model's guesses: "Che" stretched over a second, a two-second gap.
-        return _aligned(self.TEXT, [
-            *[(c, 0.2 * i, 0.2 * i + 0.2) for i, c in enumerate("佢以為我係你女朋友")],
-            ("，", 1.8, 1.8),
-            ("Che", 2.0, 3.0), ("peccato", 5.0, 5.2), ("pensavo", 5.2, 5.3), ("che", 5.3, 5.4),
-            ("era", 5.4, 5.5), ("tua", 5.5, 5.6), ("ragazza", 5.6, 9.0), ("Mi", 9.0, 9.1),
-            ("vedevano", 9.1, 9.9)], end=10.0)
+    def _seg(self, times):
+        return {"text": self.TEXT, "foreign_spans": [
+            {"text": self.SPAN, "start": 5.0, "end": 15.0, "language": "Italian", "words": times}]}
 
-    def test_words_are_spread_and_cut_into_clauses(self):
-        seg = {"text": self.TEXT, "foreign_spans": [
-            {"text": "Che peccato, pensavo che era tua ragazza. Mi vedevano", "start": 2.0, "end": 9.0}]}
-        out = ar.spread_foreign(seg, [self._cue()])
-        # Too wide for a line, the sentence is also cut at its comma.
+    def test_the_aligners_times_replace_the_align_models_and_sentences_are_cut(self):
+        cue = _aligned(self.TEXT, _unspaced_words(self.TEXT), end=40.0)
+        times = [[10.0 + i, 10.5 + i] for i in range(9)]  # Che .. vedevano
+        out = ar.place_foreign(self._seg(times), [cue])
+        # Too wide for one line, the first sentence is also cut at its comma.
         assert [p["text"] for p in out] == [
             "佢以為我係你女朋友，Che peccato,", "pensavo che era tua ragazza.", "Mi vedevano"]
-        # The Cantonese keeps its own times; the Italian is evenly spread over 2-9 s.
-        assert out[0]["start"] == 0.0 and out[0]["words"][0]["end"] == 0.2
-        italian = [w for p in out for w in p["words"] if w["word"].isascii() and w["word"] != "，"]
-        assert italian[0]["start"] == 2.0 and italian[-1]["end"] == 9.0
-        gaps = [b["start"] - a["end"] for a, b in zip(italian, italian[1:])]
-        assert max(gaps) == pytest.approx(0.0, abs=0.002)
+        italian = [w for p in out for w in p["words"] if w["word"].isalpha() and w["word"].isascii()]
+        assert [(w["start"], w["end"]) for w in italian] == [tuple(t) for t in times]
         assert all("peak" not in w for w in italian)
+        # The Cantonese keeps its own times.
+        assert out[0]["words"][0] == cue["words"][0] and out[0]["start"] == 0.0
+        assert out[1]["start"] == 12.0 and out[1]["end"] == 16.5
         assert [p["release_from"] for p in out] == [p["end"] for p in out]
-        assert "".join(p["text"] for p in out).replace(" ", "") == self.TEXT.replace(" ", "")
 
-    def test_a_mark_that_is_a_word_of_its_own_still_ends_a_clause(self):
-        # Unspaced text: alignment makes every mark and space a word of its own.
-        text = "Si può scattare una foto? La festa?"
-        tokens = ["Si", " ", "può", " ", "scattare", " ", "una", " ", "foto", "?", " ", "La",
-                  " ", "festa", "?"]
-        cue = _aligned(text, [(t, float(i), float(i) + 0.5) for i, t in enumerate(tokens)], end=15.0)
-        seg = {"text": text, "foreign_spans": [{"text": text, "start": 0.0, "end": 6.0}]}
-        assert [p["text"] for p in ar.spread_foreign(seg, [cue])] == [
-            "Si può scattare una foto?", "La festa?"]
+    def test_a_word_the_aligner_could_not_time_keeps_its_own(self):
+        cue = _aligned(self.TEXT, _unspaced_words(self.TEXT), end=40.0)
+        times = [[10.0 + i, 10.5 + i] for i in range(9)]
+        times[1] = None
+        out = ar.place_foreign(self._seg(times), [cue])
+        peccato = next(w for p in out for w in p["words"] if w["word"] == "peccato")
+        assert "peak" in peccato
 
-    def test_a_sentence_too_wide_for_a_line_is_cut_at_commas(self):
-        text = "Rosé, até. Il nasce sulle gambe blu, la ragazza più rossa, e la cantina buia."
-        words = [m.group(0) for m in LATIN_WORD.finditer(text)]
-        cue = _aligned(text, [(w, float(i), float(i) + 0.5) for i, w in enumerate(words)], end=20.0)
-        seg = {"text": text, "foreign_spans": [{"text": text, "start": 0.0, "end": 12.0}]}
-        assert [p["text"] for p in ar.spread_foreign(seg, [cue])] == [
-            "Rosé, até.", "Il nasce sulle gambe blu,", "la ragazza più rossa,", "e la cantina buia."]
+    @pytest.mark.parametrize("times", [None, [[1.0, 2.0]] * 3])
+    def test_no_times_or_a_mismatch_leave_the_cues_alone(self, times):
+        cue = _aligned(self.TEXT, _unspaced_words(self.TEXT), end=40.0)
+        before = [dict(w) for w in cue["words"]]
+        out = ar.place_foreign(self._seg(times), [cue])
+        assert out == [cue] and cue["words"] == before
 
-    def test_no_spans_or_unmatched_text_leave_the_cues_alone(self):
-        cue = self._cue()
-        assert ar.spread_foreign({"text": self.TEXT}, [cue]) == [cue]
-        seg = {"text": self.TEXT, "foreign_spans": [{"text": "Non c'è", "start": 2.0, "end": 9.0}]}
-        assert ar.spread_foreign(seg, [cue]) == [cue]
-
-    def test_repair_records_the_spans_it_kept(self):
-        result, vads = _files(["", "你好"], [12.0, 5.0], {0: {}})
-        vads[0]["audio"] = _bursts((2, 9), total=12.0)
+    def test_repair_records_each_span_with_its_language_and_time(self):
+        result, vads = _files(["", "你好"], [12.0, 5.0])
         chunks = ar.plan_chunks([(result, vads)], RepairSettings(empty_needs_foreign=False))
         ar.run_language_check(chunks, lambda wavs: [_Text("Si può. Basta, dai.", language="Italian")],
                               NATIVE)
         ar.finish(chunks, [result], RepairSettings(), _join)
-        (span,) = result["segments"][0]["foreign_spans"]
-        assert span["text"] == "Si può. Basta, dai."
-        assert span["start"] == pytest.approx(2.0, abs=0.2) and span["end"] == pytest.approx(9.0, abs=0.2)
+        assert result["segments"][0]["foreign_spans"] == [
+            {"text": "Si può. Basta, dai.", "start": 0.0, "end": 12.0, "language": "Italian"}]
+
+
+class TestSpokenTokens:
+    def test_latin_runs_whole_everything_else_one_letter_at_a_time(self):
+        text = "Si può, 你好！OK? café"
+        assert [text[a:b] for a, b in wa.spoken_tokens(text)] == ["Si", "può", "你", "好", "OK", "café"]
+
+
+class _Inputs(dict):
+    def to(self, *args, **kwargs):
+        return self
+
+
+class _FakeAlignerProcessor:
+    """Records the prompts; decodes word k of each sample to (k, k + 0.5) seconds."""
+
+    def __init__(self):
+        self.conversations = []
+
+    def apply_chat_template(self, conversations, **kwargs):
+        self.conversations.extend(conversations)
+        return _Inputs(input_ids=torch.zeros((len(conversations), 3), dtype=torch.long))
+
+    def decode_forced_alignment(self, logits, input_ids, word_lists, timestamp_token_id):
+        return [[{"text": w, "start_time": k, "end_time": k + 0.5} for k, w in enumerate(words)]
+                for words in word_lists]
+
+
+class _FakeAlignerModel:
+    device, dtype = "cpu", torch.float32
+    config = type("C", (), {"timestamp_token_id": 7})()
+
+    def __call__(self, **kwargs):
+        return type("Out", (), {"logits": torch.zeros(1)})()
+
+
+class TestQwen3ForcedAligner:
+    def _aligner(self):
+        return wa.Qwen3ForcedAligner(_FakeAlignerModel(), _FakeAlignerProcessor(), batch_size=2)
+
+    def test_times_come_back_per_word_with_unreadable_words_untimed(self):
+        aligner = self._aligner()
+        audio = np.zeros(SR, dtype=np.float32)
+        out = aligner.align([wa.WordAlignJob(audio, ["Si", "—", "può"], "Italian"),
+                             wa.WordAlignJob(audio, ["Bonjour"], "French")])
+        assert out == [[(0, 0.5), None, (1, 1.5)], [(0, 0.5)]]
+        texts = [[c["text"] for c in conv[0]["content"][1:]] for conv in aligner.processor.conversations]
+        assert sorted(texts) == [["Bonjour"], ["Si", "può"]]
+
+    def test_unsupported_languages_and_overlong_audio_are_skipped(self):
+        aligner = self._aligner()
+        out = aligner.align([wa.WordAlignJob(np.zeros(SR, dtype=np.float32), ["Cześć"], "Polish"),
+                             wa.WordAlignJob(np.zeros(301 * SR, dtype=np.float32), ["Ciao"], "Italian")])
+        assert out == [[None], [None]] and not aligner.processor.conversations
+
+    def test_supported_languages_ignore_case(self):
+        aligner = self._aligner()
+        assert aligner.supports("italian") and aligner.supports("Cantonese")
+        assert not aligner.supports(None) and not aligner.supports("Polish")
+
+
+class TestUnpile:
+    def test_words_piled_on_one_instant_share_the_gap_around_them(self):
+        times = [(1.0, 1.32), (1.32, 1.32), (1.32, 1.32), (1.32, 1.32), (1.64, 2.0)]
+        assert wa.unpile(times, 5.0) == [(1.0, 1.32), (1.32, 1.427), (1.427, 1.533),
+                                         (1.533, 1.64), (1.64, 2.0)]
+
+    def test_a_pile_spreads_no_faster_than_a_word_in_four_tenths(self):
+        # Seven words piled at 9.0 s with nothing timed after them: fast speech, not slow.
+        times = [(1.0, 1.4)] + [(9.0, 9.0)] * 7
+        out = wa.unpile(times, 25.0)
+        assert out[1] == (9.0, 9.4) and out[-1] == (11.4, 11.8)
+
+    def test_ordinary_times_and_gaps_are_untouched(self):
+        times = [(0.5, 0.9), None, (1.0, 1.0), (1.4, 1.8)]
+        assert wa.unpile(times, 5.0) == times
+
+
+class TestTimeForeignSpans:
+    def test_spans_get_file_timeline_word_times_from_the_aligner(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from cantocaptions_ai.pipeline import stages, word_align
+
+        seen = {}
+
+        class Aligner:
+            def supports(self, language):
+                return language == "Italian"
+
+            def align(self, jobs):
+                seen["jobs"] = jobs
+                return [[(0.5 * k, 0.5 * k + 0.4) for k in range(len(j.words))] for j in jobs]
+
+        monkeypatch.setattr(word_align, "load_word_aligner", lambda *a, **k: Aligner())
+        span = {"text": "Si può.", "start": 12.0, "end": 14.0, "language": "Italian"}
+        items = [{"vad_segments": [{"start": 10.0, "end": 20.0, "audio": np.zeros(10 * SR)}],
+                  "result": {"segments": [{"text": "Si può.", "start": 10.0, "end": 20.0,
+                                           "foreign_spans": [span]}]}}]
+        cfg = SimpleNamespace(align_foreign_model="x", device="cpu", device_index=0,
+                              align_compute_type="float32", model_dir=None, model_cache_only=True,
+                              align_batch_size=2)
+        stages._time_foreign_spans(SimpleNamespace(cfg=cfg), items,
+                                   SimpleNamespace(status=lambda *a: None))
+        (job,) = seen["jobs"]
+        assert job.words == ["Si", "può"] and len(job.audio) == 2 * SR
+        assert span["words"] == [[12.0, 12.4], [12.5, 12.9]]
+
+    def test_none_turns_it_off(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from cantocaptions_ai.pipeline import stages, word_align
+
+        monkeypatch.setattr(word_align, "load_word_aligner",
+                            lambda *a, **k: pytest.fail("the word aligner must not load"))
+        items = [{"vad_segments": [], "result": {"segments": [
+            {"text": "x", "foreign_spans": [{"text": "x", "start": 0.0, "end": 1.0}]}]}}]
+        stages._time_foreign_spans(SimpleNamespace(cfg=SimpleNamespace(align_foreign_model="none")),
+                                   items, None)
