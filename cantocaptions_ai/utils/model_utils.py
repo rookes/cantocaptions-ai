@@ -190,6 +190,18 @@ class BatchExecutor:
                 torch.cuda.empty_cache()
 
 
+def inductor_usable(device) -> bool:
+    """Whether torch.compile's default backend can run on *device*: CUDA with a Triton that
+    Inductor can use (on Windows that is the ``compile`` extra)."""
+    if torch.device(device).type != "cuda":
+        return False
+    try:
+        from torch.utils._triton import has_triton
+    except ImportError:
+        return False
+    return has_triton()
+
+
 def run_adaptive_batches(
     jobs: List[Any],
     batch_size: Optional[int],

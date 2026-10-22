@@ -31,7 +31,8 @@ uv sync
 
 This installs all dependencies into an isolated virtual environment and pins exact versions; every ASR
 family (Qwen3-ASR, Whisper, CTC) runs on it. Torch is pulled from the PyTorch CUDA 12.8 index on Linux
-and Windows; the CPU build is used on macOS. Optional extras: `compile` (triton, for `--compile`),
+and Windows; the CPU build is used on macOS. Optional extras: `compile` (triton on Windows, for `--compile`
+and `vocal_isolation_compile`; Linux has it already),
 `ensemble`, `llm`, `flash-attn`, `proofread` (the hosted-LLM clients for `--proofread`), `ocr` (PaddleOCR, for
 image subtitle tracks; see "Embedded reference subtitles"), or `full` for all of them. `transformers_qwen` is the old name of
 `compile` and still works.
@@ -122,6 +123,14 @@ generated again once with `asr_loop_retry_penalty` (default 1.1, `0` turns it of
 happens. A chunk that starts repeating itself is stopped right there (`asr_loop_stop`) rather than left to run
 out its budget, which would also hold up every other chunk transcribed alongside it.
 
+On CUDA, Qwen3-ASR's decoding step is compiled with `torch.compile`, which makes transcription about three
+times faster. Compiling costs about 10 s per process (about a minute the first time on a machine), so with the
+default `compile = auto` it happens only when a run has a few full batches of audio to repay it. The compiled
+step keeps a fixed-size buffer for every chunk in the batch, about 0.8 GB more VRAM at `batch_size = 12`; if
+that runs out of memory, transcription carries on uncompiled. Even at a smaller `batch_size` it is still much
+faster than uncompiled, so lower `batch_size` rather than turning compiling off if VRAM is tight. `on` and `off`
+force it either way. It needs Triton: included on Linux; on Windows install the `compile` extra.
+
 ### ASR repair (`[asr_repair]`)
 
 After transcription, chunks that went wrong in a recognisable way are transcribed again:
@@ -181,9 +190,9 @@ transcribes the isolated vocals. Improves subtitle quality significantly, but is
 ~600 MB download on first use. Off by default.
 
 On CUDA the separator is compiled with `torch.compile`, which roughly halves its time once
-compiled. Compiling costs about 12 s per process (about 50 s the first time on a machine), so with
-the default `vocal_isolation_compile = auto` it happens only when there's enough audio to repay
-it (about 13 minutes of speech), or when the process has compiled it already. `on` and `off`
+compiled. Compiling costs about 15 s per process (a few minutes the first time on a machine), so
+with the default `vocal_isolation_compile = auto` it happens only when there's enough audio to
+repay it (about 10 minutes of speech), or when the process has compiled it already. `on` and `off`
 force it either way. It needs Triton: included on Linux; on Windows install the `compile` extra.
 Without it, isolation runs uncompiled.
 

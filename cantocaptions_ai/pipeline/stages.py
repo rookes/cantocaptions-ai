@@ -1155,7 +1155,8 @@ def _asr_load_kwargs(ctx: RunContext, **overrides) -> dict:
         threads=ctx.qwen_threads,
         use_auth_token=cfg.hf_token,
         batch_size=cfg.batch_size,
-        compile_enabled=cfg.compile,
+        compile=cfg.compile,
+        chunk_size=cfg.chunk_size,
         print_progress=cfg.print_progress,
         verbose=cfg.verbose,
         vram_checks=cfg.vram_checks,
@@ -1315,7 +1316,7 @@ class AsrRepairStage(_CachedAsrPath):
             timer.status(f"checking the language of {len(chunks)} chunk(s)")
             try:
                 with model_scope(load_model, cfg.asr_foreign_model,
-                                 **_asr_load_kwargs(ctx, compile_enabled=False)) as model:
+                                 **_asr_load_kwargs(ctx, compile="off")) as model:
                     if hasattr(model, "transcribe"):
                         hint = model._backend_language(cfg.language)
                         asr_repair.run_language_check(

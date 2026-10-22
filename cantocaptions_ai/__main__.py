@@ -20,6 +20,15 @@ _MEDIA_EXTENSIONS = {
 }
 
 
+def _compile_setting(value: str) -> str:
+    """--compile's value: auto, on or off. True and False, its values when it was a plain
+    switch, still mean on and off, so an older config file keeps working."""
+    lowered = value.strip().lower()
+    if lowered in ("auto", "on", "off"):
+        return lowered
+    return "on" if str2bool(value.strip()) else "off"
+
+
 def discover_media_files(directory: str, recursive: bool = False) -> list:
     """Return sorted list of media file paths found in *directory*.
 
@@ -95,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     inference_grp.add_argument("--attn_implementation", default=argparse.SUPPRESS, type=str, choices=["sdpa", "flash_attention_2", "eager"], help="attention implementation for transformer models; 'flash_attention_2' requires flash-attn to be installed")
     inference_grp.add_argument("--threads", type=optional_int, default=argparse.SUPPRESS, help="number of threads used by torch for CPU inference; supercedes MKL_NUM_THREADS/OMP_NUM_THREADS")
     inference_grp.add_argument("--hf_token", type=str, default=argparse.SUPPRESS, help="Hugging Face Access Token to access PyAnnote gated models")
-    inference_grp.add_argument("--compile", action="store_true", default=argparse.SUPPRESS, help="enable torch.compile for the native ASR backend (opt-in; benchmarked to be a net loss by default for this pipeline's variable-length VAD segments — see scripts/bench_asr_compile.py)")
+    inference_grp.add_argument("--compile", nargs="?", const="on", default=argparse.SUPPRESS, type=_compile_setting, choices=["auto", "on", "off"], help="torch.compile the ASR decode step (Qwen3-ASR on CUDA): about 3x faster transcription, for some extra VRAM, at a one-off cost of ~10 s per process (about a minute the first time on a machine). 'auto' compiles when a run has enough audio to repay that; a bare --compile means 'on'")
 
     output_grp = parser.add_argument_group("output")
     output_grp.add_argument("--output_dir", "-o", type=str, default=argparse.SUPPRESS, help="directory to save the outputs")
@@ -130,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     isol_grp.add_argument("--vocal_isolation_batch_size", default=argparse.SUPPRESS, type=int, help="number of fixed-size audio chunks the vocal isolation model processes per batch; larger values give little/no speedup on this model and can regress sharply (benchmark before increasing)")
     isol_grp.add_argument("--vocal_isolation_compute_type", default=argparse.SUPPRESS, type=str, choices=["float32", "float16"], help="compute type (weight dtype) for the vocal isolation model; float16 roughly halves its VRAM usage (falls back to float32 off CUDA)")
     isol_grp.add_argument("--vocal_isolation_segment_mode", default=argparse.SUPPRESS, type=str, choices=["whole", "chunked"], help="how the isolation model consumes a segment: 'whole' runs one pass at the segment's natural length (~2.5x faster, no chunk seams), 'chunked' slides a fixed 8s window with overlap-add. Must match what the downstream ASR model was trained on. Defaults to the bundled model config.")
-    isol_grp.add_argument("--vocal_isolation_compile", default=argparse.SUPPRESS, type=str, choices=["auto", "on", "off"], help="torch.compile the isolation model (chunked mode, CUDA): about 2x faster once compiled, at a one-off cost of ~12 s per process (~50 s the first time on a machine). 'auto' compiles when there is enough audio to repay that, or when this process has compiled it already")
+    isol_grp.add_argument("--vocal_isolation_compile", default=argparse.SUPPRESS, type=str, choices=["auto", "on", "off"], help="torch.compile the isolation model (chunked mode, CUDA): about 2x faster once compiled, at a one-off cost of ~15 s per process (a few minutes the first time on a machine). 'auto' compiles when there is enough audio to repay that, or when this process has compiled it already")
     isol_grp.add_argument("--vocal_isolation_span_gap", default=argparse.SUPPRESS, type=float, metavar="SECONDS", help="isolate VAD segments at most this far apart together, with the real audio between them as context instead of reflected padding at each segment's edges (chunked mode). About 13%% less isolation work at the default; 0 isolates every segment on its own")
     isol_grp.add_argument("--vocal_isolation", "-vi", choices=["fast", "quality"], default=argparse.SUPPRESS, help="shorthand for --vocal_isolation_compute_type (fast=float16, quality=float32). Does NOT affect --vocal_isolation_batch_size (see its own help text: larger batches give little/no speedup on this model and can regress sharply). The granular --vocal_isolation_compute_type flag always wins if both are given.")
 

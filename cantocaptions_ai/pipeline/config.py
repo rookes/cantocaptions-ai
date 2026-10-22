@@ -53,7 +53,10 @@ class PipelineConfig:
     files_per_group: int = 10
     threads: int = 0
     hf_token: Optional[str] = None
-    compile: bool = False
+    # torch.compile for the ASR decode step, on a static KV cache: about 3x faster
+    # transcription on CUDA, for ~0.8 GB more VRAM at batch 12. "auto" compiles when a run
+    # has enough full batches to repay it; see _asr_native._COMPILE_MIN_BATCHES.
+    compile: str = "auto"
     # A chunk whose generation spends the whole token budget without an EOS is a
     # repetition loop (a sung "da da da" decoding to 噔噔噔... until the cap); it is
     # re-generated once with this repetition_penalty. 0 disables the retry.
@@ -106,7 +109,7 @@ class PipelineConfig:
     # that pass segment_mode=None instead defer to the bundled model yaml.)
     vocal_isolation_segment_mode: str = "chunked"
     # torch.compile for chunked isolation: about 2x faster on CUDA after a one-off compile
-    # (~12 s per process, ~50 s the first time). "auto" compiles when the run is long
+    # (~14 s per process, ~3 minutes the first time). "auto" compiles when the run is long
     # enough to repay it, or the process already has; see vocal_isolation.py.
     vocal_isolation_compile: str = "auto"
     # Isolate VAD segments at most this many seconds apart as one stretch, with the real

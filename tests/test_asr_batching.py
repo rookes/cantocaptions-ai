@@ -462,3 +462,122 @@ class TestLoopStop(unittest.TestCase):
         self.assertFalse(stop(rows([1] * 3 + phrase * 4 + [2] * 7))[0])  # 4 copies, then on
         self.assertFalse(stop(rows([5] + [99] * 30))[0])      # finished: padding repeats
         self.assertFalse(stop(rows(list(range(30))))[0])
+
+
+class _KwargsModel(_FakeModel):
+    """Records each generate() call's row count and whether it asked for the static cache.
+    ``fail_static`` raises once on the first static call: an OOM, or another error."""
+
+    def __init__(self, fail_static=None):
+        super().__init__(fail_first_call=False)
+        self.seen = []  # (rows, max_cache_len or None, repetition_penalty or None)
+        self.fail_static = fail_static
+
+    def generate(self, **kwargs):
+        static = kwargs.get("cache_implementation") == "static"
+        self.seen.append((int(kwargs["input_ids"].shape[0]),
+                          kwargs.get("max_cache_len") if static else None,
+                          kwargs.get("repetition_penalty")))
+        if static and self.fail_static is not None:
+            error, self.fail_static = self.fail_static, None
+            raise error
+        return super().generate(**kwargs)
+
+
+_REAL_COMPILE_BLOCKER = QwenPipelineNative._compile_blocker
+
+
+class TestAsrDecodeCompile(unittest.TestCase):
+    """--compile: only full batches of the configured size take the static cache (and with
+    it the compiled decode step), so no other batch size ever builds a graph of its own."""
+
+    def setUp(self):
+        from unittest import mock
+
+        from cantocaptions_ai.pipeline import _asr_native
+        self._native = _asr_native
+        # CPU tests: pretend CUDA and Triton are there.
+        patch = mock.patch.object(QwenPipelineNative, "_compile_blocker", return_value=None)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(setattr, _asr_native, "_COMPILE_FAILED", False)
+
+    def _run(self, n, compile="auto", batch_size=2, model=None, **kwargs):
+        model = model or _KwargsModel()
+        pipe = QwenPipelineNative(model=model, processor=_FakeProcessor(), device="cpu",
+                                  language="yue", batch_size=batch_size, compile=compile,
+                                  **kwargs)
+        result = pipe.process(_make_marked_segments(list(range(n))))
+        self.assertEqual([s["text"] for s in result["segments"]], [str(m) for m in range(n)])
+        return model, pipe
+
+    def test_auto_compiles_full_batches_and_leaves_the_short_last_one(self):
+        model, pipe = self._run(7)  # 3 full batches of 2, then 1
+        self.assertEqual([rows for rows, _, _ in model.seen], [2, 2, 2, 1])
+        self.assertTrue(all(cache for rows, cache, _ in model.seen if rows == 2))
+        self.assertIsNone(model.seen[-1][1])
+        self.assertEqual(len({cache for _, cache, _ in model.seen if cache}), 1,
+                         "every compiled call shares one cache length")
+
+    def test_auto_skips_a_run_too_short_to_repay_it(self):
+        model, pipe = self._run(5)  # 2 full batches
+        self.assertTrue(all(cache is None for _, cache, _ in model.seen))
+        self.assertIsNone(pipe._compiled_rows)
+
+    def test_on_compiles_even_a_short_run_and_off_never_does(self):
+        model, _ = self._run(2, compile="on")
+        self.assertIsNotNone(model.seen[0][1])
+        model, _ = self._run(8, compile="off")
+        self.assertTrue(all(cache is None for _, cache, _ in model.seen))
+
+    def test_a_loop_retry_runs_uncompiled(self):
+        model = _LoopingModel()
+        seen = []
+        real = model.generate
+        model.generate = lambda **kw: seen.append(
+            (int(kw["input_ids"].shape[0]), kw.get("cache_implementation"))) or real(**kw)
+        pipe = QwenPipelineNative(model=model, processor=_FakeProcessor(), device="cpu",
+                                  language="yue", batch_size=2, compile="on")
+        pipe.process(_make_marked_segments([2, 3]))
+        self.assertEqual(seen, [(2, "static"), (1, None)])
+
+    def test_the_cache_is_sized_for_a_chunk_size_chunk(self):
+        from cantocaptions_ai.pipeline._asr_native import _TOKENS_PER_SECOND
+        model, _ = self._run(2, compile="on", chunk_size=40)
+        need = _FakeProcessor.N_INPUT + 40 * _TOKENS_PER_SECOND
+        self.assertEqual(model.seen[0][1], need)
+
+    def test_out_of_memory_reruns_the_batch_uncompiled_at_the_same_size(self):
+        model = _KwargsModel(fail_static=RuntimeError("CUDA out of memory. Tried to allocate"))
+        _, pipe = self._run(6, model=model)
+        self.assertEqual([(rows, bool(cache)) for rows, cache, _ in model.seen],
+                         [(2, True), (2, False), (2, False), (2, False)])
+        self.assertIsNone(pipe._compiled_rows)
+        self.assertFalse(self._native._COMPILE_FAILED)
+
+    def test_a_broken_compile_falls_back_for_the_rest_of_the_process(self):
+        model = _KwargsModel(fail_static=RuntimeError("triton: no compiler"))
+        with self.assertLogs(self._native.logger.name, "WARNING"):
+            self._run(6, model=model)
+        self.assertEqual([bool(cache) for _, cache, _ in model.seen], [True, False, False, False])
+        self.assertTrue(self._native._COMPILE_FAILED)
+
+    def test_unknown_setting_is_an_error(self):
+        with self.assertRaises(ValueError):
+            QwenPipelineNative(model=_KwargsModel(), processor=_FakeProcessor(), device="cpu",
+                               language="yue", batch_size=2, compile="yes")
+
+    def test_the_blocker_keeps_a_cpu_run_uncompiled(self):
+        from unittest import mock
+        with mock.patch.object(QwenPipelineNative, "_compile_blocker", _REAL_COMPILE_BLOCKER):
+            model, pipe = self._run(8, compile="on")
+        self.assertTrue(all(cache is None for _, cache, _ in model.seen))
+
+
+class TestCompileSetting(unittest.TestCase):
+    def test_old_true_false_values_still_parse(self):
+        from cantocaptions_ai.__main__ import _compile_setting
+        self.assertEqual([_compile_setting(v) for v in ("auto", "ON", "off", "True", "False")],
+                         ["auto", "on", "off", "on", "off"])
+        with self.assertRaises(ValueError):
+            _compile_setting("maybe")
