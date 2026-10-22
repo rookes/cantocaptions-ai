@@ -72,7 +72,8 @@ _SPAN_MAX_S = 120.0
 # The warm figure holds only while both disk caches hit (see _compile_model). Compiling
 # forward whole, the istft graph break made Dynamo trace twice, and einops pack and an
 # in-graph sdpa_kernel made AOTAutograd skip its cache: warm compiles took 31-54 s, which
-# 580-chunk episodes barely repaid. The output is bit-identical either way.
+# 580-chunk episodes barely repaid. The output is bit-identical either way. How to check a
+# compile's cache hits, and the full breakdown: docs/torch-compile.md.
 #
 # "auto" compiles once a run is long enough to repay a warm compile: ~88 ms saved per
 # chunk against ~14 s is ~160 chunks, so 200 (about 11 minutes of speech at the ~3.4 s

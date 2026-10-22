@@ -154,6 +154,7 @@ def _split_label(raw: str) -> Tuple[Optional[str], Optional[str]]:
 #
 # "auto" compiles when a run has _COMPILE_MIN_BATCHES full batches: each saves ~6.6 s at
 # batch 12 against ~10 s for a warm compile (a first-ever one, ~50 s, takes ~8 to repay).
+# Full measurements and the rejected approaches: docs/torch-compile.md.
 _COMPILE_MIN_BATCHES = 3
 _COMPILE_SETTINGS = ("auto", "on", "off")
 # Set when a compiled generate fails other than by running out of memory (e.g. a broken
