@@ -340,6 +340,39 @@ class QwenPipelineNative(BatchedAsrStage):
             list(range(len(wavs))), infer_fn, reporter=progress_callback)
         return out
 
+    def score_alternatives(self, items: List[dict], language: Optional[str] = None,
+                           progress_callback=None) -> List[list]:
+        """How likely the model finds alternative wordings at spots of a transcript.
+
+        Each item is ``{"audio": wav, "text": transcript, "spots": [asr_scoring.Spot]}``;
+        returns, per item, one ``asr_scoring.SpotScore`` per scorable spot (the joint
+        log-probability of the transcript's own wording and of each alternative, each
+        followed by the same few transcript characters). Items run one at a time: each is
+        one forward pass plus one small one per spot (see asr_scoring).
+        """
+        from cantocaptions_ai.pipeline import asr_scoring
+
+        lang = self._backend_language(language or self.language)
+        if getattr(self, "_label_prefix", None) is None and items:
+            # Does this model write `language X<asr_text>` before its text (stock Qwen3-ASR)
+            # or not (the fine-tuned model)? Asked once, from its own output.
+            inputs = self.processor.apply_transcription_request(audio=[items[0]["audio"]], language=lang)
+            inputs = inputs.to(self.model.device, self.model.dtype)
+            with torch.inference_mode():
+                head = self.model.generate(**inputs, max_new_tokens=8, do_sample=False)
+            raw = self.processor.tokenizer.decode(head[0, inputs["input_ids"].shape[1]:],
+                                                  skip_special_tokens=False)
+            self._label_prefix = asr_scoring.label_prefix(raw, lang)
+            del inputs, head
+        out = []
+        for item in items:
+            out.append(asr_scoring.score_spots(self.model, self.processor, item["audio"], item["text"],
+                                               item["spots"], lang, self._label_prefix)
+                       if item["spots"] and item["text"] else [])
+            if progress_callback is not None:
+                progress_callback.advance(1)
+        return out
+
     @property
     def compiled(self) -> bool:
         """Whether this model's full batches run the compiled decode step."""

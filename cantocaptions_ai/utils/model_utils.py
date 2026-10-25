@@ -738,12 +738,23 @@ def _offline_error_types() -> Tuple[type, ...]:
                 types.append(exc)
     except Exception:  # pragma: no cover - requests is a hub transitive dep
         pass
+    try:
+        # huggingface_hub >= 1.0 talks to the hub through httpx, not requests.
+        import httpx
+        types.append(httpx.TransportError)
+    except Exception:  # pragma: no cover - httpx is a hub >= 1.0 dependency
+        pass
     return tuple(types)
 
 
 def _looks_offline(exc: BaseException) -> bool:
     """True if *exc* indicates a connectivity failure we can retry against the cache."""
     if isinstance(exc, _offline_error_types()):
+        return True
+    # huggingface_hub 1.x's retry loop closes its shared httpx client on a ConnectError and
+    # then retries on that same closed client (fixed in hub 2.x, which transformers 5.13
+    # doesn't allow), so one dropped connection surfaces as this RuntimeError.
+    if isinstance(exc, RuntimeError) and "client has been closed" in str(exc):
         return True
     # transformers wraps connectivity problems in a plain OSError.
     if isinstance(exc, OSError):

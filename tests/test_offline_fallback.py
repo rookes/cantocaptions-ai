@@ -31,6 +31,14 @@ class TestLooksOffline(unittest.TestCase):
         self.assertTrue(_looks_offline(requests.exceptions.ConnectionError("x")))
         self.assertTrue(_looks_offline(requests.exceptions.Timeout("x")))
 
+    def test_httpx_errors_are_offline(self):
+        import httpx
+        self.assertTrue(_looks_offline(httpx.ConnectError("x")))
+        self.assertTrue(_looks_offline(httpx.ReadTimeout("x")))
+        # huggingface_hub 1.x retries a ConnectError on the client it has just closed.
+        self.assertTrue(_looks_offline(RuntimeError("Cannot send a request, as the client has been closed.")))
+        self.assertFalse(_looks_offline(RuntimeError("CUDA out of memory")))
+
     def test_transformers_oserror_message_sniff(self):
         # transformers wraps connectivity problems in a plain OSError.
         self.assertTrue(_looks_offline(OSError("We couldn't connect to 'https://huggingface.co'")))
