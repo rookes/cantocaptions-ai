@@ -148,3 +148,11 @@ def test_partition_by_cache_treats_stale_checkpoints_as_missing(stage, tmp_path)
     stage.run([_item()], debug_dir=d)
     cached, to_compute = partition_by_cache([_item(language="zh")], stage, d)
     assert cached == {} and [i for i, _ in to_compute] == [0]
+
+
+def test_debug_stem_drops_what_windows_cannot_enter():
+    from cantocaptions_ai.utils.checkpoints import debug_stem
+    # Windows strips a trailing dot from a directory it creates, then cannot find it.
+    assert debug_stem("Frieren - S01E02 - It Didn't Have To Be Magic...") == "Frieren - S01E02 - It Didn't Have To Be Magic"
+    assert debug_stem(" s1 /ep01. ") == "s1/ep01"
+    assert debug_stem("ep01") == "ep01"

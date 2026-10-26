@@ -260,6 +260,12 @@ ANCHOR_MIN_CHARS = 4
 # Consecutive windows overlap by this much, so a line near a window's far edge gets a second,
 # better-centred look rather than being judged from the edge.
 ANCHOR_WINDOW_OVERLAP = 20.0
+# Mode adjust: a line with fewer Chinese characters than this gives the align model too little
+# to place it on its own (Mark哥, Mr. Ng, 嗱), so it moves at most WEAK_LINE_LEASH from where
+# the subtitle put it, not the full leash. On Court! E01 such lines were pulled 1.2 s off
+# good hand timings into a neighbour's pause.
+WEAK_LINE_CJK = 3
+WEAK_LINE_LEASH = 0.5
 
 # Anchor review: forced-align blocks of this many consecutive anchors, stepping by the stride,
 # and drop an interior anchor that moves further than the tolerance. See verify_anchors.
@@ -834,6 +840,23 @@ def acquire(
     overlap = min(ANCHOR_WINDOW_OVERLAP, window_seconds / 2.0)
     anchors: List[Tuple[int, float, float, float]] = []
     p, t = 0, timeline.file_start
+
+    def usable(q: int, got, t: float, t1: float) -> List[Tuple[int, float, float, float]]:
+        """The anchors a probe from line *q* actually yields."""
+        out = []
+        for k, start, end, score in got:
+            i = q + k
+            if end > t1 - commit_margin and t1 < timeline.file_end:
+                break     # only half seen; the next window gets a proper look at it
+            if not (score == score) or score < ANCHOR_MIN_SCORE:
+                continue  # NaN fails every comparison silently, so reject it explicitly
+            if len(lines[i].text) < ANCHOR_MIN_CHARS:
+                continue
+            if not _bounded_timing(lines[i], start, end, floor=t).placed:
+                continue  # implausibly slow for its text: not something to anchor on
+            out.append((i, start, end, score))
+        return out
+
     while p < len(lines) and t < timeline.file_end - 0.5:
         t1 = min(t + window_seconds, timeline.file_end)
         frames = max(int(round((t1 - t) * timeline.frame_rate)), 1)
@@ -844,31 +867,22 @@ def acquire(
                 break
             hi = min(len(lines), q + _offer(aligner.tokens_per_line, q, t1 - t, frames))
             got = aligner.run(q, hi, t, t1, free=True)
-            if got:
-                mass = sum(len(lines[q + k].text) * s for k, _, _, s in got if s == s)
-                quality = [s for _, _, _, s in got if s == s]
-                quality = float(np.mean(quality)) if quality else 0.0
+            quality = [s for _, _, _, s in got if s == s]
+            quality = float(np.mean(quality)) if quality else 0.0
+            found_here = usable(q, got, t, t1) if quality >= ACQUIRE_MIN_SCORE else []
+            if found_here:
+                mass = sum(len(lines[i].text) * s for i, _, _, s in found_here)
                 if best is None or mass > best[0]:
-                    best = (mass, quality, q, got)
+                    best = (mass, found_here)
             # The alternatives are a re-acquisition search; they are only worth their
-            # trellises once the pointer itself has clearly failed.
-            if offset == 0 and best is not None and best[1] >= ACQUIRE_MIN_SCORE:
+            # trellises once the pointer itself has clearly failed. A probe that scores well
+            # on average but yields no anchor has failed too: on Court! E01 a lone 哎 at the
+            # pointer let one common phrase (好啦) match far down every window, so the search
+            # never looked further down the transcript and went blind for 18 minutes.
+            if offset == 0 and best is not None:
                 break
 
-        found = []
-        if best is not None and best[1] >= ACQUIRE_MIN_SCORE:
-            _mass, _quality, q, got = best
-            for k, start, end, score in got:
-                i = q + k
-                if end > t1 - commit_margin and t1 < timeline.file_end:
-                    break     # only half seen; the next window gets a proper look at it
-                if not (score == score) or score < ANCHOR_MIN_SCORE:
-                    continue  # NaN fails every comparison silently, so reject it explicitly
-                if len(lines[i].text) < ANCHOR_MIN_CHARS:
-                    continue
-                if not _bounded_timing(lines[i], start, end, floor=t).placed:
-                    continue  # implausibly slow for its text: not something to anchor on
-                found.append((i, start, end, score))
+        found = best[1] if best is not None else []
         if not found:
             stats["blind"] += 1
             t = max(t1 - overlap, t + MIN_LINE_STEP) if t1 < timeline.file_end                 else timeline.file_end
@@ -1566,7 +1580,7 @@ def _assign_lines_adjust(
         fill(lines, aligner, lo, hi, t0, t1, out, stats)
         if progress_callback is not None:
             progress_callback.advance(hi - lo)
-    reverted = clamp_to_prior(out, prior, leash, stats)
+    reverted = clamp_to_prior(out, prior, leash, stats, lines)
     if reverted:
         logger.info(
             "%d cue(s) were re-timed further than %.1fs from the transform and were "
@@ -1607,16 +1621,28 @@ def bracket_blocks(
     return out
 
 
+def weak_line(text: str) -> bool:
+    """A line the align model has too little of to place on its own: fewer than
+    WEAK_LINE_CJK Chinese characters (a name with 哥, an English line, a lone interjection)."""
+    return sum(1 for ch in text if _is_cjk(ch)) < WEAK_LINE_CJK
+
+
+def line_tolerance(text: str, tolerance: float) -> float:
+    """How far mode adjust lets the audio move a line from where the subtitle had it."""
+    return min(tolerance, WEAK_LINE_LEASH) if weak_line(text) else tolerance
+
+
 def clamp_to_prior(
     out: List[Optional[LineTiming]], prior: Sequence[LineTiming],
-    tolerance: float, stats: dict,
+    tolerance: float, stats: dict, lines: Optional[Sequence[TranscriptLine]] = None,
 ) -> int:
     """Revert any line the audio placed further than *tolerance* from its prior.
 
     A line ``fill`` could not place from the audio (isolated, unreadable, out of vocabulary)
     goes back to the prior too, whatever the distance: the transform is real evidence from
     hundreds of anchors, while an interpolation between two neighbours is a guess. Both keep a
-    reason, so neither disappears from suspect.srt.
+    reason, so neither disappears from suspect.srt. With *lines*, a weak line (``weak_line``)
+    gets the tighter WEAK_LINE_LEASH.
     """
     reverted = 0
     for i, timing in enumerate(out):
@@ -1627,7 +1653,8 @@ def clamp_to_prior(
                                 reason=prior[i].reason or REASON_OFF_PRIOR)
             reverted += 1
             continue
-        off = abs(timing.start - prior[i].start) > tolerance
+        limit = line_tolerance(lines[i].text, tolerance) if lines is not None else tolerance
+        off = abs(timing.start - prior[i].start) > limit
         if not off and timing.reason is None:
             continue
         out[i] = LineTiming(
@@ -2544,7 +2571,7 @@ def hold_to_placement(
         if tolerance is None or placement is None:
             continue
         start, end = placement
-        if abs(seg["start"] - start) <= tolerance:
+        if abs(seg["start"] - start) <= line_tolerance(seg.get("text", ""), tolerance):
             continue
         nxt = segments[k + 1]["start"] if k + 1 < len(segments) else None
         if nxt is not None and end > nxt - align_padding:
@@ -2575,13 +2602,15 @@ def enforce_cue_order(segments: List[dict]) -> int:
 
     Order is fixed by moving the later cue *forward*, never by sorting: the transcript's line
     order is authoritative, so a cue that appears to precede its predecessor is a misplacement
-    to be clamped, not evidence that the two should swap.
+    to be clamped, not evidence that the two should swap. A clamped cue keeps a displayable
+    duration (MIN_VISIBLE_DURATION): a zero-length cue is as invalid as an out-of-order one, and
+    on Court! E01 a clamped cue came out 1697.00 --> 1697.00.
     """
     moved = 0
     for prev, seg in zip(segments, segments[1:]):
         if seg["start"] < prev["start"]:
             seg["start"] = prev["start"]
-            seg["end"] = max(seg["end"], seg["start"])
+            seg["end"] = round(max(seg["end"], seg["start"] + MIN_VISIBLE_DURATION), 3)
             moved += 1
     if moved:
         logger.warning(

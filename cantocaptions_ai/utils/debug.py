@@ -44,7 +44,8 @@ def _stem(name: str) -> str:
     on this: transcribe.py decides whether to skip a stage from `_debug_stage_exists`, so
     a name only one side derived would make "cached" and "loadable" disagree.
     """
-    return name.strip()
+    from cantocaptions_ai.utils.checkpoints import debug_stem
+    return debug_stem(name)
 
 
 def _leaf(name: str) -> str:

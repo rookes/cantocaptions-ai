@@ -353,17 +353,8 @@ class QwenPipelineNative(BatchedAsrStage):
         from cantocaptions_ai.pipeline import asr_scoring
 
         lang = self._backend_language(language or self.language)
-        if getattr(self, "_label_prefix", None) is None and items:
-            # Does this model write `language X<asr_text>` before its text (stock Qwen3-ASR)
-            # or not (the fine-tuned model)? Asked once, from its own output.
-            inputs = self.processor.apply_transcription_request(audio=[items[0]["audio"]], language=lang)
-            inputs = inputs.to(self.model.device, self.model.dtype)
-            with torch.inference_mode():
-                head = self.model.generate(**inputs, max_new_tokens=8, do_sample=False)
-            raw = self.processor.tokenizer.decode(head[0, inputs["input_ids"].shape[1]:],
-                                                  skip_special_tokens=False)
-            self._label_prefix = asr_scoring.label_prefix(raw, lang)
-            del inputs, head
+        if items:
+            self._ensure_label_prefix(items[0]["audio"], lang)
         out = []
         for item in items:
             out.append(asr_scoring.score_spots(self.model, self.processor, item["audio"], item["text"],
@@ -372,6 +363,38 @@ class QwenPipelineNative(BatchedAsrStage):
             if progress_callback is not None:
                 progress_callback.advance(1)
         return out
+
+    def score_texts(self, items: List[dict], language: Optional[str] = None) -> List[list]:
+        """How likely the model finds each whole candidate transcript of a clip.
+
+        Each item is ``{"audio": wav, "texts": [str]}``; returns, per item, one
+        ``(joint log-probability, tokens)`` per text, end of text included
+        (``asr_scoring.score_texts``). Only texts of the same clip are comparable.
+        """
+        from cantocaptions_ai.pipeline import asr_scoring
+
+        lang = self._backend_language(language or self.language)
+        if items:
+            self._ensure_label_prefix(items[0]["audio"], lang)
+        return [asr_scoring.score_texts(self.model, self.processor, item["audio"], item["texts"], lang,
+                                        self._label_prefix) if item["texts"] else []
+                for item in items]
+
+    def _ensure_label_prefix(self, wav, lang: str) -> None:
+        """Does this model write `language X<asr_text>` before its text (stock Qwen3-ASR) or
+        not (the fine-tuned model)? Asked once, from its own output."""
+        from cantocaptions_ai.pipeline import asr_scoring
+
+        if getattr(self, "_label_prefix", None) is not None:
+            return
+        inputs = self.processor.apply_transcription_request(audio=[wav], language=lang)
+        inputs = inputs.to(self.model.device, self.model.dtype)
+        with torch.inference_mode():
+            head = self.model.generate(**inputs, max_new_tokens=8, do_sample=False)
+        raw = self.processor.tokenizer.decode(head[0, inputs["input_ids"].shape[1]:],
+                                              skip_special_tokens=False)
+        self._label_prefix = asr_scoring.label_prefix(raw, lang)
+        del inputs, head
 
     @property
     def compiled(self) -> bool:

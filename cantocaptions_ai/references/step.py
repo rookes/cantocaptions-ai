@@ -43,7 +43,8 @@ def _settings(cfg, media: str) -> dict:
 
 
 def _checkpoint_dir(debug_dir: str, name: str) -> str:
-    return os.path.join(debug_dir, name.strip(), CHECKPOINT)
+    from cantocaptions_ai.utils.checkpoints import debug_stem
+    return os.path.join(debug_dir, debug_stem(name), CHECKPOINT)
 
 
 def _save_checkpoint(cfg, name: str, media: str, result) -> None:

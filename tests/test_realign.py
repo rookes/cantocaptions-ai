@@ -962,6 +962,13 @@ class TestCueOrder(unittest.TestCase):
         segs = [{"start": 1.0, "end": 2.0}, {"start": 2.0, "end": 3.0}]
         self.assertEqual(enforce_cue_order(segs), 0)
 
+    def test_a_clamped_cue_keeps_a_visible_duration(self):
+        # Court! E01: 「二人當時關係友好」 came back before its predecessor, ending where that one
+        # started, and the clamp made it 1697.00 --> 1697.00.
+        segs = [{"start": 1697.0, "end": 1699.36}, {"start": 1694.65, "end": 1697.0}]
+        enforce_cue_order(segs)
+        self.assertGreater(segs[1]["end"], segs[1]["start"])
+
     def test_the_result_is_always_non_decreasing(self):
         segs = [{"start": s, "end": s + 0.1} for s in (5.0, 4.0, 4.5, 3.0, 9.0)]
         enforce_cue_order(segs)
@@ -1071,6 +1078,31 @@ class TestAcquireProgress(unittest.TestCase):
         )
         self.assertEqual(len(timings), 8)
         self.assertEqual([t.index for t in timings], list(range(8)))
+
+    def test_a_probe_with_no_usable_anchor_does_not_stop_the_search(self):
+        # Court! E01: a lone 哎 at the pointer, and one short common phrase matched far down the
+        # window, gave the pointer's probe a passing average but no anchor. The search must
+        # still look further down the transcript instead of going blind window after window.
+        class Timeline:
+            file_start, file_end, frame_rate = 0.0, 400.0, 25.0
+
+        class Stub:
+            timeline = Timeline()
+            tokens_per_line = [[1, 2, 3, 4]] * 12
+
+            def run(self, lo, hi, t0, t1, free):
+                if lo == 0:      # 哎 unheard, then 得啦 heard confidently: too short to anchor
+                    return [(0, t0 + 0.1, t0 + 0.2, 0.05), (1, t0 + 50.0, t0 + 50.6, 0.99)]
+                if lo == 3:
+                    return [(0, t0 + 2.0, t0 + 3.5, 0.95), (1, t0 + 4.0, t0 + 5.5, 0.93)]
+                return []
+
+        lines = [TranscriptLine(0, "哎"), TranscriptLine(1, "得啦"), TranscriptLine(2, "吖")] + [
+            TranscriptLine(i, "轉去邊號庭啊") for i in range(3, 12)]
+        stats = dict(blind=0)
+        anchors = acquire(lines, Stub(), window_seconds=120.0, commit_margin=10.0, stats=stats)
+        self.assertEqual([a[0] for a in anchors[:2]], [3, 4])
+        self.assertAlmostEqual(anchors[0][1], 2.0)
 
     def test_a_window_smaller_than_the_overlap_still_advances(self):
         # ANCHOR_WINDOW_OVERLAP is 20s; a 6s window must not step time backwards.

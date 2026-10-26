@@ -115,6 +115,33 @@ def score_spots(model, processor, wav, text: str, spots: Sequence[Spot], languag
     return results
 
 
+def score_texts(model, processor, wav, texts: Sequence[str], language: str,
+                prefix: str = "") -> List[Tuple[float, int]]:
+    """(joint log-probability, tokens) of each whole transcript of *wav*, end of text included,
+    so a candidate that stops early pays for it. One forward pass over the prompt; every text
+    then branches off its cache. Used to weigh candidate transcriptions of a clip that has no
+    transcript yet (a line the subtitles are missing); compare texts of one clip only."""
+    import torch
+
+    tok = processor.tokenizer
+    inputs = processor.apply_transcription_request(audio=[wav], language=language)
+    inputs = inputs.to(model.device, model.dtype)
+    prompt = inputs["input_ids"]
+    if prefix:
+        pre = tok(prefix, add_special_tokens=False, return_tensors="pt")["input_ids"]
+        prompt = torch.cat([prompt, pre.to(prompt.device, prompt.dtype)], dim=1)
+    batch = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
+    batch.update(input_ids=prompt, attention_mask=torch.ones_like(prompt))
+    with torch.inference_mode():
+        out = model(**batch, use_cache=True)
+    cache = out.past_key_values
+    del out
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    conts = [tok(t, add_special_tokens=False)["input_ids"] + [tok.eos_token_id] for t in texts]
+    lps = _continuation_logprobs(model, cache, prompt, prompt.shape[1], conts, pad_id)
+    return [(lp, len(c)) for lp, c in zip(lps, conts)]
+
+
 def _continuation_logprobs(model, cache, input_ids, abs_pos: int, conts: List[List[int]], pad_id: int) -> List[float]:
     """logP of several continuations at one position, in a single forward over the cropped,
     widened gold cache. The gold pass already used the logits of the position before

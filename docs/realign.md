@@ -193,6 +193,18 @@ placement on that episode; of the moves over 1 s whose truth is known, the three
 were all wrong (2.1-2.8 s early, placement within 0.1 s) and the two under it were
 corrections (+1.6 s, +1.7 s), so the leash is where the line falls.
 
+**A weak line gets a short leash.** A line with fewer than `WEAK_LINE_CJK` (3) Chinese
+characters (Mark哥, Mr. Ng, 嗱, an English line) gives the align model too little to place it
+on its own, and the fill pulled such lines into a neighbour's pause: on Court! E01 Mark哥 came
+out 1.2 s early (input 811.02 s, truth about 811.15) and Mr. Ng 1.3 s early, both within the
+2 s leash. `line_tolerance` gives them `WEAK_LINE_LEASH` (0.5 s) instead, in `clamp_to_prior`
+and in `hold_to_placement`. Measured with `scripts/eval_realign.py`: Court within 0.5 s 96.6% ->
+97.7% (both lines now within 0.03 s of the user's times); AoT S1E05 with its hand timings
+roughened (late starts, tight ends, 10% of cues 0.6-1.5 s off; true answer known) 97.1% ->
+97.4%, one short line (艾倫) going from 1.65 s early to 0.00 and none getting worse. The cost not
+measured: a short line the input has more than 0.5 s wrong can only move 0.5 s (the
+roughening put none of AoT's 21 short lines that far off).
+
 **The main track passes over the top-of-screen speech too.** Taking `{\an8}` lines out of
 the sequence leaves their speech in the main track's audio with nothing to consume it, and
 it pulled the next main line back across it (奇怪喇 and 嚟唔切喇, 2.2-2.3 s early). The main
@@ -604,6 +616,19 @@ The replacement is four passes:
    And progress in *time* is guaranteed -- each iteration either anchors or advances the window
    -- so the loop cannot grind on unreadable audio. Lines that are not anchored are **not
    committed**; they are filled later from their brackets.
+
+   "Explains nothing" means **yields no usable anchor**, not "scores badly on average". On
+   Court! E01 (adjust) the pointer sat on a lone 哎; its free-end probe matched one short
+   common phrase (好啦, 唔該晒) far down every 120 s window, which lifted the probe's average
+   over `ACQUIRE_MIN_SCORE` while giving no anchor (the match was too short, or half seen). The
+   offsets were never tried, so the search went blind for 18 minutes (lines 170-469), the one
+   anchor at the far end (認罪扣減…, matched to an earlier 認罪 7.6 s early) went unverified
+   because the gap was too big for `verify_anchors`, and the piece fitted between them took a
+   slope of its own (x0.998) that pulled 102 cues 1-8 s early. Only a probe with an anchor now
+   ends the search at the pointer. Measured (`scripts/eval_realign.py`): Court adjust against
+   its own hand timing, start p90 6.14 s -> 0.20 s and within 0.5 s 77.9% -> 96.6% (3 pieces
+   from 136 anchors -> 1 piece from 327); Bluey transcript unchanged; Doraemon transcript
+   within 0.5 s 98.6% -> 98.8%.
 2. **`sanitise_anchors`** keeps the heaviest set of anchors that can all be true at once:
    increasing in time, and leaving at least `chars_between / MAX_CHAR_RATE` seconds for the text
    between them. Only the *lower* bound is used -- capping the forward jump is the documented

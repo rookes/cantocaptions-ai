@@ -46,6 +46,8 @@ def main(argv=None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("transcript", help="line-delimited transcript, or an SRT/VTT")
     parser.add_argument("--align_model", default=DEFAULT_MODEL)
+    parser.add_argument("--language", default="yue",
+                        help="language pack whose character readings the resolver uses (default yue)")
     parser.add_argument("--model_dir", default=None)
     parser.add_argument("--level", default="near", choices=["off", "variant", "homophone", "near"],
                         help="resolver level to report; 'near' shows every tier (default)")
@@ -56,18 +58,32 @@ def main(argv=None) -> int:
                         help="emit a [substitutions] table instead of the report")
     args = parser.parse_args(argv)
 
+    from cantocaptions_ai.languages import get_language_pack
+    from cantocaptions_ai.pipeline.align_profiles import get_align_profile
     from cantocaptions_ai.pipeline.align_vocab import (
-        KIND_HELP, LEVELS, VocabRepair, _repairable, load_substitution_overrides, reading_of,
+        KIND_HELP, LEVELS, VocabRepair, _repairable, bundled_substitutions,
+        load_substitution_overrides, merge_substitutions,
     )
     from cantocaptions_ai.pipeline.realign import REALIGN_PUNCTUATION, load_transcript_lines
 
     dictionary = build_dictionary(args.align_model, args.model_dir)
     known = set(dictionary)
     lines = load_transcript_lines(args.transcript)
-    overrides = load_substitution_overrides(args.substitutions) if args.substitutions else None
-    # A fresh dictionary per level so the tiers are reported independently: augment() mutates
-    # the dictionary, and a character resolved at 'variant' is invisible to 'homophone'.
-    repair = VocabRepair(dict(dictionary), args.level, overrides)
+    # Built the way load_align_model builds it: the language pack's readings drive the variant
+    # and homophone tiers, and the model's bundled table sits under any --substitutions file.
+    pack = get_language_pack(args.language)
+    readings = pack.char_readings() if pack.char_readings is not None else None
+    if readings is None and args.level != "off":
+        print(f"language {args.language!r} has no character readings: only the substitution "
+              "tables apply", file=sys.stderr)
+    profile = get_align_profile(args.align_model)
+    overrides = merge_substitutions(
+        bundled_substitutions(profile.substitutions) if profile.substitutions else None,
+        load_substitution_overrides(args.substitutions) if args.substitutions else None,
+    )
+    # A copy of the dictionary: resolving a character adds its substitute to it.
+    repair = VocabRepair(dict(dictionary), args.level, overrides, readings=readings)
+    reading_of = readings.reading if readings is not None else (lambda char: None)
 
     counts: "Counter[str]" = Counter()
     line_hits = defaultdict(set)
@@ -101,7 +117,8 @@ def main(argv=None) -> int:
         text = "\n".join(out) + "\n"
     else:
         text = _markdown(args, lines, chars, counts, line_hits, examples, resolved, known,
-                         KIND_HELP, LEVELS, dictionary, REALIGN_PUNCTUATION)
+                         KIND_HELP, LEVELS, dictionary, REALIGN_PUNCTUATION, reading_of,
+                         readings.label if readings is not None else "reading")
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
@@ -113,9 +130,7 @@ def main(argv=None) -> int:
 
 
 def _markdown(args, lines, chars, counts, line_hits, examples, resolved, known, kind_help,
-              levels, dictionary, punctuation) -> str:
-    from cantocaptions_ai.pipeline.align_vocab import reading_of
-
+              levels, dictionary, punctuation, reading_of, reading_label) -> str:
     total = sum(counts.values())
     buckets = defaultdict(list)
     for char, n in counts.items():
@@ -167,7 +182,7 @@ def _markdown(args, lines, chars, counts, line_hits, examples, resolved, known, 
             w("")
             w(f"*{note}*")
             w("")
-            w("| char | jyutping | substitute | count | lines | example line |")
+            w(f"| char | {reading_label.lower()} | substitute | count | lines | example line |")
             w("|---|---|:-:|---:|---:|---|")
             for n, char, sub in rows:
                 example = examples[char].replace("|", "\\|")

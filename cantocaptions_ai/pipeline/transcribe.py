@@ -1246,7 +1246,7 @@ def _execute_pipeline(
     # The settings each stage's debug checkpoint must have been made with to be replayed;
     # carried on every item so the stages can check what they read (utils/checkpoints.py).
     # Taken after the reference step, which may have set reference_subtitle.
-    from cantocaptions_ai.utils.checkpoints import checkpoint_settings
+    from cantocaptions_ai.utils.checkpoints import checkpoint_settings, debug_stem
     checkpoints = checkpoint_settings(cfg)
 
     realign_mode = None
@@ -1276,7 +1276,7 @@ def _execute_pipeline(
     if cfg.load_debug_dir:
         missing = [
             ap for ap in audio_paths
-            if not os.path.isdir(os.path.join(cfg.load_debug_dir, name_of[ap]))
+            if not os.path.isdir(os.path.join(cfg.load_debug_dir, debug_stem(name_of[ap])))
         ]
         if missing:
             # Not fatal: files without cached data are simply (re)computed from scratch,

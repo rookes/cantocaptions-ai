@@ -533,9 +533,19 @@ if __name__ == "__main__":
 class TestHoldToPlacement(unittest.TestCase):
     """Mode adjust's leash, enforced on the final alignment as well as the placement."""
 
-    def _cue(self, start, end, placement, **extra):
-        return {"start": start, "end": end, "text": "x", "words": [],
+    def _cue(self, start, end, placement, text="我哋一齊走啦", **extra):
+        return {"start": start, "end": end, "text": text, "words": [],
                 "realign_placement": placement, **extra}
+
+    def test_a_weak_line_gets_the_short_leash(self):
+        from cantocaptions_ai.pipeline.realign import WEAK_LINE_LEASH, hold_to_placement
+        # Mark哥 pulled 1.2 s off its placement: within the leash, but too far for a line the
+        # align model has one character of.
+        cue = self._cue(809.85, 811.77, (811.09, 811.68), text="Mark哥")
+        self.assertEqual(hold_to_placement([cue], 2.0), 1)
+        self.assertEqual(cue["start"], 811.09)
+        near = self._cue(811.0 + WEAK_LINE_LEASH - 0.1, 811.7, (811.0, 811.6), text="Mr. Ng")
+        self.assertEqual(hold_to_placement([near], 2.0), 0)
 
     def test_a_cue_pulled_past_the_leash_takes_its_placement_back(self):
         from cantocaptions_ai.pipeline.realign import REASON_OFF_PRIOR, hold_to_placement

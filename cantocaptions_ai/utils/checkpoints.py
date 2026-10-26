@@ -141,9 +141,18 @@ def fingerprint(settings: Dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
+def debug_stem(name: str) -> str:
+    """The directory (relative to the debug dir) a file's checkpoints live under: its output
+    name with each path component stripped of surrounding spaces and trailing dots. Windows
+    drops a trailing dot from a directory name, so "It Didn't Have To Be Magic..." could be
+    created but not entered. Every writer and reader of checkpoints goes through this."""
+    parts = [part.strip().rstrip(". ") or "_" for part in name.strip().split("/")]
+    return "/".join(parts)
+
+
 def _meta_path(debug_dir: str, name: str, stage: str) -> str:
     # Must match debug._stage_dir, which lays checkpoints out the same way.
-    return os.path.join(debug_dir, name.strip(), stage, META_FILENAME)
+    return os.path.join(debug_dir, debug_stem(name), stage, META_FILENAME)
 
 
 def write_checkpoint_meta(debug_dir: str, name: str, stage: str, settings: Dict[str, Any]) -> None:
